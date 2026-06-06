@@ -1,0 +1,47 @@
+dump1090 — Mode-S / ADS-B decoder by Salvatore Sanfilippo (antirez)
+Upstream: https://github.com/antirez/dump1090
+SPDX-License-Identifier: BSD-3-Clause
+
+The text below is the VERBATIM upstream LICENSE file fetched from
+https://raw.githubusercontent.com/antirez/dump1090/master/LICENSE
+
+ADSBin adapts (does not copy verbatim) the following antirez dump1090 portions,
+all of which are covered by this BSD 3-Clause license and which carry a preserved
+copyright/attribution notice in their source headers:
+  - components/demod1090/demod1090.c  (magnitude-LUT envelope, 8 us preamble
+    correlation, PPM half-bit Manchester slicing — generalised to 2.4 Msps)
+  - components/modes_decode/modes_decode.c  (table-driven 24-bit Mode-S CRC,
+    poly 0xFFF409; DF17/18 parity -> ICAO recovery; Gillham Mode-C altitude fold)
+  - components/modes_decode/cpr.c  (CPR global/local decode + NL longitude-zone
+    decoder structure; NL boundary numbers independently keyed from the spec)
+
+================================================================================
+
+Copyright (c) 2012-present, Salvatore Sanfilippo <antirez@gmail.com>
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
