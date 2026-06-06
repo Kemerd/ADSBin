@@ -1,148 +1,410 @@
 /**
  * @file    adsbin_app.c
- * @brief   ADSBin entry point + dual-core task wiring (Phase 0 scaffold).
+ * @brief   ADSBin entry point + full Stage-3 pipeline wiring (plan S2).
  *
  * @details
- *   Establishes the real-time threading skeleton from IMPLEMENTATION_PLAN.md S2:
+ *   `main` is the top of the dependency graph: it is the ONLY translation unit
+ *   that constructs the shared inter-task IPC (the IQ ring + the frame/msg
+ *   queues), creates every FreeRTOS task and pins it to its design core, and
+ *   calls each component's `*_start()` / `*_init()` entry point. Components never
+ *   create the shared queues or pin themselves; they receive the handles.
  *
- *     - Core 0 (::ADSBIN_CORE_DSP)    : RX + DSP. Hard-real-time; nothing else
- *                                       competes with it once usb_rtlsdr/demod1090
- *                                       land here in Phase 1-3.
- *     - Core 1 (::ADSBIN_CORE_DECODE) : decode, traffic table, sinks, status.
+ *   The realised S2 data flow:
  *
- *   At Phase 0 each core only proves liveness (a heartbeat log + an optional
- *   status-LED blink). The pipeline stages graft onto these cores in later
- *   phases WITHOUT changing the core-affinity contract fixed here.
+ *     usb_rtlsdr (Core 0)                       demod1090 (Core 0)
+ *       └─ IQ ring (owned by usb_rtlsdr) ────────►┐
+ *                                                 │ magnitude/preamble/bit-slice
+ *                                                 ▼
+ *                                        frame_queue (modes_frame_t, by value)
+ *                                                 │
+ *     ┌───────────────────────────────────────────┘
+ *     ▼  DECODE GLUE TASK (Core 1, owned here)
+ *   modes_decode_frame() ──► adsb_msg_t ──► msg_queue ──► sink_feed_msg()
+ *                                                       └► status_notify_traffic()
+ *                                                 │
+ *     ┌───────────────────────────────────────────┘
+ *     ▼  TRAFFIC GLUE TASK (Core 1, owned here)
+ *   traffic_ingest() + ~1 Hz traffic_age()
+ *
+ *   Two further Core-1 helpers main owns:
+ *     - the sinks publisher task (created inside sinks_start()), and
+ *     - the +INJECT console reader (this file), which lets the Python bench feed
+ *       canned Mode-S frames into the *real* decode path over USB-CDC.
+ *
+ *   The glue tasks exist because demod1090 and modes_decode are deliberately
+ *   decoupled (they share only the POD `modes_frame_t` / `adsb_msg_t` ABI), so
+ *   the cross-component "pop a frame, decode it, fan the result out" plumbing is
+ *   integration policy and therefore lives here, not in any one component.
  *
  * @copyright Novabox / ADSBin. Receive-only, experimental, non-certified.
  */
 
 #include <stdbool.h>
+#include <stdint.h>
+#include <inttypes.h>   // PRIX32 / PRIu32 for portable 32-bit log formatting
+#include <string.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+
 #include "esp_log.h"
 #include "esp_chip_info.h"
 #include "esp_idf_version.h"
 #include "sdkconfig.h"
-#include "driver/gpio.h"
 
-#include "adsbin_app.h"     // pipeline + task tuning knobs
-#include "adsbin_types.h"   // ADSBIN_CORE_*, adsbin_now_us()
+#include "driver/usb_serial_jtag.h"   // +INJECT console RX over the shared USB-C link
+
+#include "adsbin_app.h"     // pipeline plumbing + task tuning knobs (frozen)
+#include "adsbin_types.h"   // ADSBIN_CORE_*, adsbin_now_us(), modes_frame_t, adsb_msg_t
+
+// Component public contracts (the frozen source of truth for every call below).
+#include "adsbin_config.h"  // config_init / config_get
+#include "ownship.h"        // ownship_init / ownship_get
+#include "usb_rtlsdr.h"     // RTL-SDR USB-HS host driver
+#include "demod1090.h"      // 1090ES demodulator (Core 0)
+#include "modes_decode.h"   // Mode-S / ADS-B decoder (Core 1)
+#include "traffic.h"        // traffic table manager (Core 1)
+#include "sinks.h"          // sink registry + publisher
+#include "sink_transport.h" // USB-CDC byte transport for the sinks
+#include "sink_debug.h"     // human-readable debug sink
+#include "sink_gdl90.h"     // GDL90 sink
+#include "status.h"         // LEDs + temperature watchdog
 
 /// Log tag for the application core.
 static const char *TAG = "adsbin";
 
-/// Heartbeat cadence (ms) for the Phase-0 liveness proof.
-#define ADSBIN_HEARTBEAT_MS  1000
-
-/// Scaffold task stacks. Right-sized per task as real work is grafted on.
-#define ADSBIN_SCAFFOLD_STACK 4096
+/* ───────────────────────────────────────────────────────────────────────────
+ *  Task stacks. Sized for the work each task actually does: the glue tasks do a
+ *  queue pop + one decode/ingest call (the heavy LUT/CPR state lives inside the
+ *  components, on the heap), so they stay modest. The inject console only parses
+ *  a short hex line.
+ * ─────────────────────────────────────────────────────────────────────────── */
+#define ADSBIN_DECODE_TASK_STACK   6144   /**< decode glue: modes_decode_frame().  */
+#define ADSBIN_TRAFFIC_TASK_STACK  4096   /**< traffic glue: ingest + age.         */
+#define ADSBIN_INJECT_TASK_STACK   4096   /**< +INJECT console line reader.        */
 
 /* ───────────────────────────────────────────────────────────────────────────
- *  Singleton plumbing. Empty in Phase 0 (no producers/consumers yet); Stage 3
- *  integration fills iq_ring / frame_queue / msg_queue as components come up.
+ *  Pipeline cadence / sizing knobs.
  * ─────────────────────────────────────────────────────────────────────────── */
-static adsbin_pipeline_t s_pipeline;
+#define ADSBIN_AGE_INTERVAL_US     (1000000)   /**< traffic_age() cadence (~1 Hz).  */
+#define ADSBIN_PUBLISH_INTERVAL_MS (1000)      /**< sinks publish / GDL90 Heartbeat.*/
+#define ADSBIN_DECODE_POP_TICKS    portMAX_DELAY /**< block on the frame queue.     */
+#define ADSBIN_TRAFFIC_POP_MS      100         /**< msg-queue poll so age can run.  */
+#define ADSBIN_INJECT_MAX_LINE     80          /**< longest +INJECT line we accept. */
 
 /* ───────────────────────────────────────────────────────────────────────────
- *  Status LED — driven inline for the scaffold. Migrates into the `status`
- *  component once its task is wired (Stage 3). Pin is user-selectable because
- *  the LED location differs across P4 boards (we never hard-code a board pin).
+ *  Singleton plumbing + the handles the glue tasks need. Built once in
+ *  adsbin_app_init()/adsbin_app_start(); read-only thereafter from the tasks.
  * ─────────────────────────────────────────────────────────────────────────── */
-#if CONFIG_ADSBIN_STATUS_LED_GPIO >= 0
+static adsbin_pipeline_t s_pipeline;          /**< IQ ring + frame/msg queues.     */
+static traffic_handle_t  s_traffic;           /**< Traffic table instance.         */
+static sink_transport_t  s_cdc_transport;     /**< Shared USB-CDC byte transport.  */
+static sink_handle_t     s_sink_debug;        /**< Optional debug sink.            */
+static sink_handle_t     s_sink_gdl90;        /**< Optional GDL90 sink.            */
 
-/// Configure the heartbeat LED GPIO as a push-pull output.
-static void status_led_init(void)
-{
-    const gpio_config_t io = {
-        .pin_bit_mask = (1ULL << CONFIG_ADSBIN_STATUS_LED_GPIO),
-        .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&io));
-}
-
-/// Drive the LED, honouring active-low boards.
-static inline void status_led_set(bool on)
-{
-#if CONFIG_ADSBIN_STATUS_LED_ACTIVE_LOW
-    gpio_set_level(CONFIG_ADSBIN_STATUS_LED_GPIO, on ? 0 : 1);
-#else
-    gpio_set_level(CONFIG_ADSBIN_STATUS_LED_GPIO, on ? 1 : 0);
-#endif
-}
-#endif /* status LED configured */
-
-/* ───────────────────────────────────────────────────────────────────────────
- *  Core 0 — RX + DSP task
- * ─────────────────────────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Ownship helper
+ *
+ *  modes_decode wants a per-call ownship reference for *local* CPR. ownship_get()
+ *  is non-blocking and internally synchronized, so we simply snapshot it once per
+ *  frame on the decode task; that always reflects the latest manual/GPS fix
+ *  without main caching anything stale.
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Hard-real-time RX/DSP task (Core 0).
+ * @brief Copy the current ownship reference, returning NULL when unset.
  *
- * Phase 0: emits a debug heartbeat so we can confirm Core 0 is scheduled and the
- * console transport is alive. Phase 1+ : owns the USB-HS bulk-transfer pump and
- * the magnitude / preamble / bit-slice DSP front end (S4.1, S4.2).
+ * @param scratch  Caller-provided storage to copy the reference into.
+ * @return @p scratch when a valid reference exists, else NULL (=> global CPR).
  */
-static void rx_dsp_task(void *arg)
+static const ownship_ref_t *ownship_snapshot(ownship_ref_t *scratch)
+{
+    // ownship_get() always fills the struct (even when !valid) so the caller can
+    // inspect valid/source; we translate "!valid" into the NULL the decode/local
+    // CPR contract expects ("NULL or !valid => global only").
+    if (ownship_get(scratch) != ESP_OK || !scratch->valid) {
+        return NULL;
+    }
+    return scratch;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  DECODE GLUE TASK (Core 1)
+ *
+ *  Pops candidate frames from demod1090's output queue, runs the full Mode-S /
+ *  ADS-B decode against the live ownship reference, and on MODES_OK fans the
+ *  decoded message out: (a) onto msg_queue for the traffic task, (b) to any sink
+ *  that opted into per-message feed, and (c) to the status LED heartbeat.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Core-1 decode worker: frame_queue -> modes_decode_frame -> msg_queue.
+ */
+static void decode_task(void *arg)
 {
     (void)arg;
-    ESP_LOGI(TAG, "RX/DSP task up on core %d", xPortGetCoreID());
+    ESP_LOGI(TAG, "decode task up on core %d", xPortGetCoreID());
 
-    TickType_t next = xTaskGetTickCount();
+    modes_frame_t  frame;     // by-value frame popped from the queue
+    adsb_msg_t     msg;       // decoded result handed to traffic/sinks
+    ownship_ref_t  own;       // scratch for the per-frame ownship snapshot
+
     for (;;) {
-        // No radio yet - just prove liveness on the time-critical core.
-        ESP_LOGD(TAG, "core0 heartbeat @ %lld us", (long long)adsbin_now_us());
-        vTaskDelayUntil(&next, pdMS_TO_TICKS(ADSBIN_HEARTBEAT_MS));
+        // Block until demod1090 hands us a candidate frame. The frame is POD and
+        // copied by value out of the queue, so demod1090 may recycle its slot
+        // the instant the receive returns — we own this copy.
+        if (xQueueReceive(s_pipeline.frame_queue, &frame, ADSBIN_DECODE_POP_TICKS) != pdTRUE) {
+            continue;
+        }
+
+        // Snapshot ownship fresh for this frame so local CPR follows live config.
+        const ownship_ref_t *ref = ownship_snapshot(&own);
+
+        // Full decode: CRC + DF gate, parse, and CPR resolution against the
+        // decoder's internal pairing cache. frame.rx_time_us was carried all the
+        // way from the originating IQ block, so aging/pairing share one clock.
+        modes_result_t r = modes_decode_frame(frame.data, frame.len_bytes,
+                                              frame.rx_time_us, ref, &msg);
+        if (r != MODES_OK) {
+            // Most frames are CRC fails / unsupported DFs / incomplete CPR pairs;
+            // that is normal noise, so trace it rather than logging at INFO.
+            ESP_LOGV(TAG, "decode drop: %s", modes_result_str(r));
+            continue;
+        }
+
+        // (a) Hand the decoded observation to the traffic task. Bounded wait so a
+        //     wedged traffic task can never back-pressure the decode loop into
+        //     starving demod1090's output queue — drop-with-trace instead.
+        if (xQueueSend(s_pipeline.msg_queue, &msg, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "msg_queue full; dropping ICAO %06" PRIX32, adsb_icao_get(&msg));
+        }
+
+        // (b) Per-message fan-out (e.g. verbose sink_debug "MSG ..." lines). Only
+        //     sinks that implement feed_msg act on this; the rest ignore it.
+        sink_feed_msg(&msg);
+
+        // (c) Heartbeat: flash the TRAFFIC LED on a fresh position fix only, so
+        //     the LED genuinely means "I just resolved an aircraft's position".
+        if (msg.has_position) {
+            status_notify_traffic();
+        }
     }
 }
 
-/* ───────────────────────────────────────────────────────────────────────────
- *  Core 1 — decode + serve task
- * ─────────────────────────────────────────────────────────────────────────── */
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  TRAFFIC GLUE TASK (Core 1)
+ *
+ *  The single writer of the traffic table: pops decoded messages from msg_queue
+ *  and merges them, and on a ~1 Hz cadence ages the table (the traffic component
+ *  starts no timer of its own — that is main's job, per its header).
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Decode / serve / housekeeping task (Core 1).
- *
- * Phase 0: blinks the optional status LED and logs a heartbeat. Phase 4+ :
- * consumes candidate frames, maintains the traffic table, and drives the output
- * sinks (S4.3-S4.5, S4.8).
+ * @brief Core-1 traffic worker: msg_queue -> traffic_ingest + periodic age.
  */
-static void decode_serve_task(void *arg)
+static void traffic_task(void *arg)
 {
     (void)arg;
-    ESP_LOGI(TAG, "decode/serve task up on core %d", xPortGetCoreID());
+    ESP_LOGI(TAG, "traffic task up on core %d", xPortGetCoreID());
 
-#if CONFIG_ADSBIN_STATUS_LED_GPIO >= 0
-    status_led_init();
-    bool led = false;
-#endif
+    adsb_msg_t msg;                       // by-value message popped from the queue
+    int64_t    last_age_us = adsbin_now_us();
 
-    TickType_t next = xTaskGetTickCount();
     for (;;) {
-#if CONFIG_ADSBIN_STATUS_LED_GPIO >= 0
-        led = !led;
-        status_led_set(led);   // 1 Hz "alive" blink until real traffic drives it.
-#endif
-        ESP_LOGI(TAG, "alive - no traffic yet (scaffold)");
-        vTaskDelayUntil(&next, pdMS_TO_TICKS(ADSBIN_HEARTBEAT_MS));
+        // Poll the message queue with a bounded wait. The timeout doubles as our
+        // aging tick source: even with no traffic flowing we still wake ~10x/s,
+        // so the 1 Hz traffic_age() below always runs on schedule.
+        if (xQueueReceive(s_pipeline.msg_queue, &msg,
+                          pdMS_TO_TICKS(ADSBIN_TRAFFIC_POP_MS)) == pdTRUE) {
+            // Merge this observation into the per-ICAO record. The ingest result
+            // is informational here (new/updated/filtered); the table handles all
+            // of merge, cull and eviction internally.
+            traffic_ingest_result_t res;
+            esp_err_t err = traffic_ingest(s_traffic, &msg, &res);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "traffic_ingest failed: %s", esp_err_to_name(err));
+            }
+        }
+
+        // ~1 Hz aging pass: drop targets unheard past expiry and demote stale
+        // position fixes. Driven off the one microsecond clock, not ticks.
+        int64_t now = adsbin_now_us();
+        if (now - last_age_us >= ADSBIN_AGE_INTERVAL_US) {
+            last_age_us = now;
+            uint32_t expired = 0;
+            traffic_age(s_traffic, now, &expired);
+            if (expired) {
+                ESP_LOGD(TAG, "aged out %" PRIu32 " target(s)", expired);
+            }
+        }
     }
 }
 
-/* ───────────────────────────────────────────────────────────────────────────
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  +INJECT CONSOLE HANDLER (Core 1)
+ *
+ *  Implements the firmware side of the frozen USB-CDC wire contract
+ *  (tools/bench/WIRE_CONTRACT.md §2): the bench sends "+INJECT <hex>" lines over
+ *  the shared USB-C link; we parse 14/28 hex chars into a modes_frame_t and push
+ *  it onto frame_queue — so an injected frame travels the EXACT same decode path
+ *  as a real off-air frame — and reply "+OK" / "+ERR <reason>".
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Convert one ASCII hex nibble to its 0..15 value, or -1 if not hex.
+ */
+static int hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;   // not a hex digit
+}
+
+/**
+ * @brief Write a short reply line back to the host over USB-CDC.
+ *
+ * Goes straight to the USB Serial/JTAG driver (the same link the console and the
+ * sink transport use) with a bounded timeout so a dead host never wedges us.
+ */
+static void inject_reply(const char *line)
+{
+    usb_serial_jtag_write_bytes((const uint8_t *)line, strlen(line),
+                                pdMS_TO_TICKS(20));
+}
+
+/**
+ * @brief Parse and execute one fully-received console line.
+ *
+ * Recognises only "+INJECT <hex>" per the wire contract; anything else is
+ * ignored silently (the line may simply be ESP-IDF console traffic). On a valid
+ * frame it builds a ::modes_frame_t and pushes it to the decode path.
+ *
+ * @param line  NUL-terminated line with the trailing CR/LF already stripped.
+ */
+static void inject_handle_line(char *line)
+{
+    // Fast reject: only act on the "+INJECT " prefix; leave everything else for
+    // the IDF console so we never fight it for unrelated input.
+    static const char PREFIX[] = "+INJECT ";
+    const size_t plen = sizeof(PREFIX) - 1;
+    if (strncmp(line, PREFIX, plen) != 0) {
+        return;
+    }
+
+    // Skip the prefix and any extra spaces before the hex payload.
+    const char *hex = line + plen;
+    while (*hex == ' ') {
+        hex++;
+    }
+
+    // Length gate: a Mode-S frame is exactly 14 (short/56-bit) or 28 (long/112-
+    // bit) hex chars. Anything else is a malformed request.
+    size_t hexlen = strlen(hex);
+    if (hexlen != (MODES_SHORT_BYTES * 2) && hexlen != (MODES_LONG_BYTES * 2)) {
+        inject_reply("+ERR BADLEN\n");
+        return;
+    }
+
+    // Decode the hex into a by-value candidate frame. data[] is zero-initialised
+    // so a short frame leaves bytes [7..13] clean.
+    modes_frame_t frame = (modes_frame_t){0};
+    frame.len_bytes = (uint8_t)(hexlen / 2);
+
+    for (size_t i = 0; i < hexlen; i += 2) {
+        int hi = hex_nibble(hex[i]);
+        int lo = hex_nibble(hex[i + 1]);
+        if (hi < 0 || lo < 0) {
+            inject_reply("+ERR BADHEX\n");
+            return;
+        }
+        frame.data[i / 2] = (uint8_t)((hi << 4) | lo);
+    }
+
+    // Populate the rest of the frame header the way demod1090 would: df is the
+    // pre-computed DF gate (byte0 >> 3); the injected frame has no real RF, so we
+    // stamp a perfect preamble score and "unknown" signal level, and timestamp it
+    // now so CPR pairing/aging treat it as a just-received frame.
+    frame.df             = (uint8_t)(frame.data[0] >> 3);
+    frame.preamble_score = 255;
+    frame.signal_level   = 0;
+    frame.rx_time_us     = adsbin_now_us();
+
+    // Push it onto the SAME queue demod1090 feeds, so the decode glue task picks
+    // it up and runs it through the real modes_decode -> traffic -> sinks path.
+    // A short wait gives a momentarily-full queue a chance to drain.
+    if (xQueueSend(s_pipeline.frame_queue, &frame, pdMS_TO_TICKS(50)) != pdTRUE) {
+        inject_reply("+ERR QUEUEFULL\n");
+        return;
+    }
+
+    inject_reply("+OK\n");
+}
+
+/**
+ * @brief Core-1 task: read USB-CDC bytes, assemble lines, dispatch +INJECT.
+ *
+ * Reads a byte at a time with a short timeout and accumulates into a line buffer
+ * until CR or LF. Overlong lines (no terminator within the buffer) are flushed
+ * defensively so a flood of junk can't wedge the parser.
+ */
+static void inject_console_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "inject console task up on core %d", xPortGetCoreID());
+
+    char   line[ADSBIN_INJECT_MAX_LINE + 1];
+    size_t len = 0;
+
+    for (;;) {
+        // Read one byte with a bounded wait. Reading single bytes keeps the line
+        // assembler simple and the latency-to-reply low; throughput on a control
+        // channel like this is irrelevant.
+        uint8_t ch;
+        int n = usb_serial_jtag_read_bytes(&ch, 1, pdMS_TO_TICKS(100));
+        if (n <= 0) {
+            continue;   // timeout / no data — just keep waiting
+        }
+
+        if (ch == '\r' || ch == '\n') {
+            // End of line: NUL-terminate and dispatch (ignoring blank lines).
+            if (len > 0) {
+                line[len] = '\0';
+                inject_handle_line(line);
+                len = 0;
+            }
+        } else if (len < ADSBIN_INJECT_MAX_LINE) {
+            // Accumulate printable input into the line buffer.
+            line[len++] = (char)ch;
+        } else {
+            // Overlong line with no terminator — drop it to avoid wedging, and
+            // resync on the next newline.
+            len = 0;
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  *  Lifecycle
- * ─────────────────────────────────────────────────────────────────────────── */
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 const adsbin_pipeline_t *adsbin_app_pipeline(void)
 {
     return &s_pipeline;
 }
 
+/**
+ * @brief One-shot bring-up: config + ownship, then construct the shared IPC.
+ *
+ * Order matters: config_init() opens NVS and loads settings; ownship_init()
+ * seeds the reference from that config. The IQ ring is NOT built here — it is
+ * owned by usb_rtlsdr and fetched after usb_rtlsdr_init() in adsbin_app_start();
+ * here we only construct the two FreeRTOS queues main owns.
+ */
 esp_err_t adsbin_app_init(void)
 {
-    // Boot banner: chip + cores + IDF version. The fastest way to confirm the
+    // Boot banner: chip + cores + IDF version — the fastest confirmation that the
     // dual-core P4 target and toolchain are correct when bringing up a board.
     esp_chip_info_t chip;
     esp_chip_info(&chip);
@@ -150,31 +412,308 @@ esp_err_t adsbin_app_init(void)
     ESP_LOGI(TAG, "chip: %d core(s), silicon rev v%d.%d",
              chip.cores, chip.full_revision / 100, chip.full_revision % 100);
 
-    // Phase 0: nothing else to initialize yet. Stage 3 adds config_init() and
-    // constructs the shared IQ ring + frame/msg queues into s_pipeline here.
+    // Persistent settings first: everything downstream (gain, ownship, filters,
+    // sink map) reads from here.
+    esp_err_t err = config_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "config_init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // Ownship reference, seeded from the just-loaded config (manual lat/lon if
+    // present; otherwise an invalid ref => global-CPR-only, which is fully valid).
+    err = ownship_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ownship_init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // Construct the two queues main owns. Both carry small POD structs by value,
+    // so the queue copies them and no refcounting / ownership tracking is needed.
+    //   frame_queue : demod1090 (Core 0) -> decode task (Core 1)
+    //   msg_queue   : decode task (Core 1) -> traffic task (Core 1)
+    s_pipeline.frame_queue = xQueueCreate(ADSBIN_FRAME_QUEUE_LEN, sizeof(modes_frame_t));
+    s_pipeline.msg_queue   = xQueueCreate(ADSBIN_MSG_QUEUE_LEN,   sizeof(adsb_msg_t));
+    // The IQ ring is filled in adsbin_app_start() from usb_rtlsdr_get_iq_ring().
     s_pipeline.iq_ring     = NULL;
-    s_pipeline.frame_queue = NULL;
-    s_pipeline.msg_queue   = NULL;
+
+    if (s_pipeline.frame_queue == NULL || s_pipeline.msg_queue == NULL) {
+        ESP_LOGE(TAG, "failed to allocate pipeline queues");
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG, "pipeline queues built (frame=%d, msg=%d)",
+             ADSBIN_FRAME_QUEUE_LEN, ADSBIN_MSG_QUEUE_LEN);
     return ESP_OK;
 }
 
+/**
+ * @brief Build the status_config_t from the menuconfig LED selection.
+ *
+ * The LED pin is board-specific, so it stays operator-selectable via Kconfig.
+ * A <0 pin means "no LED" — the status component then runs the temp watchdog and
+ * health logic without driving any GPIO.
+ */
+static status_config_t status_cfg_from_kconfig(void)
+{
+    status_config_t cfg = {0};
+    // POWER + TRAFFIC share the one configured LED pin in the MVP (most boards
+    // expose a single user LED); a future two-LED board overrides this here.
+    cfg.led_power_gpio   = CONFIG_ADSBIN_STATUS_LED_GPIO;
+    cfg.led_traffic_gpio = CONFIG_ADSBIN_STATUS_LED_GPIO;
+#if CONFIG_ADSBIN_STATUS_LED_ACTIVE_LOW
+    cfg.leds_active_low  = true;
+#else
+    cfg.leds_active_low  = false;
+#endif
+    // Zeroed thresholds/period => the status component's documented defaults.
+    return cfg;
+}
+
+/**
+ * @brief Start every component, fetch the IQ ring, and launch the glue tasks.
+ *
+ * This is the body of the S2 graph: bring the radio up, wire demod1090 to the IQ
+ * ring + frame_queue, stand up decode/traffic/sinks/status, then create the
+ * Core-1 glue tasks main owns and pin them to ADSBIN_CORE_DECODE.
+ */
 esp_err_t adsbin_app_start(void)
 {
-    // Core 0 — the time-critical RX/DSP path gets its own core, by contract.
-    BaseType_t ok0 = xTaskCreatePinnedToCore(
-        rx_dsp_task, "rx_dsp", ADSBIN_SCAFFOLD_STACK,
-        NULL, ADSBIN_PRIO_DEMOD, NULL, ADSBIN_CORE_DSP);
+    esp_err_t err;
 
-    // Core 1 — decode, traffic, sinks, status, config.
-    BaseType_t ok1 = xTaskCreatePinnedToCore(
-        decode_serve_task, "decode", ADSBIN_SCAFFOLD_STACK,
-        NULL, ADSBIN_PRIO_DECODE, NULL, ADSBIN_CORE_DECODE);
+    // Snapshot config once for the start sequence (gain + sink map drive setup).
+    adsbin_config_t cfg;
+    if (config_get(&cfg) != ESP_OK) {
+        ESP_LOGW(TAG, "config_get failed; using compiled defaults for start");
+        memset(&cfg, 0, sizeof(cfg));
+    }
 
-    if (ok0 != pdPASS || ok1 != pdPASS) {
-        ESP_LOGE(TAG, "failed to create scaffold tasks");
+    /* ── 1. USB-HS host + RTL-SDR ───────────────────────────────────────────
+     * Install the host stack and allocate the IQ ring, then begin streaming. The
+     * ring is OWNED by usb_rtlsdr; we fetch the handle and hand it to demod1090. */
+    const usb_rtlsdr_config_t usb_cfg = {
+        .ring_capacity_blocks = ADSBIN_IQ_RING_BLOCKS,  // >= 8 blocks (S2 sizing)
+        .block_size_iq_pairs  = 0,                      // driver default
+        .usb_task_priority    = ADSBIN_PRIO_USB,        // top of the Core-0 stack
+        .usb_task_core_id     = ADSBIN_CORE_DSP,        // RX pinned to Core 0
+        .auto_recover         = true,                   // re-enumerate on stall (S10)
+    };
+    err = usb_rtlsdr_init(&usb_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "usb_rtlsdr_init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // The ring exists once init succeeds — capture it before anyone consumes it.
+    s_pipeline.iq_ring = usb_rtlsdr_get_iq_ring();
+    if (s_pipeline.iq_ring == NULL) {
+        ESP_LOGE(TAG, "usb_rtlsdr_get_iq_ring returned NULL after init");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    // Begin streaming at 1090ES with the configured tuner gain. A missing/auto
+    // gain falls back to the driver default; a fixed gain disables AGC (S5.3).
+    usb_rtlsdr_stream_config_t stream_cfg = {
+        .center_freq_hz      = ADSB_CENTER_FREQ_HZ,
+        .sample_rate_sps     = ADSB_SAMPLE_RATE_HZ,
+        .gain_mode           = (cfg.tuner_gain_tenth_db == ADSBIN_CFG_GAIN_AUTO)
+                                   ? USB_RTLSDR_GAIN_HW_AGC
+                                   : USB_RTLSDR_GAIN_MANUAL_FIXED,
+        .gain_tenth_db       = (cfg.tuner_gain_tenth_db == ADSBIN_CFG_GAIN_AUTO)
+                                   ? 0
+                                   : cfg.tuner_gain_tenth_db,
+        .freq_correction_ppm = 0,
+        .bias_tee_enable     = false,
+        .device_index        = 0,
+    };
+    err = usb_rtlsdr_start(&stream_cfg);
+    if (err != ESP_OK) {
+        // A missing dongle is non-fatal: the rest of the pipeline still stands up
+        // so +INJECT and the bench harness work without RF. Reflect it on the LED.
+        ESP_LOGW(TAG, "usb_rtlsdr_start failed (%s) - continuing without RF",
+                 esp_err_to_name(err));
+    }
+
+    /* ── 2. demod1090 (Core 0) ──────────────────────────────────────────────
+     * Init the DSP front end, then start its Core-0 task reading the IQ ring and
+     * writing candidate frames into the queue main owns. */
+    const demod1090_config_t demod_cfg = {
+        .sample_rate_hz     = ADSB_SAMPLE_RATE_HZ,
+        .task_core_id       = ADSBIN_CORE_DSP,    // hard-RT, sits below USB RX
+        .task_priority      = ADSBIN_PRIO_DEMOD,
+        .task_stack_size    = 0,                  // component default
+        .preamble_threshold = 0,                  // component default (0 => default)
+    };
+    err = demod1090_init(&demod_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "demod1090_init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    err = demod1090_start(s_pipeline.iq_ring, s_pipeline.frame_queue);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "demod1090_start failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    /* ── 3. modes_decode (Core 1) ───────────────────────────────────────────
+     * Allocate the CPR pairing cache + CRC tables. The decode task created below
+     * is the only caller of modes_decode_frame(). */
+    err = modes_decode_init(NULL);   // NULL => documented decoder defaults
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "modes_decode_init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    /* ── 4. traffic table (Core 1) ──────────────────────────────────────────
+     * Start with documented defaults, then layer in any config-driven culls so
+     * an operator's range/altitude/expiry settings take effect. */
+    traffic_config_t tcfg;
+    traffic_config_default(&tcfg);
+    if (cfg.range_filter_m > 0.0f) {
+        tcfg.enable_range_filter = true;
+        tcfg.max_range_nm        = cfg.range_filter_m / 1852.0f;  // metres -> NM
+    }
+    if (cfg.alt_filter_ft > 0) {
+        tcfg.enable_altitude_filter = true;
+        tcfg.max_altitude_ft        = cfg.alt_filter_ft;
+    }
+    if (cfg.target_expiry_s > 0) {
+        tcfg.expiry_ms = cfg.target_expiry_s * 1000u;
+    }
+    if (cfg.max_targets > 0) {
+        tcfg.max_targets = (uint16_t)cfg.max_targets;
+    }
+    err = traffic_init(&tcfg, &s_traffic);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "traffic_init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // Bind the ownship reference for range cull + relative geometry. NULL/!valid
+    // simply disables range filtering (global-CPR fallback) — fully supported.
+    {
+        ownship_ref_t own;
+        const ownship_ref_t *ref = ownship_snapshot(&own);
+        traffic_set_ownship(s_traffic, ref);
+    }
+
+    /* ── 5. sinks (Core 1) ──────────────────────────────────────────────────
+     * Bind the registry to the traffic table, build the shared USB-CDC transport,
+     * then construct/register the sinks the config's sink_map asks for. */
+    err = sinks_init(s_traffic);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "sinks_init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // One USB-CDC transport shared by both sinks (binary-clean; the debug text and
+    // GDL90 byte stream coexist on the one USB-C link).
+    err = sink_transport_usb_cdc_create(NULL, &s_cdc_transport);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "sink_transport_usb_cdc_create failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // Honour the configured sink map. Default (no bits set) lights up both sinks
+    // so a fresh box is immediately bench-observable.
+    uint32_t sink_map = cfg.sink_map;
+    if (sink_map == ADSBIN_SINK_NONE) {
+        sink_map = ADSBIN_SINK_DEBUG | ADSBIN_SINK_GDL90;
+    }
+
+    if (sink_map & ADSBIN_SINK_DEBUG) {
+        const sink_debug_cfg_t dcfg = {
+            .transport    = s_cdc_transport,
+            .verbose      = false,   // per-message "MSG ..." off by default
+            .clear_screen = false,   // raw scroll so the bench parses every block
+        };
+        err = sink_debug_create(&dcfg, &s_sink_debug);
+        if (err == ESP_OK) {
+            sinks_register(s_sink_debug);
+        } else {
+            ESP_LOGW(TAG, "sink_debug_create failed: %s", esp_err_to_name(err));
+        }
+    }
+
+    if (sink_map & ADSBIN_SINK_GDL90) {
+        const sink_gdl90_cfg_t gcfg = {
+            .transport             = s_cdc_transport,
+            .emit_ownship_report   = true,   // emit 0x0A when an ownship fix exists
+            .max_targets_per_cycle = 0,      // no per-cycle cap
+        };
+        err = sink_gdl90_create(&gcfg, &s_sink_gdl90);
+        if (err == ESP_OK) {
+            // Seed the GDL90 ownship so the optional Ownship Report is populated.
+            ownship_ref_t own;
+            const ownship_ref_t *ref = ownship_snapshot(&own);
+            sink_gdl90_set_ownship(s_sink_gdl90, ref);
+            sinks_register(s_sink_gdl90);
+        } else {
+            ESP_LOGW(TAG, "sink_gdl90_create failed: %s", esp_err_to_name(err));
+        }
+    }
+
+    // Spawn the Core-1 publisher (snapshots traffic + ownship every cycle).
+    const sinks_loop_cfg_t loop_cfg = {
+        .publish_interval_ms = ADSBIN_PUBLISH_INTERVAL_MS,
+        .task_stack_size     = 0,                  // component default
+        .task_priority       = ADSBIN_PRIO_SINKS,
+        .task_core_id        = ADSBIN_CORE_DECODE,
+    };
+    err = sinks_start(&loop_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "sinks_start failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    /* ── 6. status (Core 1) ─────────────────────────────────────────────────
+     * LEDs + temperature watchdog. Reflect dongle presence on the power LED. */
+    status_config_t scfg = status_cfg_from_kconfig();
+    err = status_init(&scfg);
+    if (err != ESP_OK) {
+        // Non-fatal: the box still decodes without indicators. Log and continue.
+        ESP_LOGW(TAG, "status_init failed: %s", esp_err_to_name(err));
+    } else {
+        // Drive the initial health from whether a dongle actually streamed.
+        usb_rtlsdr_status_t ust;
+        if (usb_rtlsdr_get_status(&ust) == ESP_OK) {
+            status_set_health(ust.device_present ? STATUS_HEALTH_OK
+                                                 : STATUS_HEALTH_NO_DONGLE);
+        }
+    }
+
+    /* ── 7. Core-1 glue tasks main owns ─────────────────────────────────────
+     * decode + traffic + the +INJECT console reader. All pinned to Core 1 so the
+     * hard-real-time Core-0 DSP path is never preempted by integration glue. */
+    BaseType_t ok;
+
+    ok = xTaskCreatePinnedToCore(decode_task, "adsbin_decode",
+                                 ADSBIN_DECODE_TASK_STACK, NULL,
+                                 ADSBIN_PRIO_DECODE, NULL, ADSBIN_CORE_DECODE);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "failed to create decode task");
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "scaffold tasks launched (core0=rx/dsp, core1=decode/serve)");
+
+    ok = xTaskCreatePinnedToCore(traffic_task, "adsbin_traffic",
+                                 ADSBIN_TRAFFIC_TASK_STACK, NULL,
+                                 ADSBIN_PRIO_TRAFFIC, NULL, ADSBIN_CORE_DECODE);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "failed to create traffic task");
+        return ESP_ERR_NO_MEM;
+    }
+
+    // The inject console reads USB-CDC RX; the transport above already installed
+    // the USB Serial/JTAG driver, so the reader can pull bytes immediately.
+    ok = xTaskCreatePinnedToCore(inject_console_task, "adsbin_inject",
+                                 ADSBIN_INJECT_TASK_STACK, NULL,
+                                 ADSBIN_PRIO_STATUS, NULL, ADSBIN_CORE_DECODE);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "failed to create inject console task");
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG, "pipeline up: usb->demod(core0) -> decode/traffic/sinks(core1)");
     return ESP_OK;
 }
 

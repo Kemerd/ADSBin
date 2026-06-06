@@ -63,14 +63,6 @@ extern "C" {
 #define DEMOD_FP_SHIFT           32
 #define DEMOD_FP_ONE             (1ull << DEMOD_FP_SHIFT)
 
-/** @brief Convert a microsecond offset to a fixed-point sample delta. */
-static inline uint64_t demod_us_to_fp(double us, uint64_t fp_samples_per_us)
-{
-    /* fp_samples_per_us is already in fixed-point; scale by the (small) µs    */
-    /* count. The multiply stays inside 64 bits for all Mode-S offsets.        */
-    return (uint64_t)(us * (double)fp_samples_per_us);
-}
-
 /* ───────────────────────────────────────────────────────────────────────────
  *  Demod working limits.
  *
@@ -114,7 +106,6 @@ typedef struct {
 
     /* ---- precomputed DSP geometry (set in init) ---- */
     uint64_t fp_samples_per_us;     /**< samples/µs in 32.32 fixed-point.        */
-    uint32_t samples_per_us_int;    /**< Rounded samples/µs (for coarse spans).  */
 
     /* ---- magnitude LUT (heap, 64 KiB) ---- */
     uint16_t *mag_lut;              /**< [256*256] (I<<8 | Q) → magnitude.        */
@@ -129,6 +120,10 @@ typedef struct {
     TaskHandle_t    task;           /**< The Core-0 demod task.                   */
     volatile bool   running;        /**< Task should keep looping while true.     */
     volatile bool   task_alive;     /**< Set by task on entry, cleared on exit.   */
+
+    /* ---- ring sequence tracking (task-private, reset on start) ---- */
+    uint32_t last_seq;              /**< Last iq_block_t.seq we consumed.         */
+    bool     have_seq;             /**< false until the first block arrives.     */
 
     /* ---- stats (guarded by stats_mux) ---- */
     SemaphoreHandle_t stats_mux;

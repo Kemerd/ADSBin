@@ -1,0 +1,9 @@
+# ADSBin host bench harness — Python dependencies.
+#
+# Only pyserial is required: it provides the cross-platform serial port
+# enumeration (serial.tools.list_ports) and the USB-CDC transport used by
+# cdc_link.py. Everything else (gdl90 framing, CRC, CPR math, the canned corpus,
+# the +INJECT handshake and the CLI) is pure standard-library Python 3.7+.
+#
+# Install with:  python -m pip install -r requirements.txt
+pyserial>=3.5

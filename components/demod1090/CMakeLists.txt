@@ -7,9 +7,13 @@
 #  (iq_block_t / modes_frame_t). It does NOT depend on modes_decode (decoupled
 #  via the shared frame type) - that is what lets the two build in parallel.
 # ─────────────────────────────────────────────────────────────────────────────
+#  PRIV_REQUIRES: esp_timer for adsbin_now_us()'s backing clock, plus the heap
+#  caps allocator (heap) and logging (log) we use internally for the 64 KiB
+#  magnitude LUT and diagnostics. These are private — they never leak through the
+#  public header, so they stay out of the public REQUIRES line.
 idf_component_register(
     SRCS          "demod1090.c"
     INCLUDE_DIRS  "include"
     REQUIRES      common esp_ringbuf freertos
-    PRIV_REQUIRES esp_timer
+    PRIV_REQUIRES esp_timer esp_log heap
 )

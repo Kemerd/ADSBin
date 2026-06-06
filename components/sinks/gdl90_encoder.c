@@ -323,9 +323,12 @@ static void gdl90_build_traffic_body(uint8_t id, const gdl90_traffic_t *tr, uint
     gdl90_pack_latlon(tr->lon_deg, &msg[8]);
 
     // [11..12] 12-bit altitude code packed into 1.5 bytes; low nibble of [12]
-    // is the "misc" field (airborne flag + report type — bit 3 = airborne).
+    // is the GDL90 "Misc" field. Bit3 = airborne (1) vs surface (0); bits 1..0 =
+    // track-type, where 01 means the heading field carries a True Track Angle.
+    // We always set track-type 01 (bit0) since our track is a true ground track,
+    // so airborne => 0b1001 (0x9), surface => 0b0001 (0x1).
     uint16_t alt = gdl90_pack_altitude(tr->alt_press_ft);
-    uint8_t  misc = (uint8_t)(tr->airborne ? 0x09u : 0x08u); /* bit3 airborne, bit0 "updated/true track" */
+    uint8_t  misc = (uint8_t)(tr->airborne ? 0x09u : 0x01u);
     msg[11] = (uint8_t)((alt >> 4) & 0xFFu);
     msg[12] = (uint8_t)(((alt & 0x0Fu) << 4) | (misc & 0x0Fu));
 
@@ -333,18 +336,30 @@ static void gdl90_build_traffic_body(uint8_t id, const gdl90_traffic_t *tr, uint
     msg[13] = (uint8_t)(((tr->nic & 0x0Fu) << 4) | (tr->nacp & 0x0Fu));
 
     // [14..16] horizontal (12-bit) + vertical (12-bit) velocity.
-    //   hVel is knots, 0xFFF = unknown; vVel is a signed 12-bit count of 64-fpm
-    //   units, 0x800 = unknown. We clamp hVel to its 0xFFE max.
+    //   hVel is knots in 0..0xFFE; the all-ones code 0xFFF means "unavailable"
+    //   and MUST be preserved. So we only clamp real speeds that exceed the
+    //   0xFFE maximum — the 0xFFF sentinel passes straight through untouched.
     uint16_t hvel = tr->h_velocity_kt;
-    if (hvel > 0xFFE) hvel = 0xFFE;
+    if (hvel != 0xFFFu && hvel > 0xFFEu) {
+        hvel = 0xFFEu;
+    }
 
     // Vertical velocity: convert ft/min -> 64-fpm units, round to nearest, then
-    // fit a signed 12-bit field. 0x800 is the spec's "no vertical rate" code.
-    int32_t vraw = tr->v_velocity_fpm;
-    int32_t vunits = (vraw >= 0) ? (vraw + 32) / 64 : (vraw - 32) / 64;
-    if (vunits >  511) vunits =  511;
-    if (vunits < -511) vunits = -511;
-    uint16_t vvel = (uint16_t)(vunits & 0x0FFFu);
+    // fit a signed 12-bit field. The spec's "no vertical rate" code is 0x800
+    // (the most-negative 12-bit pattern); the mapper signals "unknown" with the
+    // INT16_MIN sentinel so we don't confuse it with genuine level flight.
+    uint16_t vvel;
+    if (tr->v_velocity_fpm == INT16_MIN) {
+        vvel = 0x800u;                       /* "vertical rate unavailable"      */
+    } else {
+        int32_t vraw   = tr->v_velocity_fpm;
+        int32_t vunits = (vraw >= 0) ? (vraw + 32) / 64 : (vraw - 32) / 64;
+        // Valid signed range is -512..+511; -512 (0x800) is reserved as "unknown"
+        // so we floor real descents at -511 to avoid aliasing onto that code.
+        if (vunits >  511) vunits =  511;
+        if (vunits < -511) vunits = -511;
+        vvel = (uint16_t)(vunits & 0x0FFFu);
+    }
 
     msg[14] = (uint8_t)((hvel >> 4) & 0xFFu);
     msg[15] = (uint8_t)(((hvel & 0x0Fu) << 4) | ((vvel >> 8) & 0x0Fu));
@@ -546,8 +561,10 @@ void gdl90_traffic_from_target(gdl90_traffic_t *out, const traffic_target_t *tgt
         out->track_heading = 0;
     }
 
-    // Vertical rate when present; otherwise leave 0 (encoder emits ~no climb).
-    out->v_velocity_fpm = tgt->has_vertical_rate ? tgt->vertical_rate_fpm : 0;
+    // Vertical rate when present; otherwise the INT16_MIN sentinel tells the
+    // encoder to emit the GDL90 "vertical rate unavailable" code (0x800) rather
+    // than a fabricated level-flight 0 fpm.
+    out->v_velocity_fpm = tgt->has_vertical_rate ? tgt->vertical_rate_fpm : INT16_MIN;
 
     // Emitter category via the explicit ADS-B -> GDL90 translation table.
     out->emitter_cat = tgt->has_category
