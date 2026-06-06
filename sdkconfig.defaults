@@ -1,0 +1,36 @@
+# ============================================================================
+#  ADSBin - default sdkconfig (seeds a fresh build; the real sdkconfig is
+#  generated and git-ignored). Phase 0 scaffold scope: target, console, dual
+#  core, custom partitions. USB-host tuning lands in Phase 1; WiFi/C6 Phase 10.
+# ============================================================================
+
+# --- Target -----------------------------------------------------------------
+# ESP32-P4: dual-core RISC-V, USB 2.0 High-Speed OTG host. The HS host is the
+# whole reason for this part - 2.4 Msps x 2 bytes ~= 4.8 MB/s of IQ is far past
+# what a Full-Speed S3 could carry (IMPLEMENTATION_PLAN.md S5.1).
+CONFIG_IDF_TARGET="esp32p4"
+
+# --- Console / logging ------------------------------------------------------
+# The P4's USB-C port is power + debug. Route console + monitor over the
+# built-in USB Serial/JTAG so one cable gives us flash AND logs (S1.1). This is
+# also the MVP transport the GDL90 / debug sinks write to (S4.5).
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# --- FreeRTOS / SMP ---------------------------------------------------------
+# Keep BOTH cores online. Core 0 is the hard-real-time RX+DSP path, Core 1 is
+# decode + serve (S2). Never enable UNICORE. 1 kHz tick gives 1 ms aging math.
+# CONFIG_FREERTOS_UNICORE is not set
+CONFIG_FREERTOS_HZ=1000
+
+# --- Flash / partitions -----------------------------------------------------
+# 16 MB assumed (typical P4 dev board). If your board differs, change this one
+# line; the partition layout fits in 8 MB too. Two OTA app slots leave room for
+# field firmware updates without a serial cable later.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# --- Logging verbosity (bring-up) ------------------------------------------
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y

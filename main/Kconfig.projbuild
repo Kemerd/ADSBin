@@ -1,0 +1,18 @@
+menu "ADSBin"
+
+    config ADSBIN_STATUS_LED_GPIO
+        int "Status LED GPIO (-1 to disable)"
+        default -1
+        help
+            GPIO driving the Phase-0 heartbeat LED. The right pin differs across
+            ESP32-P4 dev boards, so there is intentionally NO board default --
+            set this to your board's user LED. Leave it at -1 and the firmware
+            still proves life via the console heartbeat (no LED needed).
+
+    config ADSBIN_STATUS_LED_ACTIVE_LOW
+        bool "Status LED is active-low"
+        default n
+        help
+            Enable if the LED lights when the GPIO is driven LOW.
+
+endmenu

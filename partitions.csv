@@ -1,0 +1,13 @@
+# ============================================================================
+#  ADSBin - partition table (IMPLEMENTATION_PLAN.md S6 Phase 0: "room for OTA").
+#  Two equal app slots (ota_0 / ota_1) + otadata enable field firmware updates.
+#  NVS holds operator config (gain, reference position, filters - S4.7).
+#  Offsets are explicit for clarity; app slots are 64 KB aligned.
+#
+#  Name,     Type, SubType,  Offset,    Size,     Flags
+# ============================================================================
+nvs,        data, nvs,      0x9000,    0x6000,
+otadata,    data, ota,      0xf000,    0x2000,
+phy_init,   data, phy,      0x11000,   0x1000,
+ota_0,      app,  ota_0,    0x20000,   0x300000,
+ota_1,      app,  ota_1,    0x320000,  0x300000,
