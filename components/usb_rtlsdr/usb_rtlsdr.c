@@ -872,7 +872,7 @@ static void bulk_in_cb(usb_transfer_t *xfer)
         }
         return;
 
-    case USB_TRANSFER_STATUS_CANCELLED:
+    case USB_TRANSFER_STATUS_CANCELED:
         /* We cancelled it during stop()/teardown. Just retire it. */
         s_ctx.urbs_inflight--;
         return;
@@ -1406,7 +1406,7 @@ static void task_do_recovery(void)
  * @brief Apply any deferred runtime-config requests on the usb_task.
  *
  * @details
- *   This is where Core-1 set_*/start/stop requests actually reach the chip — on
+ *   This is where Core-1 set_* / start/stop requests actually reach the chip — on
  *   the one task that owns the USB client event loop. Each dirty flag is cleared
  *   under the lock and the matching chip write is performed (only if a device is
  *   open). Failures are recorded in last_error rather than propagated, since the
@@ -1684,6 +1684,10 @@ esp_err_t usb_rtlsdr_deinit(void)
     ESP_LOGI(TAG, "deinit complete");
     return ESP_OK;
 }
+
+/* kick_task() is defined further down with the deferred-config helpers, but the
+ * start/stop/set_* entry points above it are the first callers — declare it here. */
+static inline void kick_task(void);
 
 esp_err_t usb_rtlsdr_start(const usb_rtlsdr_stream_config_t *stream_cfg)
 {

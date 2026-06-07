@@ -15,5 +15,5 @@ idf_component_register(
     SRCS          "demod1090.c"
     INCLUDE_DIRS  "include"
     REQUIRES      common esp_ringbuf freertos
-    PRIV_REQUIRES esp_timer esp_log heap
+    PRIV_REQUIRES esp_timer heap
 )

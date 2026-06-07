@@ -16,6 +16,5 @@ idf_component_register(
     #   esp_timer        -> backs adsbin_now_us() pulled in via adsbin_types.h
     #   common           -> adsbin_types.h (ADSBIN_CORE_*, adsbin_now_us), .c only
     #   freertos         -> render/watchdog task + portMUX temperature spinlock
-    #   esp_log          -> diagnostics
-    PRIV_REQUIRES driver esp_driver_tsens esp_timer common freertos esp_log
+    PRIV_REQUIRES esp_driver_gpio driver esp_driver_tsens esp_timer common freertos
 )

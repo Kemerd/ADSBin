@@ -13,7 +13,7 @@
  *   @c has_position is set; the traffic manager never handles raw CPR.
  *
  *   API SHAPE: the Core-1 decode task calls only modes_decode_frame(); the
- *   granular extract_*/decode_* helpers are exposed so the Python bench harness
+ *   granular extract_* / decode_* helpers are exposed so the Python bench harness
  *   and host unit tests can drive decode field-by-field on canned frames.
  *
  * @par Core affinity

@@ -227,7 +227,7 @@ extern "C" {
  *  The module-private singleton.
  *
  *  One dongle per firmware image. All cross-thread access to mutable config /
- *  stats / device handles goes through s_ctx.lock so a Core-1 set_*/get_* call
+ *  stats / device handles goes through s_ctx.lock so a Core-1 set_* / get_* call
  *  cannot tear a value the Core-0 completion path is updating.
  * ═══════════════════════════════════════════════════════════════════════════ */
 typedef struct {

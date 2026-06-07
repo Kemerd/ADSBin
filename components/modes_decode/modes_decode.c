@@ -355,7 +355,7 @@ modes_msg_kind_t modes_decode_typecode(const uint8_t *frame)
  * Index by the 6-bit code: 1-26 => A-Z, 32 => space, 48-57 => 0-9. Everything
  * else is reserved and rendered as a space so the callsign stays printable.
  */
-static const char IDENT_CHARSET[64] =
+static const char IDENT_CHARSET[] =
     "#ABCDEFGHIJKLMNOPQRSTUVWXYZ#####"   /* 0-31  (0 and 27-31 invalid -> '#')  */
     " ###############0123456789######";  /* 32-63 (32 space, 48-57 digits)      */
 

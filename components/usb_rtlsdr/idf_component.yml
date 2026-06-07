@@ -1,0 +1,11 @@
+## IDF Component Manager manifest for components/usb_rtlsdr.
+##
+## The USB Host Library was extracted from ESP-IDF core into the component
+## registry as of IDF v6.0 (it used to be the in-core `usb` component). It is now
+## the managed package `espressif/usb`, which still provides the same
+## `usb/usb_host.h` API this driver is written against. Declaring it here lets the
+## component manager fetch it into managed_components/ at configure time; the
+## CMakeLists keeps `PRIV_REQUIRES usb` (the package's component name is `usb`).
+dependencies:
+  espressif/usb: "^1.0.0"
+  idf: ">=5.0"

@@ -111,7 +111,7 @@ esp_err_t ownship_init(void);
  *
  * @param lat_deg  WGS-84 latitude  [-90, 90].
  * @param lon_deg  WGS-84 longitude [-180, 180].
- * @param persist  If true, also persist via config_set_*/config_commit().
+ * @param persist  If true, also persist via config_set_* / config_commit().
  * @return ESP_OK; ESP_ERR_INVALID_ARG if lat/lon are out of range.
  */
 esp_err_t ownship_set_manual(double lat_deg, double lon_deg, bool persist);

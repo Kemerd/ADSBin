@@ -103,6 +103,11 @@ struct traffic_mgr_s {
     traffic_stats_t   stats;        /**< Cumulative counters (survive clear()).   */
 };
 
+/* The helpers below refer to the manager by its bare tag name. C has no implicit
+ * typedef for a struct tag, so alias it here (tag and typedef names live in
+ * separate namespaces, so reusing the name is legal and keeps the call sites clean). */
+typedef struct traffic_mgr_s traffic_mgr_s;
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Small internal helpers — all assume the caller already holds @c m->lock
  *  unless explicitly noted. None of them log, allocate, or block.

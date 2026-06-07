@@ -282,7 +282,7 @@ static esp_err_t load_from_nvs(adsbin_config_t *dst)
 /**
  * @brief Write a config snapshot's every field into NVS (no flush).
  *
- * Stages all keys with the typed nvs_set_*/nvs_set_blob calls; the durable
+ * Stages all keys with the typed nvs_set_* / nvs_set_blob calls; the durable
  * flush is a separate nvs_commit() so the entire key set lands atomically.
  *
  * @param src  Source config to persist (a coherent snapshot of ::s_cfg).

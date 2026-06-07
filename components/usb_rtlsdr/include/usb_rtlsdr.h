@@ -20,7 +20,7 @@
  *
  * @par Core affinity
  *   Core 0 (::ADSBIN_CORE_DSP). The USB host task + bulk-IN completions run
- *   pinned here so nothing competes with the ~4.8 MB/s ingest. set_*/get_* are
+ *   pinned here so nothing competes with the ~4.8 MB/s ingest. set_* / get_* are
  *   internally serialized and safe to call from Core 1 while streaming.
  *
  * @copyright Novabox / ADSBin. Receive-only, experimental, non-certified.

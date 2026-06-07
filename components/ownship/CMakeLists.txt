@@ -9,6 +9,6 @@ idf_component_register(
     INCLUDE_DIRS "include"
     REQUIRES     config        # reads/writes the persisted manual reference
     # common  -> adsbin_types.h (adsbin_now_us, the one time base), only used in .c
-    # esp_timer -> backs adsbin_now_us(); freertos -> portMUX spinlock; esp_log -> diags
-    PRIV_REQUIRES esp_timer common freertos esp_log
+    # esp_timer -> backs adsbin_now_us(); freertos -> portMUX spinlock (logging auto-included)
+    PRIV_REQUIRES esp_timer common freertos
 )

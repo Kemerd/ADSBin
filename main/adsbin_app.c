@@ -410,7 +410,7 @@ esp_err_t adsbin_app_init(void)
     esp_chip_info(&chip);
     ESP_LOGI(TAG, "ADSBin booting - ESP-IDF %s", esp_get_idf_version());
     ESP_LOGI(TAG, "chip: %d core(s), silicon rev v%d.%d",
-             chip.cores, chip.full_revision / 100, chip.full_revision % 100);
+             chip.cores, chip.revision / 100, chip.revision % 100);
 
     // Persistent settings first: everything downstream (gain, ownship, filters,
     // sink map) reads from here.
