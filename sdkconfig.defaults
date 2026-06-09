@@ -73,3 +73,24 @@ CONFIG_ESP_WIFI_REMOTE_LIBRARY_HOSTED=y
 # Espressif Function-EV reference (CLK=18,CMD=19,D0=14,D1=15,D2=16,D3=17,
 # reset=GPIO54). VERIFY against the Waveshare schematic after reconfigure and
 # add the board's CONFIG_ESP_HOSTED_SDIO_* overrides here if they differ.
+# (Confirmed 2026-06-09: the SDIO link comes up on the Waveshare with the stock
+# defaults - "H_SDIO_DRV: sdio_data_to_rx_buf_task started" at boot.)
+
+# --- External PSRAM (on-package 32 MB) -------------------------------------
+# REQUIRED ONCE WIFI IS LINKED. The esp_hosted + esp_wifi_remote + lwip stack
+# reserves a large slab of INTERNAL SRAM at startup; without PSRAM that starved
+# demod1090's 128 KB magnitude LUT (MALLOC_CAP_INTERNAL) and the box boot-looped
+# on ESP_ERR_NO_MEM. Turning on the package PSRAM and steering the WiFi/lwIP
+# buffers into it frees the internal SRAM back up so the hot-path LUT still lives
+# in fast internal RAM (we deliberately DON'T move the LUT to slower PSRAM - it is
+# hit per IQ sample on the Core-0 DSP path).
+CONFIG_SPIRAM=y
+# HEX (16-line) PSRAM is the only mode the P4 package supports; 200 MHz is the
+# default and the fastest available on our rev <3 silicon (250 MHz is gated to
+# rev >=3 by Kconfig, and we run rev v1.3 - see ESP32P4_SELECTS_REV_LESS_V3).
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_SPIRAM_SPEED_200M=y
+# Let the heap allocator hand out PSRAM, and prefer it for the big WiFi/lwIP
+# buffers specifically - this is the targeted relief for the SRAM pressure above.
+CONFIG_SPIRAM_USE_MALLOC=y
+CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
