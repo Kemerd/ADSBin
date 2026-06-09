@@ -284,9 +284,15 @@ uat_result_t uat_decode_state_vector(const uint8_t *payload, adsb_msg_t *out_msg
  *  the 8-character flight id from the base-40 alphabet.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/* Base-40 alphabet used by the UAT call sign encoding. */
-static const char UAT_BASE40[40] =
-    "          ABCDEFGHIJKLMNOPQRSTUVWXYZ  ..";   /* index 0..39 */
+/* Base-40 alphabet used by the UAT call sign encoding (indices 0..39). Sized 41
+ * so the string literal's implicit NUL fits; we only ever index 0..39. Layout:
+ * index 0 = space (pad), 1..26 = A..Z, 27..36 = 0..9, 37..39 = spare (space).
+ * Exactly 40 visible characters precede the implicit NUL. */
+static const char UAT_BASE40[41] =
+    /* 0 */ " "
+    /* 1..26 */  "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    /* 27..36 */ "0123456789"
+    /* 37..39 */ "   ";   /* total = 1 + 26 + 10 + 3 = 40 chars (+ NUL) */
 
 uat_result_t uat_decode_mode_status(const uint8_t *payload, size_t len,
                                     adsb_msg_t *out_msg)

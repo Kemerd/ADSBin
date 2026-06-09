@@ -65,12 +65,15 @@
 #include "ownship.h"        // ownship_init / ownship_get
 #include "usb_rtlsdr.h"     // RTL-SDR USB-HS host driver
 #include "demod1090.h"      // 1090ES demodulator (Core 0)
+#include "demod978.h"       // 978 UAT demodulator (Core 0, weather path)
 #include "modes_decode.h"   // Mode-S / ADS-B decoder (Core 1)
+#include "uat_decode.h"     // UAT message decoder (Core 1, weather path)
 #include "traffic.h"        // traffic table manager (Core 1)
 #include "sinks.h"          // sink registry + publisher
 #include "sink_transport.h" // USB-CDC + UDP byte transports for the sinks
 #include "sink_debug.h"     // human-readable debug sink
 #include "sink_gdl90.h"     // GDL90 sink
+#include "sink_uat_weather.h" // GDL90 0x07 FIS-B weather relay sink
 #include "wifi_link.h"      // open SoftAP on the on-board C6 (esp-hosted, S10)
 #include "status.h"         // LEDs + temperature watchdog
 
@@ -86,6 +89,8 @@ static const char *TAG = "adsbin";
 #define ADSBIN_DECODE_TASK_STACK   6144   /**< decode glue: modes_decode_frame().  */
 #define ADSBIN_TRAFFIC_TASK_STACK  4096   /**< traffic glue: ingest + age.         */
 #define ADSBIN_INJECT_TASK_STACK   4096   /**< +INJECT console line reader.        */
+#define ADSBIN_UAT_DECODE_STACK    6144   /**< UAT decode glue: uat_decode_adsb(). */
+#define ADSBIN_UAT_UPLINK_STACK    4096   /**< weather glue: drain ring -> 0x07.   */
 
 /* ───────────────────────────────────────────────────────────────────────────
  *  Pipeline cadence / sizing knobs.
@@ -107,6 +112,13 @@ static sink_transport_t  s_udp_transport;     /**< Optional UDP-broadcast transp
 static sink_handle_t     s_sink_debug;        /**< Optional debug sink.            */
 static sink_handle_t     s_sink_gdl90;        /**< Optional GDL90 sink (USB-CDC).  */
 static sink_handle_t     s_sink_gdl90_wifi;   /**< Optional GDL90 sink (WiFi/UDP). */
+
+/* ── 978 UAT / weather path state (built on demand when a 978 dongle appears) ── */
+static sink_uat_weather_t s_sink_weather;     /**< FIS-B weather relay sink.       */
+static volatile bool      s_978_built;        /**< true once the 978 pipeline is up.*/
+static TaskHandle_t       s_uat_decode_task;  /**< Core-1 UAT decode glue task.    */
+static TaskHandle_t       s_uat_uplink_task;  /**< Core-1 weather uplink glue task.*/
+static volatile bool      s_uat_tasks_run;    /**< Keeps the two UAT glue tasks alive.*/
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Ownship helper
@@ -247,6 +259,283 @@ static void traffic_task(void *arg)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ *  978 UAT / WEATHER PATH (Core 0 demod + two Core-1 glue tasks)
+ *
+ *  Stood up ON DEMAND the moment a 978-role dongle is adopted (at boot if two
+ *  sticks are present, or live via the hotplug event callback). The 1090 path is
+ *  byte-for-byte unaffected: when no 978 dongle exists this whole block is never
+ *  built. Data flow:
+ *
+ *     usb_rtlsdr 978-role IQ ring ─► demod978 (Core 0)
+ *        ├─ uat_frame_queue (uat_frame_t) ─► UAT DECODE GLUE (Core 1)
+ *        │     └─ uat_decode_adsb ─► adsb_msg_t ─► msg_queue (SHARED with 1090!)
+ *        └─ uat_uplink_ring (uat_uplink_t) ─► UPLINK GLUE (Core 1)
+ *              └─ uat_decode_uplink (validate) ─► sink_uat_weather_feed ─► GDL90 0x07
+ *
+ *  UAT traffic therefore merges into the SAME traffic table as 1090 with no extra
+ *  plumbing; only the FIS-B weather uplink is a distinct output.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Core-1 UAT decode glue: uat_frame_queue -> uat_decode_adsb -> msg_queue.
+ *
+ * Identical in shape to decode_task: it pops a candidate UAT frame, decodes it to
+ * the shared adsb_msg_t, and fans it out exactly like a 1090 message (msg_queue +
+ * sink_feed_msg + traffic LED), so UAT aircraft populate the one traffic table.
+ */
+static void uat_decode_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "uat decode task up on core %d", xPortGetCoreID());
+
+    uat_frame_t frame;       // by-value frame popped from the queue
+    adsb_msg_t  msg;         // decoded result handed to traffic/sinks
+
+    while (s_uat_tasks_run) {
+        // Block (bounded) on the UAT frame queue so teardown stays responsive.
+        if (xQueueReceive(s_pipeline.uat_frame_queue, &frame,
+                          pdMS_TO_TICKS(100)) != pdTRUE) {
+            continue;
+        }
+
+        // Parse the FEC-corrected UAT payload into the shared adsb_msg_t. UAT
+        // carries an absolute position directly (no CPR), so this is a pure parse.
+        uat_result_t r = uat_decode_adsb(frame.data, frame.len_bytes,
+                                         frame.rx_time_us, &msg);
+        if (r != UAT_OK) {
+            ESP_LOGV(TAG, "uat decode drop: %d", (int)r);
+            continue;
+        }
+
+        // (a) Hand to the traffic task via the SAME msg_queue 1090 uses — UAT and
+        //     1090 observations merge into one ICAO-keyed table downstream.
+        if (xQueueSend(s_pipeline.msg_queue, &msg, 0) != pdTRUE) {
+            ESP_LOGW(TAG, "msg_queue full; dropping UAT ICAO %06" PRIX32,
+                     adsb_icao_get(&msg));
+        }
+
+        // (b) Per-message sink fan-out (verbose debug etc.), as for 1090.
+        sink_feed_msg(&msg);
+
+        // (c) Heartbeat the TRAFFIC LED on a fresh UAT position fix.
+        if (msg.has_position) {
+            status_notify_traffic();
+        }
+    }
+
+    vTaskDelete(NULL);
+}
+
+/**
+ * @brief Core-1 weather glue: drain the uplink ring, validate, relay as 0x07.
+ *
+ * The uplink frames are large (432 B) and infrequent, so they arrive by reference
+ * through a no-split ring. We validate the header (never relay garbage to the EFB)
+ * then hand the frame to the weather sink, which frames it as GDL90 Uplink Data
+ * and writes it to both transports. The borrowed ring item is returned promptly.
+ */
+static void uat_uplink_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "uat uplink task up on core %d", xPortGetCoreID());
+
+    while (s_uat_tasks_run) {
+        size_t item_size = 0;
+        uat_uplink_t *up = (uat_uplink_t *)xRingbufferReceive(
+            s_pipeline.uat_uplink_ring, &item_size, pdMS_TO_TICKS(100));
+        if (!up) {
+            continue;   // timeout: re-check the run flag and loop.
+        }
+
+        // Light header validation so a malformed buffer never reaches ForeFlight.
+        uat_result_t r = uat_decode_uplink(up->payload, up->payload_len,
+                                           up->rx_time_us, NULL);
+        if (r == UAT_OK && s_sink_weather) {
+            // Relay as GDL90 Uplink Data (0x07) over USB-CDC + UDP.
+            sink_uat_weather_feed(s_sink_weather, up);
+        } else if (r != UAT_OK) {
+            ESP_LOGV(TAG, "uplink validate drop: %d", (int)r);
+        }
+
+        // Return the borrowed ring item — never retain up->payload past this.
+        vRingbufferReturnItem(s_pipeline.uat_uplink_ring, up);
+    }
+
+    vTaskDelete(NULL);
+}
+
+/**
+ * @brief Stand up the entire 978 UAT / weather pipeline (idempotent).
+ *
+ * @details
+ *   Called when a 978-role dongle becomes available (at start, or from the
+ *   hotplug callback). It fetches the 978-role IQ ring, builds the UAT frame queue
+ *   + uplink ring (main owns them), starts demod978 (Core 0), inits uat_decode,
+ *   creates the weather sink on the existing transports, and launches the two
+ *   Core-1 glue tasks. Every failure is non-fatal and leaves the 1090 path intact.
+ *   A second call once built is a no-op.
+ */
+static void build_978_pipeline(void)
+{
+    if (s_978_built) {
+        return;   // already up.
+    }
+
+    // The 978-role ring only exists once usb_rtlsdr has adopted a 978 dongle.
+    RingbufHandle_t ring978 = usb_rtlsdr_get_iq_ring_for_role(ADSBIN_ROLE_978_UAT);
+    if (ring978 == NULL) {
+        return;   // no 978 dongle adopted yet; nothing to build.
+    }
+    s_pipeline.iq_ring_978 = ring978;
+
+    // Build the UAT IPC main owns: a by-value frame queue and a no-split uplink
+    // ring sized for a few 432-byte frames.
+    s_pipeline.uat_frame_queue = xQueueCreate(ADSBIN_UAT_FRAME_QUEUE_LEN,
+                                              sizeof(uat_frame_t));
+    {
+        // Ring item = header + 432-byte payload; size for the configured depth
+        // with the no-split per-item overhead, mirroring the IQ ring sizing.
+        const size_t per_item = sizeof(uat_uplink_t) + UAT_UPLINK_PAYLOAD_BYTES + 8u + 4u;
+        s_pipeline.uat_uplink_ring = xRingbufferCreate(per_item * ADSBIN_UAT_UPLINK_RING_BLOCKS,
+                                                       RINGBUF_TYPE_NOSPLIT);
+    }
+    if (!s_pipeline.uat_frame_queue || !s_pipeline.uat_uplink_ring) {
+        ESP_LOGW(TAG, "978 IPC alloc failed - weather path disabled");
+        return;
+    }
+
+    // Init + start the 978 demod on Core 0 (it reads the 978 ring, emits UAT
+    // frames + uplinks). Uses the UAT defaults (978 MHz, 2.4 Msps, sync_max 4).
+    const demod978_config_t dcfg978 = {
+        .sample_rate_hz  = UAT_SAMPLE_RATE_HZ,
+        .task_core_id    = ADSBIN_CORE_DSP,
+        .task_priority   = ADSBIN_PRIO_DEMOD978,
+        .task_stack_size = 0,     // component default
+        .sync_max_errors = 0,     // 0 => component default (4)
+    };
+    esp_err_t err = demod978_init(&dcfg978);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "demod978_init failed: %s - weather disabled", esp_err_to_name(err));
+        return;
+    }
+    err = demod978_start(s_pipeline.iq_ring_978, s_pipeline.uat_frame_queue,
+                         s_pipeline.uat_uplink_ring);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "demod978_start failed: %s - weather disabled", esp_err_to_name(err));
+        return;
+    }
+
+    // The UAT decoder is stateless; init just validates.
+    uat_decode_init(NULL);
+
+    // The weather sink relays 0x07 to the wired CDC link (always) and UDP (if the
+    // C6 AP came up and the UDP transport exists).
+    const sink_uat_weather_cfg_t wcfg = {
+        .cdc = s_cdc_transport,
+        .udp = s_udp_transport,   // NULL if WiFi never came up — CDC-only then.
+    };
+    if (sink_uat_weather_create(&wcfg, &s_sink_weather) != ESP_OK) {
+        ESP_LOGW(TAG, "weather sink create failed - uplink relay disabled");
+        // demod978 still runs (UAT traffic still works); only weather is lost.
+    }
+
+    // Launch the two Core-1 glue tasks.
+    s_uat_tasks_run = true;
+    xTaskCreatePinnedToCore(uat_decode_task, "adsbin_uatdec",
+                            ADSBIN_UAT_DECODE_STACK, NULL,
+                            ADSBIN_PRIO_UAT_DECODE, &s_uat_decode_task, ADSBIN_CORE_DECODE);
+    xTaskCreatePinnedToCore(uat_uplink_task, "adsbin_uatup",
+                            ADSBIN_UAT_UPLINK_STACK, NULL,
+                            ADSBIN_PRIO_UAT_UPLINK, &s_uat_uplink_task, ADSBIN_CORE_DECODE);
+
+    // Reflect 978 in the live band map (RAM only — never fights the stored value).
+    {
+        adsbin_config_t c;
+        if (config_get(&c) == ESP_OK) {
+            config_set_band_map(c.band_map | ADSBIN_BAND_978);
+        }
+    }
+
+    s_978_built = true;
+    ESP_LOGI(TAG, "978 UAT/weather pipeline up (traffic merges into shared table)");
+}
+
+/**
+ * @brief Tear down the 978 pipeline when the weather dongle is unplugged.
+ *
+ * Stops the demod + glue tasks and destroys the weather sink, leaving the 1090
+ * path completely untouched. The IQ ring belongs to usb_rtlsdr (it idles when the
+ * dongle is gone), so we only release what main owns.
+ */
+static void teardown_978_pipeline(void)
+{
+    if (!s_978_built) {
+        return;
+    }
+
+    // Stop feeding first (Core 0), then the consumers (Core 1).
+    demod978_stop();
+    s_uat_tasks_run = false;
+    // The glue tasks self-delete on their next 100 ms timeout; give them a moment.
+    vTaskDelay(pdMS_TO_TICKS(150));
+    s_uat_decode_task = NULL;
+    s_uat_uplink_task = NULL;
+
+    if (s_sink_weather) {
+        sink_uat_weather_destroy(s_sink_weather);
+        s_sink_weather = NULL;
+    }
+    demod978_deinit();
+
+    if (s_pipeline.uat_frame_queue) {
+        vQueueDelete(s_pipeline.uat_frame_queue);
+        s_pipeline.uat_frame_queue = NULL;
+    }
+    if (s_pipeline.uat_uplink_ring) {
+        vRingbufferDelete(s_pipeline.uat_uplink_ring);
+        s_pipeline.uat_uplink_ring = NULL;
+    }
+    s_pipeline.iq_ring_978 = NULL;
+
+    s_978_built = false;
+    ESP_LOGI(TAG, "978 UAT/weather pipeline torn down (1090 unaffected)");
+}
+
+/**
+ * @brief usb_rtlsdr lifecycle event sink — drives live hotplug of the 978 path.
+ *
+ * @details
+ *   Runs in the driver's housekeeping task (NOT the Core-0 hot path), so it may
+ *   create/delete FreeRTOS tasks. On a 978-role dongle CONNECTED we build the
+ *   weather pipeline; on its DISCONNECTED we tear it down. The 1090 dongle's
+ *   events are ignored here (its pipeline is stood up unconditionally at start).
+ */
+static void usb_event_cb(usb_rtlsdr_event_id_t ev, int device_index, void *user_ctx)
+{
+    (void)user_ctx;
+
+    // Only react to the device currently serving the 978 role.
+    adsbin_rf_role_t role = usb_rtlsdr_role_of(device_index);
+    if (role != ADSBIN_ROLE_978_UAT) {
+        return;
+    }
+
+    switch (ev) {
+    case USB_RTLSDR_EVENT_CONNECTED:
+    case USB_RTLSDR_EVENT_STREAM_STARTED:
+        // A weather dongle arrived (or restarted streaming) — bring the path up.
+        build_978_pipeline();
+        break;
+    case USB_RTLSDR_EVENT_DISCONNECTED:
+        // The weather dongle went away — tear down, leaving traffic running.
+        teardown_978_pipeline();
+        break;
+    default:
+        break;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  *  +INJECT CONSOLE HANDLER (Core 1)
  *
  *  Implements the firmware side of the frozen USB-CDC wire contract
@@ -283,9 +572,86 @@ static void inject_reply(const char *line)
 }
 
 /**
+ * @brief Handle the "+ROLE <auto|1090|978>" console verb (single-dongle override).
+ *
+ * @details
+ *   Lets the operator pin a LONE dongle's RF role for staged testing — e.g. force
+ *   the first dongle to 978 to validate the weather path before a second stick
+ *   exists. It persists the choice to NVS (so it survives reboots), pushes it to
+ *   the live driver override, and applies it immediately by re-driving the dongle:
+ *   tearing down any 978 pipeline and re-starting device 0 on the new band. The
+ *   override is ignored by the driver once two dongles are present.
+ *
+ * @return true if the line was a +ROLE command (handled); false otherwise.
+ */
+static bool role_handle_line(const char *line)
+{
+    static const char PREFIX[] = "+ROLE ";
+    const size_t plen = sizeof(PREFIX) - 1;
+    if (strncmp(line, PREFIX, plen) != 0) {
+        return false;
+    }
+
+    // Skip the prefix + any spaces before the argument.
+    const char *arg = line + plen;
+    while (*arg == ' ') {
+        arg++;
+    }
+
+    // Map the argument to a role override value (0 auto / 1 1090 / 2 978).
+    uint8_t role;
+    adsbin_rf_role_t drv_role;
+    if (strncmp(arg, "auto", 4) == 0) {
+        role = 0; drv_role = ADSBIN_ROLE_NONE;
+    } else if (strncmp(arg, "1090", 4) == 0) {
+        role = 1; drv_role = ADSBIN_ROLE_1090;
+    } else if (strncmp(arg, "978", 3) == 0) {
+        role = 2; drv_role = ADSBIN_ROLE_978_UAT;
+    } else {
+        inject_reply("+ERR BADROLE\n");
+        return true;
+    }
+
+    // Persist (RAM + flash) and push to the driver override.
+    config_set_role_override(role);
+    config_commit();
+    usb_rtlsdr_set_role_override(drv_role);
+
+    // Apply now without a reboot: drop any 978 pipeline, then re-start device 0 so
+    // the adopt path re-tunes the lone dongle to its new role. A 978 force will
+    // rebuild the weather pipeline on the next CONNECTED/START event.
+    teardown_978_pipeline();
+    {
+        // Re-drive device 0's stream so it re-tunes to the override's band. The
+        // driver re-reads the override on the next adopt; stopping + starting the
+        // stream triggers a clean re-tune of the open dongle.
+        usb_rtlsdr_stop();
+        usb_rtlsdr_stream_config_t scfg = {
+            .center_freq_hz      = (drv_role == ADSBIN_ROLE_978_UAT) ? UAT_CENTER_FREQ_HZ
+                                                                     : ADSB_CENTER_FREQ_HZ,
+            .sample_rate_sps     = (drv_role == ADSBIN_ROLE_978_UAT) ? UAT_SAMPLE_RATE_HZ
+                                                                     : ADSB_SAMPLE_RATE_HZ,
+            .gain_mode           = USB_RTLSDR_GAIN_MANUAL_FIXED,
+            .gain_tenth_db       = 0,   // 0 => driver default
+            .freq_correction_ppm = 0,
+            .bias_tee_enable     = false,
+            .device_index        = 0,
+        };
+        usb_rtlsdr_start(&scfg);
+    }
+    // If we forced 978, the 978-role ring will appear — build the weather path.
+    if (drv_role == ADSBIN_ROLE_978_UAT) {
+        build_978_pipeline();
+    }
+
+    inject_reply("+OK\n");
+    return true;
+}
+
+/**
  * @brief Parse and execute one fully-received console line.
  *
- * Recognises only "+INJECT <hex>" per the wire contract; anything else is
+ * Recognises "+INJECT <hex>" and "+ROLE <auto|1090|978>"; anything else is
  * ignored silently (the line may simply be ESP-IDF console traffic). On a valid
  * frame it builds a ::modes_frame_t and pushes it to the decode path.
  *
@@ -293,6 +659,11 @@ static void inject_reply(const char *line)
  */
 static void inject_handle_line(char *line)
 {
+    // The +ROLE verb (single-dongle role override for staged weather testing).
+    if (role_handle_line(line)) {
+        return;
+    }
+
     // Fast reject: only act on the "+INJECT " prefix; leave everything else for
     // the IDF console so we never fight it for unrelated input.
     static const char PREFIX[] = "+INJECT ";
@@ -518,6 +889,22 @@ esp_err_t adsbin_app_start(void)
         ESP_LOGE(TAG, "usb_rtlsdr_init failed: %s", esp_err_to_name(err));
         return err;
     }
+
+    // Push the stored single-dongle role override (0 auto / 1 1090 / 2 978) to the
+    // driver BEFORE any dongle is adopted, so a lone stick forced to 978 (for
+    // staged weather testing) is tuned correctly the moment it enumerates.
+    {
+        uint8_t ovr = config_get_role_override();
+        adsbin_rf_role_t drv = (ovr == 2) ? ADSBIN_ROLE_978_UAT
+                             : (ovr == 1) ? ADSBIN_ROLE_1090
+                             :              ADSBIN_ROLE_NONE;
+        usb_rtlsdr_set_role_override(drv);
+    }
+
+    // Register the lifecycle callback that drives LIVE hotplug of the 978/weather
+    // pipeline: a weather dongle plugged/pulled while running stands the path up or
+    // tears it down without ever interrupting 1090 traffic.
+    usb_rtlsdr_register_event_callback(usb_event_cb, NULL);
 
     // The ring exists once init succeeds — capture it before anyone consumes it.
     s_pipeline.iq_ring = usb_rtlsdr_get_iq_ring();
@@ -788,7 +1175,17 @@ esp_err_t adsbin_app_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    ESP_LOGI(TAG, "pipeline up: usb->demod(core0) -> decode/traffic/sinks(core1)");
+    /* ── 8. 978 UAT / weather path, if a second dongle is already present ────────
+     * Cover the boot-with-two-dongles case: a 978-role dongle adopted during init
+     * (before the event callback could fire) is picked up here. Late hotplug is
+     * handled by usb_event_cb. build_978_pipeline() is idempotent and a no-op when
+     * no 978-role ring exists yet, so the single-dongle box skips it cleanly. The
+     * transports (CDC always, UDP if WiFi came up) already exist by this point, so
+     * the weather sink can bind to them. */
+    build_978_pipeline();
+
+    ESP_LOGI(TAG, "pipeline up: usb->demod(core0) -> decode/traffic/sinks(core1)%s",
+             s_978_built ? " + 978 UAT/weather" : "");
     return ESP_OK;
 }
 

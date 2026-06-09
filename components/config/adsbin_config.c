@@ -61,6 +61,7 @@ static const char *TAG = "config";
  */
 #define KEY_TUNER_GAIN   "tuner_gain"   /**< int32  tenths of dB, or AUTO.       */
 #define KEY_BAND_MAP     "band_map"     /**< uint32 ::adsbin_band_t bitmask.     */
+#define KEY_ROLE_OVR     "role_ovr"     /**< uint8  single-dongle role override. */
 #define KEY_REF_VALID    "ref_valid"    /**< uint8  manual-ref present flag.      */
 #define KEY_REF_LAT      "ref_lat"      /**< blob   double latitude (WGS-84).    */
 #define KEY_REF_LON      "ref_lon"      /**< blob   double longitude (WGS-84).   */
@@ -97,6 +98,7 @@ static const adsbin_config_t s_defaults = {
     /* ── Tuner / RF ───────────────────────────────────────────────────────── */
     .tuner_gain_tenth_db = ADSBIN_CFG_DEFAULT_GAIN_TENTHDB, /* 49.6 dB, AGC off. */
     .band_map            = ADSBIN_BAND_1090,                /* 1090ES only (MVP).*/
+    .role_override       = 0,                               /* 0 => auto (count). */
 
     /* ── Ownship manual reference ─────────────────────────────────────────── */
     .ref_valid           = false,    /* No manual fix until the operator sets one.*/
@@ -239,6 +241,11 @@ static esp_err_t load_from_nvs(adsbin_config_t *dst)
     err = nvs_get_u32(s_nvs, KEY_BAND_MAP, &dst->band_map);
     if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) return err;
 
+    /* Single-dongle role override (uint8). Missing key keeps the default (0=auto),
+     * so a box that never set it behaves exactly as before this field existed. */
+    err = nvs_get_u8(s_nvs, KEY_ROLE_OVR, &dst->role_override);
+    if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) return err;
+
     err = nvs_get_i32(s_nvs, KEY_ALT_FT, &dst->alt_filter_ft);
     if (err != ESP_OK && err != ESP_ERR_NVS_NOT_FOUND) return err;
 
@@ -297,6 +304,9 @@ static esp_err_t store_to_nvs(const adsbin_config_t *src)
     if (err != ESP_OK) return err;
 
     err = nvs_set_u32(s_nvs, KEY_BAND_MAP, src->band_map);
+    if (err != ESP_OK) return err;
+
+    err = nvs_set_u8(s_nvs, KEY_ROLE_OVR, src->role_override);
     if (err != ESP_OK) return err;
 
     err = nvs_set_i32(s_nvs, KEY_ALT_FT, src->alt_filter_ft);
@@ -539,6 +549,27 @@ esp_err_t config_set_band_map(uint32_t band_map)
      */
     cfg_lock();
     s_cfg.band_map = band_map;
+    cfg_unlock();
+    return ESP_OK;
+}
+
+uint8_t config_get_role_override(void)
+{
+    cfg_lock();
+    uint8_t v = s_cfg.role_override;
+    cfg_unlock();
+    return v;
+}
+
+esp_err_t config_set_role_override(uint8_t role)
+{
+    /* Only the three defined roles are accepted (0 auto, 1 1090, 2 978); anything
+     * else is rejected so a typo cannot wedge a dongle into an undefined band. */
+    if (role > 2) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    cfg_lock();
+    s_cfg.role_override = role;
     cfg_unlock();
     return ESP_OK;
 }

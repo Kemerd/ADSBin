@@ -14,11 +14,13 @@ idf_component_register(
         common          # shared ABI: adsbin_types.h, adsbin_err.h, core-id macros
         config          # config_init / config_get (NVS-backed settings)
         ownship         # ownship_init / ownship_get (reference position)
-        usb_rtlsdr      # RTL-SDR USB-HS host driver; owns the IQ ring
+        usb_rtlsdr      # RTL-SDR USB-HS host driver; owns the IQ ring(s)
         demod1090       # 1090ES demodulator (Core 0)
+        demod978        # 978 UAT demodulator (Core 0, weather path)
         modes_decode    # Mode-S / ADS-B decoder (Core 1)
+        uat_decode      # UAT message decoder (Core 1, weather path)
         traffic         # ICAO-keyed traffic table (Core 1)
-        sinks           # output sink registry + USB-CDC transport + sinks
+        sinks           # output sink registry + USB-CDC/UDP transport + sinks (incl. weather)
         wifi_link       # open SoftAP on the on-board C6 (esp-hosted, S10)
         status          # LEDs + temperature watchdog (Core 1)
         # ── ESP-IDF components main itself touches ───────────────────────────

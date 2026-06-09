@@ -38,10 +38,14 @@ extern "C" {
  * ─────────────────────────────────────────────────────────────────────────── */
 #define ADSBIN_PRIO_USB      (configMAX_PRIORITIES - 2)  /**< usb_rtlsdr RX (Core0). */
 #define ADSBIN_PRIO_DEMOD    (configMAX_PRIORITIES - 3)  /**< demod1090 DSP (Core0). */
+#define ADSBIN_PRIO_DEMOD978 (configMAX_PRIORITIES - 3)  /**< demod978 DSP  (Core0). */
 #define ADSBIN_PRIO_DECODE   5                           /**< modes_decode (Core1).  */
 #define ADSBIN_PRIO_TRAFFIC  4                           /**< traffic table (Core1). */
 #define ADSBIN_PRIO_SINKS    3                           /**< output sinks  (Core1). */
 #define ADSBIN_PRIO_STATUS   2                           /**< LEDs / temp   (Core1). */
+/* UAT glue tasks share the decode/traffic priority band on Core 1. */
+#define ADSBIN_PRIO_UAT_DECODE  5                        /**< uat_decode glue (Core1).*/
+#define ADSBIN_PRIO_UAT_UPLINK  3                        /**< uplink glue   (Core1).  */
 
 /* ───────────────────────────────────────────────────────────────────────────
  *  IPC sizing. Producers and consumers must agree on these, so they are fixed
@@ -50,6 +54,10 @@ extern "C" {
 #define ADSBIN_IQ_RING_BLOCKS   8     /**< Depth of the IQ ring (>= 8 blocks).   */
 #define ADSBIN_FRAME_QUEUE_LEN  256   /**< modes_frame_t slots (Core0 -> Core1). */
 #define ADSBIN_MSG_QUEUE_LEN    128   /**< adsb_msg_t slots (decode -> traffic). */
+
+/* 978 UAT path IPC sizing (only built when a 978-role dongle is present). */
+#define ADSBIN_UAT_FRAME_QUEUE_LEN   64   /**< uat_frame_t slots (demod978 -> uat_decode).*/
+#define ADSBIN_UAT_UPLINK_RING_BLOCKS 4   /**< uat_uplink_t ring depth (432 B each).      */
 
 /**
  * @brief Shared inter-task plumbing built once by `main` and handed to tasks.
@@ -66,7 +74,16 @@ extern "C" {
 typedef struct {
     RingbufHandle_t iq_ring;      /**< IQ blocks, no-split ring (owned by usb_rtlsdr). */
     QueueHandle_t   frame_queue;  /**< Candidate ::modes_frame_t, by value.            */
-    QueueHandle_t   msg_queue;    /**< Decoded ::adsb_msg_t, by value.                 */
+    QueueHandle_t   msg_queue;    /**< Decoded ::adsb_msg_t, by value (1090 AND UAT).  */
+
+    /* ── 978 UAT / weather path (built only when a 978-role dongle is present) ──
+     * The 978 IQ ring is owned by usb_rtlsdr (its 978-role slot); the UAT frame
+     * queue + uplink ring are owned by main and feed the UAT glue tasks. UAT
+     * traffic merges into the SAME msg_queue above, so it reaches the one traffic
+     * table with no separate path. */
+    RingbufHandle_t iq_ring_978;     /**< 978-role IQ ring (usb_rtlsdr), or NULL.      */
+    QueueHandle_t   uat_frame_queue; /**< ::uat_frame_t, by value (demod978->uat_decode).*/
+    RingbufHandle_t uat_uplink_ring; /**< ::uat_uplink_t by ref (demod978->weather glue).*/
 } adsbin_pipeline_t;
 
 /* ───────────────────────────────────────────────────────────────────────────

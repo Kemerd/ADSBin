@@ -9,7 +9,7 @@
 #  time from the CONFIG_ESP_CONSOLE_* choice.
 # ─────────────────────────────────────────────────────────────────────────────
 idf_component_register(
-    SRCS          "sinks.c" "sink_debug.c" "sink_gdl90.c" "sink_transport.c" "gdl90_encoder.c"
+    SRCS          "sinks.c" "sink_debug.c" "sink_gdl90.c" "sink_uat_weather.c" "sink_transport.c" "gdl90_encoder.c"
     INCLUDE_DIRS  "include"
     REQUIRES      common ownship traffic
     PRIV_REQUIRES esp_driver_usb_serial_jtag esp_driver_uart esp_timer freertos lwip

@@ -93,6 +93,13 @@ typedef struct {
     int32_t  tuner_gain_tenth_db;   /**< Fixed gain ×10 dB, or GAIN_AUTO.     */
     uint32_t band_map;              /**< ::adsbin_band_t bitmask of bands.    */
 
+    /* ── Single-dongle role override (consumed by usb_rtlsdr at adopt) ────── */
+    /* Forces the FIRST-adopted dongle's RF role so a LONE dongle can be tested
+     * as 978 weather before a second stick exists (staged bring-up). Values are
+     * ::adsbin_rf_role_t (0 = auto/count-based, 1 = force 1090, 2 = force 978).
+     * Ignored once two dongles are present (count-based assignment wins). */
+    uint8_t  role_override;         /**< 0=auto, 1=1090, 2=978 (adsbin_rf_role_t).*/
+
     /* ── Ownship manual reference (seeds the `ownship` component) ─────────── */
     bool     ref_valid;             /**< True if a manual lat/lon is stored.  */
     double   ref_lat_deg;           /**< Manual reference latitude  (WGS-84). */
@@ -168,6 +175,9 @@ esp_err_t config_set_tuner_gain(int32_t gain_tenth_db);     /**< Set tuner gain.
 
 uint32_t config_get_band_map(void);                         /**< Enabled bands.    */
 esp_err_t config_set_band_map(uint32_t band_map);           /**< Set band bitmask. */
+
+uint8_t  config_get_role_override(void);                    /**< 0=auto/1=1090/2=978.*/
+esp_err_t config_set_role_override(uint8_t role);           /**< Single-dongle role. */
 
 uint32_t config_get_sink_map(void);                         /**< Enabled sinks.    */
 esp_err_t config_set_sink_map(uint32_t sink_map);           /**< Set sink bitmask. */
