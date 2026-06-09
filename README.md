@@ -9,9 +9,10 @@ Receive-only ADS-B (1090ES) traffic receiver for the ESP32-P4 for **under $100.*
 | **Tier 3** | Traffic + Weather + GPS ownship | **≈ $143** |
 
 ADSBin decodes 1090 MHz ADS-B broadcasts from nearby aircraft using an RTL-SDR dongle and re-emits
-them as GDL90 traffic for an EFB (ForeFlight, Garmin Pilot) or a panel display. It is receive-only
-and electrically incapable of transmitting. The name is the aviation term *ADS-B In* (receiving), as
-opposed to *ADS-B Out* (transmitting).
+them as GDL90 traffic for an EFB (ForeFlight, Garmin Pilot) or a panel display. The RTL-SDR is a
+receive-only radio that cannot transmit on 1090/978 MHz — the only RF it emits is the WiFi link that
+delivers GDL90 to your tablet. The name is the aviation term *ADS-B In* (receiving), as opposed to
+*ADS-B Out* (transmitting), which ADSBin does not and cannot do.
 
 ---
 
