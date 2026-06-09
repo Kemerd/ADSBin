@@ -5,10 +5,8 @@ Receive-only ADS-B (1090ES) traffic receiver for the ESP32-P4 for **under $100.*
 | Tier | What you get | Total |
 |---|---|---|
 | **Tier 1** | Traffic only (1090ES) | **≈ $81** |
-| **Tier 2** | Traffic + Weather (1090 + 978 UAT/FIS-B) — Stratux bundle | **≈ $128** |
+| **Tier 2** | Traffic + Weather (1090 + 978 UAT/FIS-B) | **≈ $128** |
 | **Tier 3** | Traffic + Weather + GPS ownship | **≈ $143** |
-
-<sub>One firmware image; the box auto-tiers by the dongles you plug in. Full breakdown in the [bill of materials](#bill-of-materials).</sub>
 
 ADSBin decodes 1090 MHz ADS-B broadcasts from nearby aircraft using an RTL-SDR dongle and re-emits
 them as GDL90 traffic for an EFB (ForeFlight, Garmin Pilot) or a panel display. It is receive-only
