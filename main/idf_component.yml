@@ -1,0 +1,29 @@
+## IDF Component Manager manifest for the ADSBin `main` component.
+##
+## main pulls wifi_link into the build. wifi_link calls the esp_wifi.h surface,
+## which on the ESP32-P4 is NOT in IDF core: the P4 has no radio and reaches WiFi
+## through the on-board ESP32-C6 over SDIO. Two managed packages provide that
+## path and must be fetched into managed_components/ at configure time (only
+## espressif/usb is resolved there today - these are additive). This mirrors the
+## IDF v6.0.1 softAP reference manifest, which pairs BOTH packages, gated to P4/H2:
+##
+##   * espressif/esp_wifi_remote - re-exports the SAME esp_wifi.h surface but RPCs
+##     each call to the C6. The HOSTED backend is selected in sdkconfig.defaults
+##     (CONFIG_ESP_WIFI_REMOTE_LIBRARY_HOSTED). Range >=0.10,<2.0 matches the
+##     reference and lets the solver pick a pairing compatible with esp_hosted.
+##   * espressif/esp_hosted - the actual SDIO host<->slave transport the remote
+##     backend drives in HOSTED mode. It OWNS the slave-target + SDIO-pin Kconfig.
+##
+## Both are scoped via rules: to P4/H2 so they never enter a host-test build.
+dependencies:
+  idf: ">=6.0"
+
+  espressif/esp_wifi_remote:
+    version: ">=0.10,<2.0"
+    rules:
+      - if: "target in [esp32p4, esp32h2]"
+
+  espressif/esp_hosted:
+    version: "~2"
+    rules:
+      - if: "target in [esp32p4, esp32h2]"

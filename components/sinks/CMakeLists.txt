@@ -12,5 +12,5 @@ idf_component_register(
     SRCS          "sinks.c" "sink_debug.c" "sink_gdl90.c" "sink_transport.c" "gdl90_encoder.c"
     INCLUDE_DIRS  "include"
     REQUIRES      common ownship traffic
-    PRIV_REQUIRES esp_driver_usb_serial_jtag esp_driver_uart esp_timer freertos
+    PRIV_REQUIRES esp_driver_usb_serial_jtag esp_driver_uart esp_timer freertos lwip
 )

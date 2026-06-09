@@ -15,4 +15,28 @@ menu "ADSBin"
         help
             Enable if the LED lights when the GPIO is driven LOW.
 
+    config ADSBIN_AP_SSID
+        string "WiFi SoftAP SSID (ForeFlight link)"
+        default "ADSBin"
+        help
+            Name of the OPEN (no-password) WiFi network the on-board ESP32-C6
+            broadcasts. A tablet running ForeFlight joins this network and
+            receives GDL90 traffic over UDP :4000. Hard-set here per board.
+
+    config ADSBIN_AP_CHANNEL
+        int "WiFi SoftAP channel"
+        default 6
+        range 1 13
+        help
+            2.4 GHz channel the SoftAP runs on. 1/6/11 are the non-overlapping
+            choices; 6 is a safe default.
+
+    config ADSBIN_AP_MAX_CLIENTS
+        int "WiFi SoftAP max simultaneous clients"
+        default 4
+        range 1 8
+        help
+            How many devices may associate at once. Keep small: the link exists
+            to feed one or two tablets, not to be a general hotspot.
+
 endmenu

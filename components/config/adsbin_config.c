@@ -110,7 +110,7 @@ static const adsbin_config_t s_defaults = {
     .max_targets         = DEFAULT_MAX_TGT,
 
     /* ── Output ───────────────────────────────────────────────────────────── */
-    .sink_map            = (ADSBIN_SINK_DEBUG | ADSBIN_SINK_GDL90), /* MVP sinks.*/
+    .sink_map            = (ADSBIN_SINK_DEBUG | ADSBIN_SINK_GDL90 | ADSBIN_SINK_WIFI), /* MVP sinks + WiFi/UDP GDL90 for ForeFlight out of the box. */
 };
 
 /* ───────────────────────────────────────────────────────────────────────────

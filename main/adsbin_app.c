@@ -68,9 +68,10 @@
 #include "modes_decode.h"   // Mode-S / ADS-B decoder (Core 1)
 #include "traffic.h"        // traffic table manager (Core 1)
 #include "sinks.h"          // sink registry + publisher
-#include "sink_transport.h" // USB-CDC byte transport for the sinks
+#include "sink_transport.h" // USB-CDC + UDP byte transports for the sinks
 #include "sink_debug.h"     // human-readable debug sink
 #include "sink_gdl90.h"     // GDL90 sink
+#include "wifi_link.h"      // open SoftAP on the on-board C6 (esp-hosted, S10)
 #include "status.h"         // LEDs + temperature watchdog
 
 /// Log tag for the application core.
@@ -102,8 +103,10 @@ static const char *TAG = "adsbin";
 static adsbin_pipeline_t s_pipeline;          /**< IQ ring + frame/msg queues.     */
 static traffic_handle_t  s_traffic;           /**< Traffic table instance.         */
 static sink_transport_t  s_cdc_transport;     /**< Shared USB-CDC byte transport.  */
+static sink_transport_t  s_udp_transport;     /**< Optional UDP-broadcast transport.*/
 static sink_handle_t     s_sink_debug;        /**< Optional debug sink.            */
-static sink_handle_t     s_sink_gdl90;        /**< Optional GDL90 sink.            */
+static sink_handle_t     s_sink_gdl90;        /**< Optional GDL90 sink (USB-CDC).  */
+static sink_handle_t     s_sink_gdl90_wifi;   /**< Optional GDL90 sink (WiFi/UDP). */
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Ownship helper
@@ -626,11 +629,14 @@ esp_err_t adsbin_app_start(void)
         return err;
     }
 
-    // Honour the configured sink map. Default (no bits set) lights up both sinks
-    // so a fresh box is immediately bench-observable.
+    // Honour the configured sink map. Default (no bits set) lights up debug +
+    // GDL90 on the wired USB-C link AND GDL90 broadcast over the C6 SoftAP, so a
+    // fresh box is bench-observable and ForeFlight-ready out of the box. The WiFi
+    // bring-up below is non-fatal, so a board with no working C6 still falls back
+    // cleanly to the two wired sinks.
     uint32_t sink_map = cfg.sink_map;
     if (sink_map == ADSBIN_SINK_NONE) {
-        sink_map = ADSBIN_SINK_DEBUG | ADSBIN_SINK_GDL90;
+        sink_map = ADSBIN_SINK_DEBUG | ADSBIN_SINK_GDL90 | ADSBIN_SINK_WIFI;
     }
 
     if (sink_map & ADSBIN_SINK_DEBUG) {
@@ -662,6 +668,62 @@ esp_err_t adsbin_app_start(void)
             sinks_register(s_sink_gdl90);
         } else {
             ESP_LOGW(TAG, "sink_gdl90_create failed: %s", esp_err_to_name(err));
+        }
+    }
+
+    /* ── 5b. WiFi / UDP GDL90 sink (optional, best-effort) ──────────────────
+     * The wired sinks above are the source of truth; this block adds a SECOND
+     * GDL90 sink that broadcasts over the on-board C6's open SoftAP so a tablet
+     * running ForeFlight receives the same frames on UDP :4000. EVERY failure
+     * here is non-fatal: WiFi is a bonus, never a precondition for decoding, so
+     * we log and continue, leaving the USB-CDC path fully intact. */
+    if (sink_map & ADSBIN_SINK_WIFI) {
+        // Stand up the open AP on the C6. SSID/channel/max-clients come from the
+        // project Kconfig (menu "ADSBin"); authmode is fixed OPEN inside wifi_link
+        // (no password — ForeFlight just joins). NVS is already initialised by
+        // config_init() in adsbin_app_init(), so wifi_link must NOT re-init it.
+        const wifi_link_ap_cfg_t apcfg = {
+            .ssid        = CONFIG_ADSBIN_AP_SSID,
+            .channel     = CONFIG_ADSBIN_AP_CHANNEL,
+            .max_clients = CONFIG_ADSBIN_AP_MAX_CLIENTS,
+        };
+        esp_err_t werr = wifi_link_start_ap(&apcfg);
+        if (werr != ESP_OK) {
+            // C6 link down / esp-hosted not ready: drop the whole WiFi path but
+            // keep decoding + the wired sinks alive.
+            ESP_LOGW(TAG, "wifi_link_start_ap failed (%s) - WiFi sink disabled, "
+                          "wired path unaffected", esp_err_to_name(werr));
+        } else {
+            // AP is up — build the UDP-broadcast transport (one datagram per GDL90
+            // frame, port 4000, the ForeFlight GDL90 listen port).
+            const sink_transport_udp_cfg_t ucfg = {
+                .port = 4000,
+            };
+            werr = sink_transport_udp_create(&ucfg, &s_udp_transport);
+            if (werr != ESP_OK) {
+                ESP_LOGW(TAG, "sink_transport_udp_create failed: %s",
+                         esp_err_to_name(werr));
+            } else {
+                // Same GDL90 encoder as the wired sink, pointed at the UDP
+                // transport — the transport seam means zero encoder changes.
+                const sink_gdl90_cfg_t wcfg = {
+                    .transport             = s_udp_transport,
+                    .emit_ownship_report   = true,   // emit 0x0A when ownship valid
+                    .max_targets_per_cycle = 0,      // no per-cycle cap
+                };
+                werr = sink_gdl90_create(&wcfg, &s_sink_gdl90_wifi);
+                if (werr == ESP_OK) {
+                    // Seed the ownship so the WiFi sink's Ownship Report matches
+                    // the wired one.
+                    ownship_ref_t own;
+                    const ownship_ref_t *ref = ownship_snapshot(&own);
+                    sink_gdl90_set_ownship(s_sink_gdl90_wifi, ref);
+                    sinks_register(s_sink_gdl90_wifi);
+                } else {
+                    ESP_LOGW(TAG, "sink_gdl90_create (wifi) failed: %s",
+                             esp_err_to_name(werr));
+                }
+            }
         }
     }
 

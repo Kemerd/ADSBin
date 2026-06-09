@@ -19,6 +19,7 @@ idf_component_register(
         modes_decode    # Mode-S / ADS-B decoder (Core 1)
         traffic         # ICAO-keyed traffic table (Core 1)
         sinks           # output sink registry + USB-CDC transport + sinks
+        wifi_link       # open SoftAP on the on-board C6 (esp-hosted, S10)
         status          # LEDs + temperature watchdog (Core 1)
         # ── ESP-IDF components main itself touches ───────────────────────────
         esp_driver_gpio                # status LED pin (board-default convention)

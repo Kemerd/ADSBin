@@ -48,3 +48,28 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 # --- Logging verbosity (bring-up) ------------------------------------------
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+
+# --- WiFi via on-board ESP32-C6 (esp-hosted) -------------------------------
+# The P4 has no radio; it reaches WiFi through the on-board C6 over SDIO. The
+# esp_wifi_remote managed component (pulled by main/idf_component.yml) re-exports
+# the standard esp_wifi.h API and RPCs it to the C6. Select its HOSTED backend
+# (the esp-hosted SDIO transport) rather than the EPPP/UART one. This symbol is
+# stable across versions; still verify it survives reconfigure:
+CONFIG_ESP_WIFI_REMOTE_LIBRARY_HOSTED=y
+#
+# Slave target = ESP32-C6. RESOLVED (verified after reconfigure 2026-06-09): the
+# esp_hosted Kconfig defaults already select the C6 once HOSTED is enabled above
+# — sdkconfig resolves CONFIG_ESP_HOSTED_CP_TARGET_ESP32C6=y on its own, so we do
+# NOT pin it here (kconfgen silently drops an unknown CONFIG_ name, so an active
+# wrong guess is worse than relying on the confirmed default). The real symbol is
+# CONFIG_ESP_HOSTED_CP_TARGET_ESP32C6 (gated by SLAVE_IDF_TARGET_ESP32C6); the
+# other two candidates below were WRONG names. Left documented, not active:
+# CONFIG_SLAVE_IDF_TARGET_ESP32C6=y          (a dependency symbol, auto-set)
+# CONFIG_ESP_HOSTED_TARGET_ESP32C6=y         (WRONG: no such symbol)
+# CONFIG_ESP_HOSTED_CP_TARGET_ESP32C6=y      (REAL name; auto-resolves, no need to pin)
+#
+# SDIO PIN MAP: the C6<->P4 SDIO pins are board-specific and ALSO live in the
+# esp_hosted Kconfig. The Waveshare ESP32-P4-WIFI6 pinout may differ from the
+# Espressif Function-EV reference (CLK=18,CMD=19,D0=14,D1=15,D2=16,D3=17,
+# reset=GPIO54). VERIFY against the Waveshare schematic after reconfigure and
+# add the board's CONFIG_ESP_HOSTED_SDIO_* overrides here if they differ.
