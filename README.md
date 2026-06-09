@@ -1,6 +1,6 @@
 # ADSBin
 
-Receive-only ADS-B (1090ES) traffic receiver for the ESP32-P4.
+Receive-only ADS-B (1090ES) traffic receiver for the ESP32-P4 for **under $100.** 
 
 ADSBin decodes 1090 MHz ADS-B broadcasts from nearby aircraft using an RTL-SDR dongle and re-emits
 them as GDL90 traffic for an EFB (ForeFlight, Garmin Pilot) or a panel display. It is receive-only
