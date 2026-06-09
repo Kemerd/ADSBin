@@ -53,7 +53,9 @@
 #include "esp_idf_version.h"
 #include "sdkconfig.h"
 
-#include "driver/usb_serial_jtag.h"   // +INJECT console RX over the shared USB-C link
+#include <stdio.h>    // fputs/fflush for the +INJECT reply (text; CRLF-safe).
+#include <unistd.h>   // read()/STDIN_FILENO for UNBUFFERED console input — see the
+                      // inject console task for why stdio getchar() won't do.
 
 #include "adsbin_app.h"     // pipeline plumbing + task tuning knobs (frozen)
 #include "adsbin_types.h"   // ADSBIN_CORE_*, adsbin_now_us(), modes_frame_t, adsb_msg_t
@@ -263,15 +265,18 @@ static int hex_nibble(char c)
 }
 
 /**
- * @brief Write a short reply line back to the host over USB-CDC.
+ * @brief Write a short reply line back to the host over the console link.
  *
- * Goes straight to the USB Serial/JTAG driver (the same link the console and the
- * sink transport use) with a bounded timeout so a dead host never wedges us.
+ * Uses stdio so the reply follows whatever transport the console is configured
+ * for (UART0 on boards whose USB-C jack routes through a USB-UART bridge, or the
+ * native USB Serial/JTAG on boards that break that controller out). fflush()
+ * pushes it out immediately rather than waiting on the line buffer, so the host
+ * sees the +OK/+ERR with no added latency.
  */
 static void inject_reply(const char *line)
 {
-    usb_serial_jtag_write_bytes((const uint8_t *)line, strlen(line),
-                                pdMS_TO_TICKS(20));
+    fputs(line, stdout);
+    fflush(stdout);
 }
 
 /**
@@ -358,13 +363,20 @@ static void inject_console_task(void *arg)
     size_t len = 0;
 
     for (;;) {
-        // Read one byte with a bounded wait. Reading single bytes keeps the line
-        // assembler simple and the latency-to-reply low; throughput on a control
-        // channel like this is irrelevant.
-        uint8_t ch;
-        int n = usb_serial_jtag_read_bytes(&ch, 1, pdMS_TO_TICKS(100));
+        // Read one byte from the console via the raw VFS file descriptor, NOT
+        // stdio. stdio's getchar() imposes its own line buffering and the choice
+        // of underlying stdin path (rom polling vs the installed UART driver) is
+        // ambiguous at this layer, which left injected lines unread. read() on
+        // STDIN_FILENO is unbuffered and goes straight through the console VFS —
+        // which the sink transport has bound to the interrupt-driven UART driver —
+        // so a byte is delivered the instant it lands. The driver yields the CPU
+        // while waiting, so this task simply parks between commands. read()<=0 is
+        // a transient empty/closed read; back off briefly and retry.
+        char ch;
+        int n = read(STDIN_FILENO, &ch, 1);
         if (n <= 0) {
-            continue;   // timeout / no data — just keep waiting
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
         }
 
         if (ch == '\r' || ch == '\n') {
@@ -703,8 +715,9 @@ esp_err_t adsbin_app_start(void)
         return ESP_ERR_NO_MEM;
     }
 
-    // The inject console reads USB-CDC RX; the transport above already installed
-    // the USB Serial/JTAG driver, so the reader can pull bytes immediately.
+    // The inject console reads the console link via stdio, which the IDF console
+    // (UART0 or USB Serial/JTAG, per sdkconfig) has already brought up by now, so
+    // the reader can pull bytes immediately without owning a peripheral itself.
     ok = xTaskCreatePinnedToCore(inject_console_task, "adsbin_inject",
                                  ADSBIN_INJECT_TASK_STACK, NULL,
                                  ADSBIN_PRIO_STATUS, NULL, ADSBIN_CORE_DECODE);

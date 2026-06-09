@@ -22,7 +22,6 @@ idf_component_register(
         status          # LEDs + temperature watchdog (Core 1)
         # ── ESP-IDF components main itself touches ───────────────────────────
         esp_driver_gpio                # status LED pin (board-default convention)
-        esp_driver_usb_serial_jtag     # +INJECT console RX over the shared USB-C link
         esp_timer                      # backs adsbin_now_us()
         esp_ringbuf                    # RingbufHandle_t in the pipeline struct
         freertos                       # tasks + queues (the glue layer)

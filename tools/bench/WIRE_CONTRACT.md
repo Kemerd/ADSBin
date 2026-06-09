@@ -5,9 +5,13 @@ This file is the **frozen ABI** between the firmware's USB-CDC output (the
 harness (`tools/bench/`). Both sides MUST conform byte-for-byte. Do not change a
 token name or delimiter without bumping every consumer.
 
-> Transport: USB Serial/JTAG on the P4's USB-C port (the same link that carries
-> the ESP-IDF console). The GDL90 byte stream and this text share the link; the
-> harness deframes GDL90 by its `0x7E` flags and reads debug lines as UTF-8 text.
+> Transport: the ESP-IDF console link on the P4's USB-C port (the same link that
+> carries flashing and logs). On boards that break out the native USB-Serial/JTAG
+> controller this is `303A:1001`; on boards whose single USB-C jack is wired
+> through an on-board USB-UART bridge (e.g. a CH343) it is that bridge's COM port
+> instead — point the bench at it with `--port COMx`. Either way the GDL90 byte
+> stream and this text share the one link; the harness deframes GDL90 by its
+> `0x7E` flags and reads debug lines as UTF-8 text.
 
 ---
 

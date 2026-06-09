@@ -140,14 +140,22 @@ class CdcLink:
         @param baud          Line rate (ignored by true USB-CDC, set for UARTs).
         @param read_timeout  Per-read timeout the reader thread uses, seconds.
         """
-        # Open the underlying pyserial port. A short read timeout keeps the
-        # reader thread responsive to shutdown without busy-spinning.
-        self._serial = serial.Serial(
-            port=port,
-            baudrate=baud,
-            timeout=read_timeout,
-            write_timeout=2.0,
-        )
+        # Open the underlying pyserial port WITHOUT asserting the modem control
+        # lines. On boards whose USB-C jack routes through a USB-UART bridge (e.g.
+        # a CH343), DTR/RTS are wired to the P4's EN/IO0 auto-reset circuit, so a
+        # default open() would reboot the device — losing any command we send and
+        # resetting the traffic table mid-test. We construct the port unopened,
+        # clear DTR/RTS, then open, so the board keeps running across connect.
+        # (A true USB-Serial/JTAG endpoint ignores these lines, so this is safe on
+        # every supported transport.)
+        self._serial = serial.Serial()
+        self._serial.port = port
+        self._serial.baudrate = baud
+        self._serial.timeout = read_timeout
+        self._serial.write_timeout = 2.0
+        self._serial.dtr = False
+        self._serial.rts = False
+        self._serial.open()
 
         # Captured-but-unconsumed bytes for the GDL90 deframer view.
         self._byte_buf = bytearray()
@@ -157,6 +165,12 @@ class CdcLink:
         self._line_buf = bytearray()
         # Completed (newline-terminated) lines, decoded to str, FIFO order.
         self._lines: List[str] = []
+        # Persistent GDL90-frame state for the TEXT filter. Frames (0x7E..0x7E)
+        # interleave with text on the shared link and can split across read
+        # chunks, so we track "are we currently inside a frame?" ACROSS chunks and
+        # route in-frame bytes away from the text accumulator. Without persistence
+        # a frame split over two reads would leak its second half into the text.
+        self._in_gdl90_frame = False
 
         # One lock guards all three buffers above; held only briefly.
         self._lock = threading.Lock()
@@ -219,6 +233,42 @@ class CdcLink:
                 self._byte_buf.extend(chunk)
                 self._consume_lines_locked(chunk)
 
+    # GDL90 flag byte. A frame is FLAG ... FLAG; on the shared link these frames
+    # interleave with the sink_debug text and would otherwise splice into a text
+    # line and fracture a KEY=VALUE token. The byte view (read_bytes) keeps the
+    # raw stream for the GDL90 deframer; the TEXT view filters frames out below.
+    _GDL90_FLAG = 0x7E
+
+    def _filter_text_bytes(self, chunk: bytes) -> bytes:
+        """
+        Strip interleaved GDL90 frames from @p chunk for the TEXT view.
+
+        Walks the chunk byte-by-byte through a persistent in-frame state machine
+        (``self._in_gdl90_frame``), so a frame split across read chunks is handled
+        correctly: every byte from an opening 0x7E up to and including the closing
+        0x7E is dropped (it belongs to the binary GDL90 view, captured separately).
+        Each complete frame is replaced by a single newline so it acts as a line
+        boundary instead of gluing the surrounding text lines together (a blank
+        line is harmless — the parser keys only on ICAO/===/MSG lines). Bytes
+        outside any frame pass through verbatim.
+        """
+        out = bytearray()
+        for b in chunk:
+            if self._in_gdl90_frame:
+                # Inside a frame: discard until the closing flag, then emit one
+                # newline to preserve the text line boundary the frame sat on.
+                if b == self._GDL90_FLAG:
+                    self._in_gdl90_frame = False
+                    out.append(0x0A)   # '\n'
+                # else: drop the in-frame byte.
+            elif b == self._GDL90_FLAG:
+                # Opening flag — enter frame state; nothing emitted yet.
+                self._in_gdl90_frame = True
+            else:
+                # Ordinary text byte.
+                out.append(b)
+        return bytes(out)
+
     def _consume_lines_locked(self, chunk: bytes) -> None:
         """
         Append @p chunk to the line accumulator and split out completed lines.
@@ -227,7 +277,11 @@ class CdcLink:
         trailing ``\\r`` (CRLF from the IDF console) is stripped. Bytes after the
         last newline stay buffered until their newline arrives.
         """
-        self._line_buf.extend(chunk)
+        # Filter interleaved binary GDL90 frames out of the text stream BEFORE
+        # accumulating, tracking frame state across chunks (the GDL90 byte view
+        # already captured them independently). This is the root fix for the
+        # shared-link interleave: text lines stay pure grammar.
+        self._line_buf.extend(self._filter_text_bytes(chunk))
 
         # Pull out every complete, newline-terminated line.
         while True:
@@ -239,9 +293,8 @@ class CdcLink:
             raw = bytes(self._line_buf[:nl])
             del self._line_buf[:nl + 1]
 
-            # The shared link interleaves binary GDL90 with text. Decode leniently
-            # so a stray framing byte that landed on the text side never throws;
-            # strip CR and surrounding whitespace for clean token parsing.
+            # Decode leniently so any residual stray byte never throws; strip CR
+            # and surrounding whitespace for clean token parsing.
             line = raw.decode("utf-8", errors="replace").rstrip("\r")
             self._lines.append(line)
 

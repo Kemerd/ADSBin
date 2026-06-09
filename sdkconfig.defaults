@@ -10,12 +10,26 @@
 # what a Full-Speed S3 could carry (IMPLEMENTATION_PLAN.md S5.1).
 CONFIG_IDF_TARGET="esp32p4"
 
+# --- Silicon revision -------------------------------------------------------
+# Our physical dev board carries an EARLY P4 sample (rev v1.3). ESP-IDF v6
+# defaults the P4 to the mass-production v3.x family, but rev <3.0 and >=3.0 are
+# a "mutually exclusive" hardware split (see esp_hw_support P4 Kconfig): a v3.x
+# image refuses to boot/flash on v1.x silicon. Opt into the pre-v3 family and
+# set the minimum supported revision to v1.0 so this v1.3 chip is in range.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+
 # --- Console / logging ------------------------------------------------------
-# The P4's USB-C port is power + debug. Route console + monitor over the
-# built-in USB Serial/JTAG so one cable gives us flash AND logs (S1.1). This is
-# also the MVP transport the GDL90 / debug sinks write to (S4.5).
-CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
-CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+# The P4's USB-C port is power + debug, carrying console/monitor AND the MVP
+# GDL90 / sink_debug stream (S1.1, S4.5). The transport chip depends on the
+# board, though: THIS dev board routes its single USB-C jack through an on-board
+# CH343 USB-UART bridge wired to the P4's default download UART (UART0) — the
+# native USB-Serial/JTAG controller has no connector. So the console must be on
+# UART0, not USB-Serial/JTAG, or nothing reaches the host (and the bench can't
+# feed packets in). UART0's pre-defined GPIOs are the same pins esptool flashes
+# over, which is why flashing works on this board. Boards that break out the
+# native USB-C port can switch this back to CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
 
 # --- FreeRTOS / SMP ---------------------------------------------------------
 # Keep BOTH cores online. Core 0 is the hard-real-time RX+DSP path, Core 1 is
