@@ -370,23 +370,32 @@ ADSBin/
 
 | Item | State |
 |---|---|
-| Firmware build (ESP-IDF v6.0.1 / esp32p4) | Builds clean. `adsbin.bin` ≈ 333 KB; fits the 3 MB app slot (89% free). |
-| Host unit tests (CPR / GDL90 / debug format) | 44 / 44 passing. |
-| Full pipeline (USB → DSP → decode → traffic → sinks) | Implemented and linked. |
-| On-hardware bring-up (live traffic) | Not yet performed; requires the P4 + dongle flashed. |
+| Firmware build (ESP-IDF v6.0.1 / esp32p4) | Builds clean. `adsbin.bin` ≈ 835 KB; fits the 3 MB app slot (73% free). |
+| Host unit tests (CPR / GDL90 / RS-FEC / UAT demod+decode / debug format) | All passing (incl. the new 978/UAT + GDL90 0x07 suites). |
+| Full 1090 pipeline (USB → DSP → decode → traffic → sinks) | Flashed and running on the P4; GDL90 stream CRC-clean; injected CPR pairs resolve to ground truth. |
+| Dual-dongle / auto-role (1090 traffic + 978 weather) | Implemented and on-silicon: the driver allocates a per-role IQ ring and assigns roles by hub-port position + serial. |
+| 978 UAT / FIS-B weather (demod978 + uat_decode + GDL90 0x07 sink) | Implemented; live-hotplugs in/out without interrupting traffic. Awaiting a second dongle for on-air weather validation. |
+| `+ROLE` single-dongle override | Verified on hardware (`+OK`), persists to NVS — force a lone dongle to 978 for staged weather testing. |
 | GDL90 NIC/NACp fields; raw-frame debug (`RAW=`) | Not yet wired through `adsb_msg_t`; does not block the build. |
 
-Compiles, links, fits, and passes all host-side tests. Remaining work is on-silicon validation
-(frame yield vs. dump1090, target counts vs. a reference receiver) and the two open ABI items above.
+Builds, flashes, boots, and runs on the P4: the 1090 traffic chain is verified end-to-end on
+silicon (CRC-clean GDL90, injected positions resolve correctly). The 978 weather chain is
+algorithmically verified by host unit tests (Reed-Solomon FEC across all three UAT codes, FSK
+sync/demod on synthesized waveforms, UAT→`adsb_msg_t`); on-air weather validation is pending a
+second (978) dongle.
 
 ---
 
 ## Roadmap
 
-- **978 MHz UAT** — second dongle (auto-detected); adds UAT traffic and FIS-B weather.
-- **WiFi GDL90** — bring up the on-board ESP32-C6; UDP broadcast to tablets. Reuses the GDL90 encoder.
+- **978 MHz UAT + FIS-B weather** — *implemented.* A second auto-detected dongle adds UAT traffic
+  (merged into the same table) and FIS-B weather relayed to ForeFlight as GDL90 Uplink (0x07).
+  Pending on-air validation with a real 978 dongle.
+- **WiFi GDL90** — *implemented.* The on-board ESP32-C6 SoftAP + UDP :4000 broadcast to tablets,
+  same encoder as the wired path.
 - **RS-232 / Garmin TIS-A** — panel-display output (e.g. G3X Touch); requires a reference position.
-- **GPS / NMEA ownship** — live reference for relative formats and range/altitude filtering.
+- **GPS / NMEA ownship** — live reference for relative formats and range/altitude filtering
+  (hardware listed in the BOM; firmware support not yet implemented).
 
 ---
 
