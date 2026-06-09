@@ -40,7 +40,7 @@ Antenna is just as flexible: use the **built-in antenna** for a self-contained r
 Commercial ADS-B receivers are comparatively expensive, and some gate decode features behind an app
 subscription despite the hardware being capable. The decode path is well-documented and the radio is
 a commodity RTL-SDR, so the full receive → decode → output chain can be implemented on low-cost
-hardware. ADSBin does that from a **~$73 traffic build up to a ~$138 traffic + weather build** (see
+hardware. ADSBin does that from a **~$73 traffic build up to a ~$128 traffic + weather build** (see
 the [bill of materials](#bill-of-materials)), with source available for inspection and modification
 under a noncommercial license.
 
@@ -137,13 +137,22 @@ port.
 Shared base **+ two** receivers. The firmware auto-assigns the first dongle to **1090 traffic** and
 the second to **978 weather**; weather streams to ForeFlight as GDL90 Uplink (FIS-B) frames.
 
+**Easiest path — one bundle covers both dongles and every antenna:**
+
 | Part | Cost | Link |
 |---|---|---|
-| 2× NESDR Nano 3 — **or** the Stratux bundle (two Nano 3 + dual-band antennas) | **$89.90** (2×$44.95) / **bundle** | [Stratux Nano 3 bundle](https://www.nooelec.com/store/stratux-bundle-nano-3.html) |
+| **Nooelec Stratux Nano 3 bundle** — two NESDR Nano 3 receivers **plus all the antennas you need** (both 1090 + 978 bands). One SKU, no loose parts to source. | **$99.95** | [Stratux Nano 3 bundle](https://www.nooelec.com/store/stratux-bundle-nano-3.html) |
+
+**Tier 2 total (bundle): ≈ $128** (base ≈ $28 + Stratux bundle $99.95).
+
+**Or source the parts loose:**
+
+| Part | Cost | Link |
+|---|---|---|
+| 2× NESDR Nano 3 | **$89.90** (2×$44.95) | [nooelec.com](https://www.nooelec.com/store/nesdr-nano-three.html) |
 | Antennas — the bands are tuned differently, so a 978 antenna is required. The **ADS-B Discovery 5 dBi dual-band antenna bundle** covers both 1090 + 978. | **$19.95** | [antenna bundle](https://www.nooelec.com/store/ads-b-discovery-antenna-bundle-5dbi.html) |
 
-**Tier 2 total: ≈ $138** (base ≈ $28 + two Nano 3 ≈ $90 + antenna bundle ≈ $20). The Stratux bundle
-can replace the two loose dongles + antennas for a similar all-in price.
+**Tier 2 total (loose): ≈ $138** (base ≈ $28 + two Nano 3 ≈ $90 + antenna bundle ≈ $20).
 
 ### Tier 3 — Traffic + Weather + GPS (ownship)
 
@@ -154,7 +163,7 @@ filtering). *GPS firmware support is not yet implemented — listed so you can b
 |---|---|---|
 | GPS / NMEA module | **~$15** | [AliExpress](https://www.aliexpress.us/item/3256810616275036.html) |
 
-**Tier 3 total: ≈ $153** (Tier 2 + GPS).
+**Tier 3 total: ≈ $143** (Tier 2 bundle ≈ $128 + GPS ≈ $15).
 
 > A single 1090-only dongle is expected to be passively coolable. With two dongles + WiFi the box
 > works harder; the firmware samples and logs peak die temperature for thermal validation before the
