@@ -21,6 +21,20 @@ The hardware is an ESP32-P4 (dual-core RISC-V, USB 2.0 High-Speed host) driving 
 R820T2 dongle. The High-Speed host is a hard requirement: 1090ES capture runs at 2.4 Msps of 8-bit
 I/Q (~4.8 MB/s), which exceeds the USB Full-Speed bandwidth available on smaller ESP32 parts.
 
+## Form factor and power
+
+ADSBin is the size of a thumb drive — about **3 in long × 1 in wide**, tapering from **½ in tall at
+its thinnest to 1 in at its highest**. It fits in a pocket or clips out of the way on the panel.
+
+The cutting-edge ESP32-P4 runs cool enough to stay passively cooled at this size, so there's no fan
+and no heat to manage. Power it however the cockpit allows:
+
+- **USB port** — plug it into an aircraft USB outlet and it runs off ship power.
+- **Battery bank** — any USB power bank makes it fully portable, no aircraft wiring required.
+
+Antenna is just as flexible: use the **built-in antenna** for a self-contained receiver, or wire up a
+**permanent external antenna** for better range and a fixed install.
+
 ## Rationale
 
 Commercial ADS-B receivers are comparatively expensive, and some gate decode features behind an app
