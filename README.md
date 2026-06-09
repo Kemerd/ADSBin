@@ -1,73 +1,50 @@
-<div align="center">
+# ADSBin
 
-# ✈️ ADSBin
+Receive-only ADS-B (1090ES) traffic receiver for the ESP32-P4.
 
-### A small, cheap, receive-only ADS‑B box for general aviation.
-
-**It listens to the planes around you and tells your tablet where they are.**
-No subscription. No transmitter. No nonsense.
-
-`ESP32‑P4` · `RTL‑SDR` · `1090 MHz / 1090ES` · `GDL90 out` · `~$55–80 in parts`
-
-</div>
+ADSBin decodes 1090 MHz ADS-B broadcasts from nearby aircraft using an RTL-SDR dongle and re-emits
+them as GDL90 traffic for an EFB (ForeFlight, Garmin Pilot) or a panel display. It is receive-only
+and electrically incapable of transmitting. The name is the aviation term *ADS-B In* (receiving), as
+opposed to *ADS-B Out* (transmitting).
 
 ---
 
-> **ADSBin = "ADS‑B *In*."** In aviation, *ADS‑B In* means **receiving** traffic — as opposed to
-> *ADS‑B Out*, which **transmits** your position. This box is electrically incapable of
-> transmitting. That's the whole point: it's the part that keeps you aware, not the part that
-> talks to ATC. Receive‑only is what keeps it legal, cheap, and liability‑light.
+## Overview
 
-A Novabox product, sibling to LidarAGL. Built for **experimental / non‑certified** aircraft and
-the bench. **Not** a collision‑avoidance system — see [the disclaimer](DISCLAIMER.md).
+ADS-B is a surveillance protocol that most aircraft broadcast in the clear on 1090 MHz: ICAO
+address, GPS-derived position, barometric altitude, velocity, and callsign. ADSBin receives that
+broadcast, demodulates and decodes Mode-S / ADS-B (DF17/DF18), resolves target positions via CPR,
+maintains an aging traffic table, and emits GDL90 — the traffic format EFBs and panel displays
+consume.
 
----
+The hardware is an ESP32-P4 (dual-core RISC-V, USB 2.0 High-Speed host) driving a single RTL2832U +
+R820T2 dongle. The High-Speed host is a hard requirement: 1090ES capture runs at 2.4 Msps of 8-bit
+I/Q (~4.8 MB/s), which exceeds the USB Full-Speed bandwidth available on smaller ESP32 parts.
 
-## 🧭 Table of contents
+## Rationale
 
-- [Why ADSBin](#-why-adsbin)
-- [How it works](#-how-it-works)
-- [What you need (hardware + cost)](#-what-you-need)
-- [Wiring it up](#-wiring-it-up)
-- [Software setup](#-software-setup)
-- [Build & flash](#-build--flash)
-- [Using it](#-using-it)
-- [Testing without a radio (the bench harness)](#-testing-without-a-radio)
-- [Configuration](#-configuration)
-- [Project layout](#-project-layout)
-- [Status](#-status)
-- [Roadmap](#-roadmap)
-- [License & attribution](#-license--attribution)
+Commercial ADS-B receivers are comparatively expensive, and some gate decode features behind an app
+subscription despite the hardware being capable. The decode path is well-documented and the radio is
+a commodity RTL-SDR, so the full receive → decode → output chain can be implemented on low-cost
+hardware. ADSBin does that on a ~$55–80 bill of materials, with source available for inspection and
+modification under a noncommercial license.
 
----
+Design constraints carried throughout:
 
-## 💡 Why ADSBin
-
-Commercial ADS‑B receivers are either expensive, locked behind app subscriptions, or both. ADSBin
-is the opposite of that:
-
-- **🔓 No software feature‑locks.** You get every decode feature the hardware can do. Tiering is by
-  *what you plug in*, never by a paywall. (The decode core is derived from open ADS‑B work — locking
-  it would be both wrong and legally impossible.)
-- **🧩 One binary, many boxes.** The firmware **auto‑detects** how many dongles and which bands are
-  present and lights up features accordingly. Build the superset, sell the subset. Same image on the
-  glareshield today, in the panel tomorrow.
-- **🛰️ No GPS required.** ADS‑B targets broadcast their *own* absolute position; ADSBin resolves it
-  with global CPR (even/odd pairing) and hands your tablet absolute lat/lon. Your EFB already knows
-  where *you* are. (Ownship is only needed for relative formats — that's a later phase.)
-- **⚡ Genuinely real‑time.** A dual‑core RISC‑V design where Core 0 does nothing but ingest IQ and
-  run DSP, and Core 1 does everything else. 2.4 Msps of 8‑bit I/Q (~4.8 MB/s) streams over USB
-  High‑Speed — a rate a smaller ESP32 physically cannot carry. This is *why* the P4 exists here.
-- **🪶 Cheap and hackable.** ~$55–80 in parts, a plastic box, a wire antenna, and a USB‑C cable.
-
-It's small, it's fast, and it does exactly one job extremely well.
+- **One firmware image.** Features are enabled by *detected hardware* (dongle count, bands present),
+  not by build flags or license gates.
+- **No GPS required.** Aircraft broadcast their own absolute position; ADSBin resolves it with global
+  CPR (even/odd pairing) and emits absolute lat/lon. A reference position is only needed for relative
+  output formats (a later phase).
+- **Receive-only, non-certified.** Intended for experimental aircraft and bench use. See
+  [DISCLAIMER.md](DISCLAIMER.md).
 
 ---
 
-## ⚙️ How it works
+## Architecture
 
-ADSBin pins the hard‑real‑time radio path to **Core 0** and everything else to **Core 1**, so the
-~4.8 MB/s sample firehose never competes with decoding or output.
+The hard-real-time radio path is pinned to Core 0; everything else runs on Core 1, so the sample
+ingest is never preempted by decode or output work.
 
 ```
                  ┌──────────────────────────── ESP32-P4 ────────────────────────────┐
@@ -84,289 +61,245 @@ ADSBin pins the hard‑real‑time radio path to **Core 0** and everything else 
                  │                          ▼   adsb_msg (queue)            │CRC/CPR │ │
                  │                   ┌─────────────┐                        └────────┘ │
                  │                   │  traffic    │  merge by ICAO, age, range/alt cull │
-                 │                   │  table      │                                    │
                  │                   └──────┬──────┘                                    │
                  │                          │ snapshot                                  │
-                 │              ┌───────────┼───────────┐                               │
-                 │              ▼           ▼           ▼                               │
-                 │        [sink_debug] [sink_gdl90]  [future: WiFi / TIS]              │
-                 │         USB-CDC      USB-CDC                                          │
+                 │              ┌───────────┴───────────┐                               │
+                 │              ▼                       ▼                               │
+                 │        [sink_debug]            [sink_gdl90]   (+ future WiFi / TIS)  │
+                 │         USB-CDC                  USB-CDC                              │
                  └────────────────────────────────────────────────────────────────────┘
 ```
 
-The pipeline, stage by stage:
-
-| Stage | Component | Core | What it does |
+| Stage | Component | Core | Function |
 |---|---|---|---|
-| 1 | **usb_rtlsdr** | 0 | Brings up the USB‑HS host, tunes the R820T2 to 1090 MHz @ 2.4 Msps, streams raw I/Q into a lock‑free ring it owns. |
-| 2 | **demod1090** | 0 | Magnitude LUT → 8 µs preamble correlation → PPM bit‑slice → 56/112‑bit candidate frames. Never blocks; drops‑with‑counter under load. |
-| 3 | **modes_decode** | 1 | 24‑bit Mode‑S CRC, DF17/18 parse, ICAO, callsign, altitude, velocity, and **CPR position resolution** (global even/odd + local). Emits absolute lat/lon. |
-| 4 | **traffic** | 1 | One record per aircraft keyed by ICAO. Merges updates, ages out stale targets, optional range/altitude/sanity culling. |
-| 5 | **sinks** | 1 | Pluggable outputs: a human‑readable **debug table** and a spec‑correct **GDL90** stream (Heartbeat + Traffic Report), both over USB‑CDC for the MVP. Same encoder later drives WiFi. |
+| 1 | `usb_rtlsdr` | 0 | USB-HS host bring-up; tune R820T2 to 1090 MHz @ 2.4 Msps; stream raw I/Q into a lock-free ring. |
+| 2 | `demod1090` | 0 | Magnitude LUT → 8 µs preamble correlation → PPM bit-slice → 56/112-bit candidate frames. Non-blocking. |
+| 3 | `modes_decode` | 1 | Mode-S CRC, DF17/18 parse, ICAO, callsign, altitude, velocity, and CPR position resolution (global + local) → absolute lat/lon. |
+| 4 | `traffic` | 1 | One record per aircraft, keyed by ICAO. Merge updates, age out stale targets, optional range/altitude/sanity culling. |
+| 5 | `sinks` | 1 | Pluggable outputs: a debug table and a GDL90 stream (Heartbeat + Traffic Report), both over USB-CDC. |
 
-Supporting cast: **config** (NVS settings), **ownship** (optional reference position), **status**
-(LEDs + die‑temperature watchdog), **common** (the shared type contract every component compiles
-against). Full design rationale lives in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
+Supporting components: `config` (NVS-backed settings), `ownship` (optional reference position),
+`status` (LEDs + internal die-temperature watchdog), `common` (the shared type contract every
+component compiles against). Full design rationale: [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
 
 ---
 
-## 🛒 What you need
+## Bill of materials
 
-The MVP is one compute board, one dongle, one antenna, and a cable.
-
-| Part | What | ~Cost |
+| Part | Specification | Cost |
 |---|---|---|
-| **Compute** | ESP32‑P4 dev board (ideally with an on‑board ESP32‑C6 for future WiFi). Dual‑core RISC‑V ~400 MHz, USB 2.0 **High‑Speed** OTG host. | ~$30–40 |
-| **Receiver** | Nooelec **NESDR Nano 3** (RTL2832U + **R820T2**). A generic R820T2 dongle works too. | ~$30–45 (or ~$15–20 generic) |
-| **Antenna** | 1090 MHz λ/4 whip (**~68 mm**) on SMA + a small ground plane/counterpoise. DIY is totally fine. | ~$2–3 |
-| **Power** | USB‑C, 5 V. Budget ≥ **1.5 A** headroom (P4 + dongle + future C6). | — |
-| **Enclosure** | Small **plastic/composite** box (RF‑transparent — metal blocks an internal antenna). | ~$10 |
-| **Status** | 1–2 LEDs (power + "hearing traffic" heartbeat). | — |
-| | **MVP total** | **≈ $55–80** |
+| Compute | ESP32-P4 dev board (optionally with on-board ESP32-C6 for later WiFi). Dual-core RISC-V, USB 2.0 High-Speed host. | $30–40 |
+| Receiver | Nooelec NESDR Nano 3 (RTL2832U + R820T2). A generic R820T2 dongle is also compatible. | $30–45 (~$15–20 generic) |
+| Antenna | 1090 MHz quarter-wave whip (~68 mm) on SMA, with a small ground plane. | $2–3 |
+| Power | USB-C, 5 V, ≥ 1.5 A headroom (P4 + dongle + future C6). | — |
+| Enclosure | Plastic/composite (RF-transparent; metal blocks an internal antenna). | ~$10 |
+| Indicators | 1–2 LEDs (power; traffic-heard). | — |
+| | **Total** | **≈ $55–80** |
 
-> 🔥 **Thermals:** one dongle + 1090‑only is almost certainly **passive‑coolable** — likely **no
-> fan**. Keep a thermal pad to the enclosure wall and let the firmware's temp watchdog log
-> worst‑case temps during field testing before you commit.
+A single 1090-only dongle is expected to be passively coolable. The firmware samples and logs peak
+die temperature for thermal validation before the enclosure is sealed.
 
 ---
 
-## 🔌 Wiring it up
+## Wiring
 
-The P4 has **two** USB interfaces. Don't conflate them:
+The P4 exposes two distinct USB interfaces:
 
-| P4 port | Used for |
+| Port | Use |
 |---|---|
-| **USB‑C** | **Power + debug.** Flashing, logs, and the MVP GDL90/debug output all ride this one cable (USB‑Serial/JTAG). |
-| **USB‑HS OTG host** | **The dongle.** A separate interface dedicated to the RTL‑SDR. |
+| USB-C | Power and debug — flashing, logs, and (currently) the GDL90/debug output, over USB-Serial/JTAG. |
+| USB-HS host | The RTL-SDR dongle. A separate interface dedicated to sample ingest. |
 
-Wire the NESDR Nano's USB‑A plug **directly** to the P4's HS host port:
+Wire the dongle's USB-A plug directly to the P4's High-Speed host port:
 
 ```
-NESDR Nano (RTL2832U)            ESP32-P4 (USB-HS host)
-  D+  ───────────────────────────►  HS host D+   (keep the pair short, matched, away from noise)
-  D-  ───────────────────────────►  HS host D-
-  VBUS (5V) ◄─────────────────────  5V rail      (host mode: the P4 powers the dongle, ~300–500 mA)
-  GND ───────────────────────────►  GND          (common ground)
-
-  SMA ── 1090 MHz λ/4 whip (~68 mm) + ground plane
+NESDR Nano (RTL2832U)             ESP32-P4 (USB-HS host)
+  D+   ───────────────────────────►  HS host D+      (short, length-matched pair; route away from noise)
+  D-   ───────────────────────────►  HS host D-
+  VBUS (5V) ◄──────────────────────  5V rail         (host mode: the P4 powers the dongle, ~300-500 mA)
+  GND  ───────────────────────────►  GND
+  SMA  ── 1090 MHz quarter-wave whip (~68 mm) + ground plane
 ```
 
-Then:
-
-- **Antenna placement matters.** Keep the element away from the P4, switching regulators, and USB —
-  ADS‑B is weak and those raise your noise floor. Short coax (1090 MHz is lossy). Plastic box for an
-  internal antenna; metal box ⇒ external antenna.
-- **Confirm your 5 V rail** can source the dongle's ~300–500 mA *on top of* the P4 itself, and add a
-  bulk cap near the dongle's VBUS tap to survive inrush.
-- **Status LEDs** are board‑specific — you pick the GPIOs in config (see [Configuration](#-configuration)).
-
-Full RF/placement notes are in [IMPLEMENTATION_PLAN.md §8](IMPLEMENTATION_PLAN.md).
+ADS-B is a weak signal; minimize noise coupling: keep the antenna element away from the P4,
+switching regulators, and USB lines; keep coax short (1090 MHz is lossy); use a plastic enclosure for
+an internal antenna (metal requires an external antenna). Verify the 5 V rail can source the dongle's
+~300–500 mA in addition to the P4, and place a bulk capacitor near the dongle's VBUS to handle inrush.
+Full RF/placement notes: [IMPLEMENTATION_PLAN.md §8](IMPLEMENTATION_PLAN.md).
 
 ---
 
-## 🧰 Software setup
+## Toolchain setup
 
-ADSBin builds with **ESP‑IDF v6.0.1** (RISC‑V GCC 15.2) targeting `esp32p4`.
+Builds with ESP-IDF v6.0.1 (RISC-V GCC 15.2), target `esp32p4`.
 
-1. **Install ESP‑IDF v6.0.1** (the standard Espressif installer or the VS Code extension). Confirm
-   the toolchain + Python venv are actually installed (`idf.py --version` works in an ESP‑IDF
-   terminal).
-2. **Open an ESP‑IDF terminal** so `idf.py` is on `PATH`. On Windows, that's the "ESP‑IDF
-   PowerShell/CMD" shortcut, or source the export script:
+1. Install ESP-IDF v6.0.1 and verify the toolchain (`idf.py --version` in an ESP-IDF terminal).
+2. Open an ESP-IDF terminal so `idf.py` is on `PATH`, or source the export script:
    ```powershell
    . C:\esp\v6.0.1\esp-idf\export.ps1
    ```
-3. **Set the target once** (regenerates `sdkconfig` from `sdkconfig.defaults`):
+3. Set the target once (regenerates `sdkconfig` from `sdkconfig.defaults`):
    ```
-   tools\set-target.bat          # == idf.py set-target esp32p4
+   tools\set-target.bat        # idf.py set-target esp32p4
    ```
 
-The USB Host Library left ESP‑IDF core in v6.0 — ADSBin pulls it back in automatically as the
-managed component `espressif/usb` (declared in `components/usb_rtlsdr/idf_component.yml`). The
-component manager fetches it on first build; just be online for that build.
+The USB Host Library was removed from ESP-IDF core in v6.0. ADSBin declares it as the managed
+component `espressif/usb` in `components/usb_rtlsdr/idf_component.yml`; the component manager fetches
+it on the first build (network access required for that build).
 
-> **Flash size** defaults to **16 MB** (typical P4 dev board). Different board? Change the one
-> `CONFIG_ESPTOOLPY_FLASHSIZE_*` line in `sdkconfig.defaults`. The partition layout (dual 3 MB OTA
-> app slots) fits in 8 MB too.
+Flash size defaults to 16 MB. Adjust the `CONFIG_ESPTOOLPY_FLASHSIZE_*` line in `sdkconfig.defaults`
+for other boards; the partition layout (dual 3 MB OTA app slots) also fits in 8 MB.
 
 ---
 
-## 🚀 Build & flash
+## Build and flash
 
-One‑click `.bat` helpers live in [`tools/`](tools/) (run them yourself from an ESP‑IDF terminal):
+Deploy scripts in [`tools/`](tools/), run from an ESP-IDF terminal:
 
-| Command | Does |
+| Command | Action |
 |---|---|
-| `tools\set-target.bat` | One‑time: set chip to ESP32‑P4. |
-| `tools\build.bat` | Build only (fast compile check). |
-| `tools\bfm.bat [COMx]` | **Build → flash → monitor** in one shot (the main loop). Omit `COMx` to auto‑detect. |
-| `tools\flash.bat [COMx]` | Flash + monitor (no rebuild). |
-| `tools\monitor.bat [COMx]` | Serial monitor only (`Ctrl‑]` to exit). |
+| `tools\set-target.bat` | One-time: set chip to ESP32-P4. |
+| `tools\build.bat` | Build only. |
+| `tools\bfm.bat [COMx]` | Build, flash, and monitor. Omit `COMx` to auto-detect. |
+| `tools\flash.bat [COMx]` | Flash and monitor (no rebuild). |
+| `tools\monitor.bat [COMx]` | Serial monitor (`Ctrl-]` to exit). |
 
-Typical first run:
+Initial bring-up:
 
 ```
 tools\set-target.bat
-tools\bfm.bat COM5          # ← your P4's USB-C serial port
+tools\bfm.bat COM5          # P4 USB-C serial port
 ```
 
-You should see the boot banner (chip + cores + IDF version), the two cores report in, and — with no
-dongle yet — a 1 Hz "alive" heartbeat. Plug in the NESDR and traffic starts flowing.
+Expected output: the boot banner (chip, cores, IDF version), both cores reporting in, and — with no
+dongle attached — a 1 Hz heartbeat. Attaching the dongle starts the decode pipeline.
 
 ---
 
-## 📡 Using it
+## Output
 
-Once flashed and connected to an antenna with traffic overhead, ADSBin emits **two streams over the
-USB‑C serial link**:
+Over the USB-C serial link, ADSBin emits two streams:
 
-1. **A human‑readable traffic table** (`sink_debug`) — one line per aircraft:
-   ```
-   === ADSBIN TRAFFIC 3 @ 19h... ===
-   ICAO=A1B2C3 CS=UAL123 LAT=37.6189 LON=-122.3750 ALT=12000 GS=320 TRK=095 VR=-640 MSGS=42 SEEN=120
-   ...
-   === END ===
-   ```
-2. **A GDL90 byte stream** (`sink_gdl90`) — Heartbeat + Traffic Report frames an EFB understands.
+`sink_debug` — a human-readable traffic table, one line per aircraft:
 
-In the MVP both ride **USB‑CDC** so you can validate everything from a PC before any WiFi exists. The
-GDL90 encoder is transport‑agnostic — the *same* encoder later broadcasts over WiFi to ForeFlight /
-Garmin Pilot, changing only the transport.
+```
+=== ADSBIN TRAFFIC 3 @ ... ===
+ICAO=A1B2C3 CS=UAL123 LAT=37.6189 LON=-122.3750 ALT=12000 GS=320 TRK=095 VR=-640 MSGS=42 SEEN=120
+=== END ===
+```
 
-The exact wire format (debug tokens, GDL90 constants, the `+INJECT` test command) is frozen in
+`sink_gdl90` — a GDL90 byte stream (Heartbeat + Traffic Report) consumable directly by an EFB.
+
+Both use USB-CDC in the current build, allowing full validation from a PC before WiFi exists. The
+GDL90 encoder is transport-agnostic; WiFi delivery (UDP broadcast to ForeFlight / Garmin Pilot)
+reuses the same encoder and changes only the transport. The wire format is specified in
 [`tools/bench/WIRE_CONTRACT.md`](tools/bench/WIRE_CONTRACT.md).
 
 ---
 
-## 🧪 Testing without a radio
+## Bench validation (no radio required)
 
-You don't need the sky (or even a dongle) to prove the decode/output is correct. The Python bench
-harness in [`tools/bench/`](tools/bench/) talks to the box over USB‑CDC and can inject canned
-frames.
+The Python harness in [`tools/bench/`](tools/bench/) communicates over USB-CDC and can inject canned
+frames into the live decode path:
 
 ```
 cd tools\bench
-python -m pip install -r requirements.txt        # just pyserial
+python -m pip install -r requirements.txt          # pyserial only
 
-python adsbin_bench.py list-ports                 # find the P4's serial port
-python adsbin_bench.py validate-gdl90 --port COM5 # parse & CRC-check live GDL90 frames
-python adsbin_bench.py dump-debug --port COM5     # pretty-print the live traffic table
-python adsbin_bench.py inject --port COM5 <hex>   # feed one raw Mode-S frame into the decoder
-python adsbin_bench.py inject-verify --port COM5  # inject the canned corpus, assert the decode
-python adsbin_bench.py list-canned                # show the built-in test frames + ground truth
+python adsbin_bench.py list-ports                   # enumerate serial ports
+python adsbin_bench.py validate-gdl90 --port COM5   # parse and CRC-check live GDL90 frames
+python adsbin_bench.py dump-debug --port COM5       # print the live traffic table
+python adsbin_bench.py inject --port COM5 <hex>     # inject one raw Mode-S frame
+python adsbin_bench.py inject-verify --port COM5    # inject the canned corpus and assert decode output
+python adsbin_bench.py list-canned                  # list built-in test frames + ground truth
 ```
 
-`inject-verify` is the **acceptance gate**: it pushes known ADS‑B frames (including matched CPR
-even/odd pairs with ground‑truth positions) through the *real* firmware decode path and checks the
-output. Deterministic, repeatable, no airplanes required.
+`inject-verify` is the acceptance gate: it pushes known frames (including matched CPR even/odd pairs
+with ground-truth positions) through the firmware decode path and verifies the output.
 
-**Pure host unit tests** (CPR math, GDL90 CRC/framing, debug‑table round‑trip) need no hardware at
-all:
+Pure host unit tests (CPR math, GDL90 CRC/framing, debug-table round-trip) run without hardware:
 
 ```
 cd tools\bench\tests
-run_tests.bat          # 44 tests: all green
+run_tests.bat          # 44 tests
 ```
 
 ---
 
-## 🔧 Configuration
+## Configuration
 
-Settings persist in **NVS** ([`components/config`](components/config/)): tuner gain, an optional
-manual reference position, range/altitude filters, the active band map, and which output sinks are
-enabled. Defaults are sane out of the box (49.6 dB fixed gain / AGC off, debug + GDL90 enabled).
+Runtime settings persist in NVS ([`components/config`](components/config/)): tuner gain, optional
+manual reference position, range/altitude filters, band map, and enabled sinks. Defaults: 49.6 dB
+fixed gain (AGC off), debug + GDL90 enabled.
 
-Build‑time options via `idf.py menuconfig` → **ADSBin**:
+Build-time options (`idf.py menuconfig → ADSBin`):
 
-- **`ADSBIN_STATUS_LED_GPIO`** — GPIO for the heartbeat LED. Defaults to `-1` (disabled) because the
-  LED pin differs per board; set it to your board's user LED. Console heartbeat works regardless.
-- **`ADSBIN_STATUS_LED_ACTIVE_LOW`** — flip if your LED is active‑low.
-
-> The dedicated `status` component drives a power LED + a traffic‑heartbeat LED and samples the P4's
-> internal die temperature. Its default pins are placeholders — set your real board pinout before a
-> field build.
+- `ADSBIN_STATUS_LED_GPIO` — heartbeat LED GPIO. Default `-1` (disabled); board-specific. The console
+  heartbeat is independent of this pin.
+- `ADSBIN_STATUS_LED_ACTIVE_LOW` — set for active-low LEDs.
 
 ---
 
-## 🗂️ Project layout
+## Repository layout
 
 ```
 ADSBin/
-├─ README.md                  ← you are here
-├─ IMPLEMENTATION_PLAN.md     full design + rationale
-├─ LICENSE.md                 PolyForm Noncommercial 1.0.0
-├─ DISCLAIMER.md              receive-only / experimental / not collision-avoidance
-├─ THIRD_PARTY.md             provenance + licenses of every borrowed line
+├─ IMPLEMENTATION_PLAN.md     design and rationale
+├─ THIRD_PARTY.md             provenance and license of all borrowed code
+├─ LICENSE.md  DISCLAIMER.md  license and safety terms
 ├─ licenses/                  verbatim upstream license texts
-├─ tools/                     .bat deploy scripts + Python bench harness
-│  └─ bench/                  USB-CDC validator, GDL90 decoder, +INJECT, canned corpus, tests/
-├─ sdkconfig.defaults         P4 target, dual-core, USB-Serial/JTAG console
-├─ partitions.csv             dual-OTA app slots (3 MB each)
+├─ tools/                     deploy scripts + Python bench harness (bench/, bench/tests/)
+├─ sdkconfig.defaults  partitions.csv   target config / dual-OTA layout
 ├─ main/                      app entry, pipeline wiring, core pinning, +INJECT console
 └─ components/
-   ├─ common/                 the frozen shared-type ABI (adsbin_types.h)
-   ├─ usb_rtlsdr/             RTL-SDR USB-HS host driver        (Core 0)
-   ├─ demod1090/              1090ES demodulator                (Core 0)
-   ├─ modes_decode/           Mode-S/ADS-B parser + CPR         (Core 1)
-   ├─ traffic/                traffic table manager             (Core 1)
-   ├─ sinks/                  debug + GDL90 outputs             (Core 1)
-   ├─ ownship/                reference position (optional)
+   ├─ common/                 shared type ABI (adsbin_types.h)
+   ├─ usb_rtlsdr/             RTL-SDR USB-HS host driver     (Core 0)
+   ├─ demod1090/              1090ES demodulator             (Core 0)
+   ├─ modes_decode/           Mode-S / ADS-B parser + CPR    (Core 1)
+   ├─ traffic/                traffic table manager          (Core 1)
+   ├─ sinks/                  debug + GDL90 outputs          (Core 1)
+   ├─ ownship/                optional reference position
    ├─ config/                 NVS-backed settings
    └─ status/                 LEDs + temperature watchdog
 ```
 
 ---
 
-## ✅ Status
+## Status
 
-| Thing | State |
+| Item | State |
 |---|---|
-| Firmware build (ESP‑IDF v6.0.1 / esp32p4) | ✅ **Builds clean.** `adsbin.bin` ≈ 333 KB, fits the 3 MB app slot with **89 % free**. |
-| Host unit tests (CPR / GDL90 / debug format) | ✅ **44 / 44 passing.** |
-| Full pipeline wired (USB → DSP → decode → traffic → sinks) | ✅ Implemented + linked. |
-| On‑hardware bring‑up (real dongle, live traffic) | ⏳ **Not yet flown** — needs the P4 + NESDR flashed. |
-| GDL90 integrity fields (NIC/NACp) + raw‑frame debug (`RAW=`) | ⏳ Known gaps; don't block the build, polish pending. |
+| Firmware build (ESP-IDF v6.0.1 / esp32p4) | Builds clean. `adsbin.bin` ≈ 333 KB; fits the 3 MB app slot (89% free). |
+| Host unit tests (CPR / GDL90 / debug format) | 44 / 44 passing. |
+| Full pipeline (USB → DSP → decode → traffic → sinks) | Implemented and linked. |
+| On-hardware bring-up (live traffic) | Not yet performed; requires the P4 + dongle flashed. |
+| GDL90 NIC/NACp fields; raw-frame debug (`RAW=`) | Not yet wired through `adsb_msg_t`; does not block the build. |
 
-In short: **it compiles, links, fits, and passes every host‑side test.** Real‑silicon validation
-(and the §6 phase gates — frame yield vs. dump1090, target counts vs. a reference receiver) is the
-next milestone.
-
----
-
-## 🛣️ Roadmap
-
-Designed‑for from day one, built incrementally:
-
-- **978 MHz UAT** — a second dongle, auto‑detected, adds free US weather (FIS‑B) + UAT traffic.
-- **WiFi GDL90 → EFB tablets** — bring up the on‑board ESP32‑C6 and UDP‑broadcast GDL90 to
-  ForeFlight / Garmin Pilot. Reuses the existing encoder; only the transport changes.
-- **RS‑232 + Garmin TIS‑A** — drive a panel display (e.g. G3X Touch). Relative format → needs ownship.
-- **GPS / NMEA ownship** — live reference for relative formats + range/altitude filtering.
+Compiles, links, fits, and passes all host-side tests. Remaining work is on-silicon validation
+(frame yield vs. dump1090, target counts vs. a reference receiver) and the two open ABI items above.
 
 ---
 
-## ⚖️ License & attribution
+## Roadmap
 
-ADSBin is offered under the **[PolyForm Noncommercial License 1.0.0](LICENSE.md)** — free for any
-noncommercial use (hobby, study, non‑profit, public‑safety). Commercial use? Ask Novabox.Works.
-
-To keep that license clean, ADSBin deliberately uses **permissive sources only**: it adapts the
-**BSD‑licensed antirez dump1090** (DSP, Mode‑S CRC, CPR structure — notices preserved) and
-**clean‑rooms** the RTL2832U/R820T2 tuner bring‑up and the GDL90 encoder from public datasheets and
-the Garmin spec. **No GPLv2 librtlsdr and no GPLv3 dump1090 fork is used.** Every borrowed line is
-tracked in [THIRD_PARTY.md](THIRD_PARTY.md), with full texts in [`licenses/`](licenses/).
-
-> ⚠️ **Safety:** ADSBin is a **receive‑only, advisory** traffic‑awareness aid for **experimental,
-> non‑certified** aircraft. It is **not** certified, **not** a collision‑avoidance system, and
-> **not** a substitute for see‑and‑avoid or pilot judgment. Read [DISCLAIMER.md](DISCLAIMER.md).
-> Use at your own risk.
+- **978 MHz UAT** — second dongle (auto-detected); adds UAT traffic and FIS-B weather.
+- **WiFi GDL90** — bring up the on-board ESP32-C6; UDP broadcast to tablets. Reuses the GDL90 encoder.
+- **RS-232 / Garmin TIS-A** — panel-display output (e.g. G3X Touch); requires a reference position.
+- **GPS / NMEA ownship** — live reference for relative formats and range/altitude filtering.
 
 ---
 
-<div align="center">
+## License and attribution
 
-**Built by [Novabox.Works](https://novabox.works/).** Receive‑only. Experimental. Yours to hack.
+Source is available under the [PolyForm Noncommercial License 1.0.0](LICENSE.md) — free for
+noncommercial use. Commercial use requires a separate license from Novabox.Works.
 
-*Hear everything. Transmit nothing.*
+ADSBin uses permissive sources only. It adapts the BSD-licensed antirez dump1090 (DSP, Mode-S CRC,
+CPR decoder structure; notices preserved) and clean-rooms the RTL2832U / R820T2 tuner bring-up and
+the GDL90 encoder from public datasheets and the Garmin GDL90 specification. No GPLv2 librtlsdr and
+no GPLv3 dump1090 fork is used. All borrowed code is tracked in [THIRD_PARTY.md](THIRD_PARTY.md),
+with full texts in [`licenses/`](licenses/).
 
-</div>
+**Safety:** ADSBin is a receive-only, advisory traffic-awareness aid for experimental, non-certified
+aircraft. It is not certified, not a collision-avoidance system, and not a substitute for
+see-and-avoid or pilot judgment. See [DISCLAIMER.md](DISCLAIMER.md).
