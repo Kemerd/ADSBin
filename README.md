@@ -128,8 +128,9 @@ port.
 | Part | Cost | Link |
 |---|---|---|
 | Nooelec NESDR Nano 3 (RTL2832U + R820T2, 0.5 ppm TCXO) | **$44.95** | [nooelec.com](https://www.nooelec.com/store/nesdr-nano-three.html) |
+| Nooelec 1090MHz Antenna | **7.95** | [nooelec.com](https://www.nooelec.com/store/sdr/sdr-addons/antennas/1090mhz-ads-b-antenna-5dbi-sma.html)
 
-**Tier 1 total: ≈ $73** (base ≈ $28 + one Nano 3).
+**Tier 1 total: ≈ $80.95** (base ≈ $28 + one Nano 3).
 
 ### Tier 2 — Traffic + Weather (1090 + 978 UAT/FIS-B)
 
@@ -167,24 +168,48 @@ The P4 exposes two distinct USB interfaces:
 
 | Port | Use |
 |---|---|
-| USB-C | Power and debug — flashing, logs, and (currently) the GDL90/debug output, over USB-Serial/JTAG. |
-| USB-HS host | The RTL-SDR dongle. A separate interface dedicated to sample ingest. |
+| USB-C | Power and debug — flashing, logs, and the GDL90/debug output, over the on-board USB-UART. |
+| USB-HS host | The RTL-SDR dongle(s), via the 1-to-4 USB expansion board. A separate interface dedicated to sample ingest. |
 
-Wire the dongle's USB-A plug directly to the P4's High-Speed host port:
+The single HS host port feeds the **1-to-4 USB expansion board**, which breaks out the ports the
+dongles plug into:
 
 ```
-NESDR Nano (RTL2832U)             ESP32-P4 (USB-HS host)
-  D+   ───────────────────────────►  HS host D+      (short, length-matched pair; route away from noise)
-  D-   ───────────────────────────►  HS host D-
-  VBUS (5V) ◄──────────────────────  5V rail         (host mode: the P4 powers the dongle, ~300-500 mA)
-  GND  ───────────────────────────►  GND
-  SMA  ── 1090 MHz quarter-wave whip (~68 mm) + ground plane
+                                 ┌── port ──► [NESDR Nano #1]── SMA ── 1090 MHz antenna  (traffic)
+ESP32-P4 ── HS host ── [1→4 USB expansion board] ──┤
+                                 └── port ──► [NESDR Nano #2]── SMA ── 978 MHz antenna   (weather)
+  VBUS (5 V) powers the board + dongles (host mode, ~300–500 mA each)
 ```
 
-ADS-B is a weak signal; minimize noise coupling: keep the antenna element away from the P4,
-switching regulators, and USB lines; keep coax short (1090 MHz is lossy); use a plastic enclosure for
-an internal antenna (metal requires an external antenna). Verify the 5 V rail can source the dongle's
-~300–500 mA in addition to the P4, and place a bulk capacitor near the dongle's VBUS to handle inrush.
+### Auto-role assignment (zero config)
+
+- **One dongle plugged (either port): always 1090 traffic.**
+- **Two dongles plugged: the first is 1090 traffic, the second is 978 UAT weather** (FIS-B).
+- Roles are bound to the **physical hub-port position** (so the correctly-tuned antenna stays on the
+  right band), with the dongle's USB serial recorded as a stable label. Live hotplug is supported —
+  add or pull the weather dongle while running and traffic never interrupts.
+
+> **Antennas are band-specific.** A 1090 antenna (~68 mm) is not a 978 antenna (~77 mm); the dual-band
+> [Discovery 5 dBi bundle](https://www.nooelec.com/store/ads-b-discovery-antenna-bundle-5dbi.html)
+> covers both. Keep the two antennas physically separated to avoid desense.
+
+### Staged testing / role override
+
+Getting the dongles one at a time? Force a **single** dongle to the weather role to test 978 before
+the second arrives, over the USB-CDC console:
+
+```
++ROLE 978      → force the lone dongle to 978 weather
++ROLE 1090     → force it to 1090 traffic (the default)
++ROLE auto     → back to count-based auto-assignment
+```
+
+The override persists in NVS. With two dongles it is ignored — count-based assignment takes over.
+
+ADS-B is a weak signal; minimize noise coupling: keep the antenna elements away from the P4,
+switching regulators, and USB lines; keep coax short (1090/978 MHz is lossy); use a plastic enclosure
+(PA612-CF) for internal antennas. Verify the 5 V rail can source ~300–500 mA **per dongle** on top of
+the P4, and place a bulk capacitor near each dongle's VBUS to handle inrush.
 Full RF/placement notes: [IMPLEMENTATION_PLAN.md §8](IMPLEMENTATION_PLAN.md).
 
 ---
