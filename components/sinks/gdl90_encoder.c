@@ -43,12 +43,16 @@
 #define GDL90_ESC_XOR     0x20u   /**< Stuffed byte = original XOR this.         */
 
 #define GDL90_ID_HEARTBEAT 0x00u  /**< Heartbeat message id.                     */
+#define GDL90_ID_UPLINK    0x07u  /**< Uplink Data (FIS-B weather) message id.    */
 #define GDL90_ID_OWNSHIP   0x0Au  /**< Ownship Report message id.                */
 #define GDL90_ID_TRAFFIC   0x14u  /**< Traffic Report message id.                */
 
 /* Heartbeat is id + 6 payload bytes; Traffic/Ownship is id + 27 payload bytes. */
 #define GDL90_HEARTBEAT_LEN   7u   /**< id + 6 payload.                          */
 #define GDL90_TRAFFIC_LEN     28u  /**< id + 27 payload (the longest message).   */
+
+/* Uplink Data fixed header: id (1) + Time of Reception (3) precede the payload. */
+#define GDL90_UPLINK_HDR_LEN  4u   /**< id + 3-byte Time of Reception.           */
 
 /* The 12-bit "altitude unavailable" sentinel from the Garmin spec.             */
 #define GDL90_ALT_INVALID  0xFFFu
@@ -468,6 +472,46 @@ int gdl90_frame_ownship_report(uint8_t *out, size_t out_cap, const gdl90_traffic
     uint8_t msg[GDL90_TRAFFIC_LEN];
     gdl90_build_traffic_body(GDL90_ID_OWNSHIP, own, msg);
     return gdl90_frame_message(out, out_cap, msg, GDL90_TRAFFIC_LEN);
+}
+
+int gdl90_frame_uplink(uint8_t *out, size_t out_cap,
+                       uint32_t time_of_reception,
+                       const uint8_t *uplink_payload, size_t payload_len)
+{
+    // Reject the usual bad-argument shapes with a clean negative esp_err so the
+    // caller never frames a truncated or oversized uplink onto the wire.
+    if (out == NULL || uplink_payload == NULL) {
+        return -ESP_ERR_INVALID_ARG;
+    }
+    if (payload_len == 0 || payload_len > GDL90_UPLINK_PAYLOAD_MAX) {
+        return -ESP_ERR_INVALID_SIZE;
+    }
+
+    // Assemble the UN-stuffed message body: id + 3-byte Time of Reception + the
+    // raw UAT uplink payload. The body lives on the stack at its true maximum
+    // (4 header + 432 payload = 436); gdl90_frame_message() then handles CRC,
+    // byte-stuffing and the framing flags exactly as for every other message.
+    uint8_t msg[GDL90_UPLINK_HDR_LEN + GDL90_UPLINK_PAYLOAD_MAX];
+
+    // [0] message id.
+    msg[0] = GDL90_ID_UPLINK;
+
+    // [1..3] Time of Reception, a 24-bit count. The Garmin spec transmits this
+    //   field big-endian (most-significant byte first); only the low 24 bits of
+    //   the caller's value are meaningful, so we mask before packing. A value of
+    //   0 is the accepted "time unknown" sentinel (the receiver tolerates it).
+    uint32_t tor = time_of_reception & 0x00FFFFFFu;
+    msg[1] = (uint8_t)((tor >> 16) & 0xFFu);
+    msg[2] = (uint8_t)((tor >> 8) & 0xFFu);
+    msg[3] = (uint8_t)(tor & 0xFFu);
+
+    // [4..] the UAT uplink (FIS-B) payload, copied verbatim — ADSBin relays the
+    //   FIS-B carrier untouched and lets the EFB parse the products.
+    memcpy(&msg[GDL90_UPLINK_HDR_LEN], uplink_payload, payload_len);
+
+    // Frame the (4 + payload_len)-byte body (CRC + stuff + flags).
+    return gdl90_frame_message(out, out_cap, msg,
+                               GDL90_UPLINK_HDR_LEN + payload_len);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

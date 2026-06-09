@@ -81,6 +81,7 @@ the `main` debug console (see the parallel-build plan).
 | Escape byte | `0x7D` | Byte-stuffing escape |
 | Escape XOR | `0x20` | Stuffed byte = original XOR 0x20 |
 | Heartbeat id | `0x00` | Heartbeat message |
+| Uplink id | `0x07` | Uplink Data (FIS-B weather; id + 3-byte big-endian Time of Reception + up to 432-byte UAT uplink payload) |
 | Ownship id | `0x0A` | Ownship Report |
 | Traffic id | `0x14` | Traffic Report |
 | CRC | CRC-16 (CCITT table variant) | Over UNstuffed id+payload, little-endian on the wire |

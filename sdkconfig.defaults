@@ -94,3 +94,19 @@ CONFIG_SPIRAM_SPEED_200M=y
 # buffers specifically - this is the targeted relief for the SRAM pressure above.
 CONFIG_SPIRAM_USE_MALLOC=y
 CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP=y
+
+# --- USB Host: external hub support (dual-dongle topology) ------------------
+# MAKE-OR-BREAK for the two-dongle build. The user plugs a USB hub into the P4's
+# single HS host root port so TWO NESDR sticks (one tuned 1090 traffic, one tuned
+# 978 UAT weather) enumerate behind it. The ESP-IDF USB Host stack DISABLES
+# external-hub support by default (CONFIG_USB_HOST_HUBS_SUPPORTED defaults n);
+# with it off, anything behind a hub is simply never enumerated and the second
+# dongle is invisible. Turn it on. This is purely additive — a single dongle wired
+# DIRECTLY to the root port (no hub) still enumerates exactly as before, so the
+# 1090-only path is unaffected.
+CONFIG_USB_HOST_HUBS_SUPPORTED=y
+# A single 4-port hub is one level deep (level 1). MULTI_LEVEL (cascaded hubs)
+# defaults y already; we leave it on so a hub-behind-a-hub still works, but the
+# supported topology is one hub. Per-port reset/debounce timings stay at their
+# Kconfig defaults — only revisit them if a specific stick fails to enumerate.
+CONFIG_USB_HOST_HUB_MULTI_LEVEL=y

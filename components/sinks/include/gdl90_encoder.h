@@ -77,6 +77,45 @@ int gdl90_frame_traffic_report(uint8_t *out, size_t out_cap, const gdl90_traffic
 int gdl90_frame_ownship_report(uint8_t *out, size_t out_cap, const gdl90_traffic_t *own);
 
 /* ───────────────────────────────────────────────────────────────────────────
+ *  Uplink Data (msg id 0x07) — FIS-B weather relay (978 UAT path).
+ *
+ *  The GDL90 "Uplink Data" message carries a raw UAT uplink frame (the FIS-B
+ *  carrier) straight through to the EFB, which parses the FIS-B APDUs itself.
+ *  Layout per the Garmin spec: id (0x07), a 24-bit Time of Reception, then up to
+ *  432 bytes of UAT uplink payload (an 8-byte UAT-specific header + 424 bytes of
+ *  FIS-B application data). We relay the payload verbatim — ADSBin never
+ *  re-encodes weather products.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/** @brief Largest UAT uplink payload the encoder accepts (the full UAT frame). */
+#define GDL90_UPLINK_PAYLOAD_MAX  432u
+
+/**
+ * @brief Worst-case framed size of an Uplink Data message.
+ *
+ * Body = 1 id + 3 Time-of-Reception + 432 payload = 436 bytes. Byte-stuffing can
+ * at most double every body byte AND the 2 CRC bytes, plus the 2 raw flags:
+ *   2*(436 + 2) + 2 = 878. We round up to 896 for headroom; a weather sink's
+ * scratch buffer MUST be at least this large (the 80-byte traffic frame max is
+ * far too small for an uplink).
+ */
+#define GDL90_UPLINK_FRAME_MAX    896u
+
+/**
+ * @brief Encode a GDL90 Uplink Data (0x07) message into @p out (framed/CRC/stuffed).
+ *
+ * @param out                 Destination framed buffer (>= ::GDL90_UPLINK_FRAME_MAX).
+ * @param out_cap             Capacity of @p out in bytes.
+ * @param time_of_reception   24-bit Time of Reception (low 24 bits used; 0 if unknown).
+ * @param uplink_payload      The raw UAT uplink (FIS-B) payload bytes.
+ * @param payload_len         Length of @p uplink_payload (1..::GDL90_UPLINK_PAYLOAD_MAX).
+ * @return Total framed length on success, or a NEGATIVE esp_err on overflow / bad args.
+ */
+int gdl90_frame_uplink(uint8_t *out, size_t out_cap,
+                       uint32_t time_of_reception,
+                       const uint8_t *uplink_payload, size_t payload_len);
+
+/* ───────────────────────────────────────────────────────────────────────────
  *  Helpers (also exposed for the bench harness + unit tests)
  * ─────────────────────────────────────────────────────────────────────────── */
 
