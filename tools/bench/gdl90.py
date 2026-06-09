@@ -177,8 +177,19 @@ def deframe_stream(stream: bytes) -> List[Gdl90Frame]:
         if len(body) < 3:
             continue
 
-        # Last two bytes are the CRC (little-endian on the wire).
+        # The link is SHARED with UTF-8 debug text, so a run of text (e.g.
+        # "=== ADSBIN TRAFFIC ... ===\n") can sit between two real frames' flags
+        # and masquerade as a frame chunk. Such a chunk starts with a text byte
+        # ('=' 0x3D, '\n' 0x0A, ...), never a real GDL90 message id. Gate on the
+        # id so text is skipped as resync noise rather than reported as a bogus
+        # CRC-failing "frame"; this keeps the CRC tally meaningful for the frames
+        # the device actually emitted. (A genuinely corrupted real frame keeps its
+        # valid id and is still reported with crc_ok=False — the case we DO want.)
         msg_id = body[0]
+        if msg_id not in _KNOWN_GDL90_IDS:
+            continue
+
+        # Last two bytes are the CRC (little-endian on the wire).
         crc_payload = body[:-2]
         crc_rx = body[-2] | (body[-1] << 8)
         crc_ok = crc16(crc_payload) == crc_rx
@@ -193,6 +204,15 @@ def deframe_stream(stream: bytes) -> List[Gdl90Frame]:
         )
 
     return frames
+
+
+# Recognised GDL90 message ids — the gate that distinguishes a real frame chunk
+# from interleaved debug text on the shared link. Mirrors WIRE_CONTRACT.md §3.
+_KNOWN_GDL90_IDS = frozenset((
+    GDL90_ID_HEARTBEAT,
+    GDL90_ID_OWNSHIP,
+    GDL90_ID_TRAFFIC,
+))
 
 
 # ═════════════════════════════════════════════════════════════════════════════

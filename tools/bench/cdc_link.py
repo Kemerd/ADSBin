@@ -181,6 +181,13 @@ class CdcLink:
             target=self._read_loop, name="cdc-reader", daemon=True)
         self._reader.start()
 
+        # Brief settle after opening the port. Even with DTR/RTS cleared, the act
+        # of opening a USB-UART bridge can glitch the line for a few tens of ms;
+        # a short pause lets the device's TX settle so the FIRST command we send
+        # isn't lost to a transient. Without it, the very first inject after a
+        # fresh connect can intermittently time out while later ones succeed.
+        time.sleep(0.3)
+
     # ── lifecycle ────────────────────────────────────────────────────────────
 
     def __enter__(self) -> "CdcLink":
