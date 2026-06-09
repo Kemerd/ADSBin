@@ -9,6 +9,18 @@
  *   on 1090 MHz, fixed ~49.6 dB gain with AGC off), and streams continuous
  *   bulk-IN IQ into an internally-owned no-split ring buffer.
  *
+ *   DUAL-DONGLE SPLIT. The driver now owns up to ::RTLSDR_MAX_DEVICES dongles at
+ *   once: slot 0 serves 1090ES, slot 1 serves 978 MHz UAT (the band follows the
+ *   device's ::adsbin_rf_role_t, assigned by stable adoption order). EVERYTHING
+ *   per-device — the USB handles, the owned IQ ring, the tuner-register shadow,
+ *   the stream config, the URBs and the stats — lives in a ::usb_rtlsdr_dev_t
+ *   slot; the single housekeeping task, the one USB Host client and the one
+ *   recursive lock stay process-global. Every chip/device helper takes a
+ *   `usb_rtlsdr_dev_t *d` and pokes `d->...`; the hot path finds its slot via the
+ *   `d` carried in usb_transfer_t.context. The legacy single-dongle public API is
+ *   preserved as a thin device-0 (= 1090) shim so existing callers behave
+ *   BYTE-FOR-BYTE identically when exactly one dongle is present.
+ *
  *   THE RING IS THE SEAM (plan S2). This driver OWNS the IQ ring. The bulk-IN
  *   completion callback (Core 0) writes ::iq_block_t-described chunks straight
  *   into it; demod1090 pulls from the same ring. `main` fetches the handle via
@@ -55,8 +67,17 @@
 /* Logging tag for this component. */
 static const char *TAG = "usb_rtlsdr";
 
-/* The one and only driver instance. Zero-initialised => inited == false. */
+/* The one and only driver instance. Zero-initialised => inited == false. Holds
+ * the process-global state plus the per-device `dev[]` slot array. */
 static usb_rtlsdr_ctx_t s_ctx;
+
+/* Role override for the FIRST adopted dongle (see the role-assignment block in
+ * task_try_open_pending). NONE => no override, default 1090. A file-scope static,
+ * NOT a config-component read, so this driver keeps ZERO dependency on the config
+ * component — the app sets it via the public usb_rtlsdr_set_role_override(). Safe
+ * to set before or after init; the adopt path reads it once, when seen_count was
+ * still 0 (i.e. for the very first dongle). */
+static adsbin_rf_role_t s_role_override = ADSBIN_ROLE_NONE;
 
 /* How long the housekeeping task blocks in each host/client event pump before
  * looping to re-check its flags. Short enough that stop()/recovery is snappy. */
@@ -73,9 +94,10 @@ static usb_rtlsdr_ctx_t s_ctx;
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Small locking + event helpers.
  *
- *  `lock` serialises every mutable field: config, stats, the device handles and
- *  the R820T2 shadow. The bulk completion only ever takes it for the short stats
- *  update; readers (get_status/get_stats) and the slow control path also take it.
+ *  `lock` serialises every mutable field of EVERY device slot: config, stats, the
+ *  device handles and the R820T2 shadow. There is exactly ONE lock for all slots.
+ *  The bulk completion only ever takes it for the short stats update; readers
+ *  (get_status/get_stats) and the slow control path also take it.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /* The driver lock is RECURSIVE on purpose. The slow control path (set_*, start)
@@ -108,8 +130,10 @@ static inline void unlock(void)
  *   Called only from the housekeeping task (never the bulk hot path), so it is
  *   safe for the callback to do light queue work. We snapshot the callback under
  *   the lock so a concurrent register_event_callback() cannot tear the pair.
+ *   @p device_index identifies WHICH slot the event pertains to (0 = 1090,
+ *   1 = 978 by adoption order) so a single callback can fan out per device.
  */
-static void emit_event(usb_rtlsdr_event_id_t ev)
+static void emit_event(int device_index, usb_rtlsdr_event_id_t ev)
 {
     usb_rtlsdr_event_cb_t cb;
     void                 *ctx;
@@ -120,25 +144,27 @@ static void emit_event(usb_rtlsdr_event_id_t ev)
     unlock();
 
     if (cb) {
-        cb(ev, ctx);
+        cb(ev, device_index, ctx);
     }
 }
 
-/** @brief Record the last non-fatal error for get_status (lock-protected). */
-static void set_last_error(esp_err_t e)
+/** @brief Record the device's last non-fatal error for get_status (locked). */
+static void set_last_error(usb_rtlsdr_dev_t *d, esp_err_t e)
 {
     lock();
-    s_ctx.last_error = e;
+    d->last_error = e;
     unlock();
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  USB Host control-transfer plumbing.
  *
- *  We keep ONE reusable EP0 control transfer and a binary semaphore the control
- *  callback gives when the transfer finishes. Because all control I/O is
+ *  Each device owns ONE reusable EP0 control transfer and a completion flag the
+ *  control callback raises when the transfer finishes. Because all control I/O is
  *  serialised by `lock` (only the slow start/stop/set_* paths issue it), one
- *  shared transfer is sufficient and avoids per-call allocation.
+ *  shared transfer PER DEVICE is sufficient and avoids per-call allocation. The
+ *  transfer's `context` carries the owning `usb_rtlsdr_dev_t*` so the callback can
+ *  raise the right device's flag.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
@@ -149,24 +175,27 @@ static void set_last_error(esp_err_t e)
  *   — the very loop our own usb_task pumps. Because we issue control transfers
  *   from that same task, we MUST NOT block it on a semaphore waiting for this
  *   callback (the callback would never run). Instead we just raise a completion
- *   flag here and let ctrl_xfer() pump the event loop until it sees the flag.
+ *   flag here and let ctrl_xfer() pump the event loop until it sees the flag. The
+ *   owning device is recovered from xfer->context (set when the ctrl transfer is
+ *   allocated in open_device).
  */
 static void ctrl_xfer_cb(usb_transfer_t *xfer)
 {
-    (void)xfer;
-    s_ctx.ctrl_complete = true;
+    usb_rtlsdr_dev_t *d = (usb_rtlsdr_dev_t *)xfer->context;
+    d->ctrl_complete = true;
 }
 
 /**
- * @brief Issue one synchronous USB control transfer over EP0.
+ * @brief Issue one synchronous USB control transfer over EP0 for device @p d.
  *
  * @details
- *   Builds the 8-byte setup packet at the head of the shared control buffer,
- *   appends @p out_data for an OUT transfer (or leaves room for an IN), submits,
- *   then pumps the client event loop until the completion callback fires (we
- *   cannot block here — see ctrl_xfer_cb). The caller must already hold `lock`,
- *   AND must be running on the usb_task so pumping the loop is legal.
+ *   Builds the 8-byte setup packet at the head of the device's shared control
+ *   buffer, appends @p out_data for an OUT transfer (or leaves room for an IN),
+ *   submits, then pumps the client event loop until the completion callback fires
+ *   (we cannot block here — see ctrl_xfer_cb). The caller must already hold
+ *   `lock`, AND must be running on the usb_task so pumping the loop is legal.
  *
+ * @param d          The device whose EP0 to drive.
  * @param bmReqType  USB bmRequestType (direction + type + recipient).
  * @param bRequest   Vendor/standard request code.
  * @param wValue     Setup wValue.
@@ -175,15 +204,15 @@ static void ctrl_xfer_cb(usb_transfer_t *xfer)
  * @param wLength    Data-stage length in bytes (0 for no data stage).
  * @return ESP_OK, or an esp_err_t / ESP_FAIL on a non-OK transfer status.
  */
-static esp_err_t ctrl_xfer(uint8_t bmReqType, uint8_t bRequest,
+static esp_err_t ctrl_xfer(usb_rtlsdr_dev_t *d, uint8_t bmReqType, uint8_t bRequest,
                            uint16_t wValue, uint16_t wIndex,
                            void *data, uint16_t wLength)
 {
-    if (!s_ctx.dev || !s_ctx.ctrl_xfer) {
+    if (!d->dev || !d->ctrl_xfer) {
         return ESP_ERR_INVALID_STATE;
     }
 
-    usb_transfer_t *x = s_ctx.ctrl_xfer;
+    usb_transfer_t *x = d->ctrl_xfer;
 
     /* Lay the setup packet into the first 8 bytes of the data buffer; the host
      * controller reads it from there for a control transfer. */
@@ -201,15 +230,15 @@ static esp_err_t ctrl_xfer(uint8_t bmReqType, uint8_t bRequest,
     }
 
     /* num_bytes for a control transfer = setup (8) + data stage length. */
-    x->device_handle = s_ctx.dev;
+    x->device_handle = d->dev;
     x->bEndpointAddress = 0;                 /* EP0.                            */
     x->num_bytes  = sizeof(usb_setup_packet_t) + wLength;
     x->timeout_ms = RTLSDR_CTRL_TIMEOUT_MS;
     x->callback   = ctrl_xfer_cb;
-    x->context    = NULL;
+    x->context    = d;                       /* so ctrl_xfer_cb finds this device.*/
 
     /* Arm the completion flag the callback will raise. */
-    s_ctx.ctrl_complete = false;
+    d->ctrl_complete = false;
 
     esp_err_t err = usb_host_transfer_submit_control(s_ctx.client, x);
     if (err != ESP_OK) {
@@ -222,7 +251,7 @@ static esp_err_t ctrl_xfer(uint8_t bmReqType, uint8_t bRequest,
      * short blocking wait inside the host stack, which is where the callback
      * actually runs — so this drives our own completion. */
     int64_t deadline = adsbin_now_us() + (int64_t)(RTLSDR_CTRL_TIMEOUT_MS + 200) * 1000;
-    while (!s_ctx.ctrl_complete) {
+    while (!d->ctrl_complete) {
         usb_host_client_handle_events(s_ctx.client, pdMS_TO_TICKS(10));
         if (adsbin_now_us() > deadline) {
             ESP_LOGW(TAG, "ctrl transfer timed out");
@@ -254,7 +283,7 @@ static esp_err_t ctrl_xfer(uint8_t bmReqType, uint8_t bRequest,
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /** @brief Write @p len bytes (1 or 2) to RTL2832U register @p addr in @p block.*/
-static esp_err_t rtl_write_reg(uint16_t addr, uint16_t block, uint16_t val, uint8_t len)
+static esp_err_t rtl_write_reg(usb_rtlsdr_dev_t *d, uint16_t addr, uint16_t block, uint16_t val, uint8_t len)
 {
     /* Values go MSB-first on the wire for the 2-byte case (datasheet order). */
     uint8_t buf[2];
@@ -264,14 +293,14 @@ static esp_err_t rtl_write_reg(uint16_t addr, uint16_t block, uint16_t val, uint
         buf[0] = (uint8_t)((val >> 8) & 0xFF);
         buf[1] = (uint8_t)(val & 0xFF);
     }
-    return ctrl_xfer(RTL_CTRL_OUT, RTL_VENDOR_REQUEST, addr, block, buf, len);
+    return ctrl_xfer(d, RTL_CTRL_OUT, RTL_VENDOR_REQUEST, addr, block, buf, len);
 }
 
 /** @brief Read @p len bytes (1 or 2) from RTL2832U register @p addr/@p block. */
-static esp_err_t rtl_read_reg(uint16_t addr, uint16_t block, uint16_t *out, uint8_t len)
+static esp_err_t rtl_read_reg(usb_rtlsdr_dev_t *d, uint16_t addr, uint16_t block, uint16_t *out, uint8_t len)
 {
     uint8_t buf[2] = {0, 0};
-    esp_err_t err = ctrl_xfer(RTL_CTRL_IN, RTL_VENDOR_REQUEST, addr, block, buf, len);
+    esp_err_t err = ctrl_xfer(d, RTL_CTRL_IN, RTL_VENDOR_REQUEST, addr, block, buf, len);
     if (err != ESP_OK) {
         return err;
     }
@@ -288,7 +317,7 @@ static esp_err_t rtl_read_reg(uint16_t addr, uint16_t block, uint16_t *out, uint
  *   block is selected. We pack both from the RTL_DEMOD_* constants which encode
  *   page in the high byte, offset in the low byte.
  */
-static esp_err_t rtl_demod_write(uint16_t paged_addr, uint16_t val, uint8_t len)
+static esp_err_t rtl_demod_write(usb_rtlsdr_dev_t *d, uint16_t paged_addr, uint16_t val, uint8_t len)
 {
     uint8_t page   = (uint8_t)(paged_addr >> RTL_DEMOD_PAGE_SHIFT);
     uint8_t offset = (uint8_t)(paged_addr & RTL_DEMOD_OFF_MASK);
@@ -297,7 +326,7 @@ static esp_err_t rtl_demod_write(uint16_t paged_addr, uint16_t val, uint8_t len)
     /* Demod register addresses are byte offsets within the page; the datasheet
      * shifts the offset up by 8 for the on-wire address word. */
     uint16_t waddr  = (uint16_t)(offset << 8) | 0x20u;
-    return rtl_write_reg(waddr, windex, val, len);
+    return rtl_write_reg(d, waddr, windex, val, len);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -310,10 +339,10 @@ static esp_err_t rtl_demod_write(uint16_t paged_addr, uint16_t val, uint8_t len)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /** @brief Enable/disable the RTL2832U I2C repeater that fronts the tuner bus. */
-static esp_err_t rtl_i2c_repeater(bool on)
+static esp_err_t rtl_i2c_repeater(usb_rtlsdr_dev_t *d, bool on)
 {
     uint16_t v = on ? RTL_DEMOD_IIC_REPEAT_ON : RTL_DEMOD_IIC_REPEAT_OFF;
-    return rtl_demod_write(RTL_DEMOD_IIC_REPEAT, v, 1);
+    return rtl_demod_write(d, RTL_DEMOD_IIC_REPEAT, v, 1);
 }
 
 /**
@@ -325,18 +354,18 @@ static esp_err_t rtl_i2c_repeater(bool on)
  *   over the RTL2832U I2C window: the on-wire address selects the I2C block and
  *   the tuner slave address; the payload is [reg, value].
  */
-static esp_err_t r820t_write(uint8_t reg, uint8_t val)
+static esp_err_t r820t_write(usb_rtlsdr_dev_t *d, uint8_t reg, uint8_t val)
 {
     /* Cache first so a later RMW helper can build on it even if the bus write
      * is retried by the caller. */
     if (reg < R820T_NUM_REGS) {
-        s_ctx.r82_shadow[reg] = val;
+        d->r82_shadow[reg] = val;
     }
 
     /* Payload = register index then value; the I2C window addresses the slave.
      * wValue carries the tuner I2C slave address; wIndex selects the I2C block. */
     uint8_t payload[2] = { reg, val };
-    return ctrl_xfer(RTL_CTRL_OUT, RTL_VENDOR_REQUEST,
+    return ctrl_xfer(d, RTL_CTRL_OUT, RTL_VENDOR_REQUEST,
                      (uint16_t)R820T_I2C_ADDR, RTL_BLK_I2C, payload, sizeof(payload));
 }
 
@@ -348,12 +377,12 @@ static esp_err_t r820t_write(uint8_t reg, uint8_t val)
  *   (datasheet quirk of the read path). We undo that so the caller sees the
  *   logical value. Only used to probe the chip id at 0x00.
  */
-static esp_err_t r820t_read(uint8_t reg, uint8_t *out)
+static esp_err_t r820t_read(usb_rtlsdr_dev_t *d, uint8_t reg, uint8_t *out)
 {
     uint8_t buf[2] = {0, 0};
     /* Reads come from the tuner slave on the I2C window. The RTL2832U returns
      * the requested register; one byte is enough for the id probe. */
-    esp_err_t err = ctrl_xfer(RTL_CTRL_IN, RTL_VENDOR_REQUEST,
+    esp_err_t err = ctrl_xfer(d, RTL_CTRL_IN, RTL_VENDOR_REQUEST,
                               (uint16_t)R820T_I2C_ADDR, RTL_BLK_I2C, buf, 1);
     if (err != ESP_OK) {
         return err;
@@ -391,7 +420,7 @@ static esp_err_t r820t_read(uint8_t reg, uint8_t *out)
  *       the remainder scaled by 2^16.
  *   The fields land in regs 0x10..0x14 (VCO/divider, fractional lo/hi, Nint).
  */
-static esp_err_t r820t_set_pll(uint32_t lo_hz)
+static esp_err_t r820t_set_pll(usb_rtlsdr_dev_t *d, uint32_t lo_hz)
 {
     /* PLL reference: the crystal feeds the tuner ref directly in our config. */
     const uint32_t pll_ref = RTL_XTAL_HZ;
@@ -438,15 +467,15 @@ static esp_err_t r820t_set_pll(uint32_t lo_hz)
 
     /* reg 0x10: VCO power + the VCO post-divider selection (div_num). Keep the
      * datasheet power bits and OR in our divider. */
-    uint8_t reg10 = (uint8_t)((s_ctx.r82_shadow[R820T_REG_PLL_VCO] & 0x1F) | (div_num << 5));
-    err |= r820t_write(R820T_REG_PLL_VCO, reg10);
+    uint8_t reg10 = (uint8_t)((d->r82_shadow[R820T_REG_PLL_VCO] & 0x1F) | (div_num << 5));
+    err |= r820t_write(d, R820T_REG_PLL_VCO, reg10);
 
     /* reg 0x11/0x12: 16-bit sigma-delta fractional divider. */
-    err |= r820t_write(R820T_REG_PLL_FRAC_LO, sdm_lo);
-    err |= r820t_write(R820T_REG_PLL_FRAC_HI, sdm_hi);
+    err |= r820t_write(d, R820T_REG_PLL_FRAC_LO, sdm_lo);
+    err |= r820t_write(d, R820T_REG_PLL_FRAC_HI, sdm_hi);
 
     /* reg 0x13: integer divider (Nint encoding). */
-    err |= r820t_write(R820T_REG_PLL_NINT, reg13);
+    err |= r820t_write(d, R820T_REG_PLL_NINT, reg13);
 
     return (err == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
@@ -471,7 +500,7 @@ static esp_err_t r820t_set_pll(uint32_t lo_hz)
  *   near-maximum on all three stages. For HW_AGC we hand the LNA + mixer to the
  *   chip's loop (top bits set) and let the RTL2832U/IF VGA float.
  */
-static esp_err_t r820t_apply_gain(usb_rtlsdr_gain_mode_t mode, int gain_tenth_db)
+static esp_err_t r820t_apply_gain(usb_rtlsdr_dev_t *d, usb_rtlsdr_gain_mode_t mode, int gain_tenth_db)
 {
     esp_err_t err = ESP_OK;
 
@@ -479,9 +508,9 @@ static esp_err_t r820t_apply_gain(usb_rtlsdr_gain_mode_t mode, int gain_tenth_db
         /* Hand all three stages to the chip's AGC loop: set the AUTO bit on the
          * LNA, mixer and VGA registers. The low-nibble gain step is ignored by
          * the chip while AUTO is set, but we leave a sane mid value. */
-        err |= r820t_write(R820T_REG_LNA_GAIN,   (uint8_t)(R820T_AGC_AUTO_BIT | 0x08));
-        err |= r820t_write(R820T_REG_MIXER_GAIN, (uint8_t)(R820T_AGC_AUTO_BIT | 0x08));
-        err |= r820t_write(R820T_REG_VGA_GAIN,   (uint8_t)(R820T_AGC_AUTO_BIT | 0x0B));
+        err |= r820t_write(d, R820T_REG_LNA_GAIN,   (uint8_t)(R820T_AGC_AUTO_BIT | 0x08));
+        err |= r820t_write(d, R820T_REG_MIXER_GAIN, (uint8_t)(R820T_AGC_AUTO_BIT | 0x08));
+        err |= r820t_write(d, R820T_REG_VGA_GAIN,   (uint8_t)(R820T_AGC_AUTO_BIT | 0x0B));
         return (err == ESP_OK) ? ESP_OK : ESP_FAIL;
     }
 
@@ -507,9 +536,9 @@ static esp_err_t r820t_apply_gain(usb_rtlsdr_gain_mode_t mode, int gain_tenth_db
     /* reg 0x0C: VGA manual, fixed mid-high IF gain step (0x0B ~ 16.3 dB). */
     uint8_t reg0c = (uint8_t)(0x0B & R820T_GAIN_STEP_MASK);
 
-    err |= r820t_write(R820T_REG_LNA_GAIN,   reg05);
-    err |= r820t_write(R820T_REG_MIXER_GAIN, reg07);
-    err |= r820t_write(R820T_REG_VGA_GAIN,   reg0c);
+    err |= r820t_write(d, R820T_REG_LNA_GAIN,   reg05);
+    err |= r820t_write(d, R820T_REG_MIXER_GAIN, reg07);
+    err |= r820t_write(d, R820T_REG_VGA_GAIN,   reg0c);
 
     return (err == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
@@ -523,7 +552,7 @@ static esp_err_t r820t_apply_gain(usb_rtlsdr_gain_mode_t mode, int gain_tenth_db
  *   default register set. The values are the datasheet's recommended init for
  *   the upper RF band that contains 1090 MHz; gain + PLL are applied separately.
  */
-static esp_err_t r820t_init(void)
+static esp_err_t r820t_init(usb_rtlsdr_dev_t *d)
 {
     esp_err_t err = ESP_OK;
 
@@ -562,11 +591,11 @@ static esp_err_t r820t_init(void)
         /* 0x1E reserved.                                                     */ 0x4A,
         /* 0x1F reserved.                                                     */ 0xC0,
     };
-    memcpy(s_ctx.r82_shadow, init_regs, sizeof(init_regs));
+    memcpy(d->r82_shadow, init_regs, sizeof(init_regs));
 
     /* Push every writable register (0x05..0x1F) in ascending order. */
     for (uint8_t r = R820T_WRITE_START; r < R820T_NUM_REGS; r++) {
-        err |= r820t_write(r, s_ctx.r82_shadow[r]);
+        err |= r820t_write(d, r, d->r82_shadow[r]);
     }
 
     return (err == ESP_OK) ? ESP_OK : ESP_FAIL;
@@ -585,7 +614,7 @@ static esp_err_t r820t_init(void)
  *   ratio is written MSB-first across the two RSAMP_RATIO registers; the high
  *   byte is rounded to avoid a fractional-sample bias.
  */
-static esp_err_t rtl_set_sample_rate(uint32_t rate_sps)
+static esp_err_t rtl_set_sample_rate(usb_rtlsdr_dev_t *d, uint32_t rate_sps)
 {
     if (rate_sps == 0) {
         return ESP_ERR_INVALID_ARG;
@@ -604,12 +633,12 @@ static esp_err_t rtl_set_sample_rate(uint32_t rate_sps)
 
     esp_err_t err = ESP_OK;
     /* High 16 bits then low 16 bits of the 28-bit ratio, into the two regs. */
-    err |= rtl_demod_write(RTL_DEMOD_RSAMP_RATIO0, (uint16_t)((ratio >> 16) & 0xFFFF), 2);
-    err |= rtl_demod_write(RTL_DEMOD_RSAMP_RATIO1, (uint16_t)(ratio & 0xFFFF), 2);
+    err |= rtl_demod_write(d, RTL_DEMOD_RSAMP_RATIO0, (uint16_t)((ratio >> 16) & 0xFFFF), 2);
+    err |= rtl_demod_write(d, RTL_DEMOD_RSAMP_RATIO1, (uint16_t)(ratio & 0xFFFF), 2);
 
     /* Pulse the demod soft-reset so the new ratio takes effect cleanly. */
-    err |= rtl_demod_write(RTL_DEMOD_SOFT_RST, RTL_DEMOD_SOFT_RST_ON, 1);
-    err |= rtl_demod_write(RTL_DEMOD_SOFT_RST, RTL_DEMOD_SOFT_RST_OFF, 1);
+    err |= rtl_demod_write(d, RTL_DEMOD_SOFT_RST, RTL_DEMOD_SOFT_RST_ON, 1);
+    err |= rtl_demod_write(d, RTL_DEMOD_SOFT_RST, RTL_DEMOD_SOFT_RST_OFF, 1);
 
     return (err == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
@@ -622,31 +651,31 @@ static esp_err_t rtl_set_sample_rate(uint32_t rate_sps)
  *   the bulk endpoint. We do NOT enable the OFDM/DVB-T processing chain — the
  *   dongle delivers the raw 8-bit offset-binary I/Q the demod1090 stage wants.
  */
-static esp_err_t rtl_init_baseband(void)
+static esp_err_t rtl_init_baseband(usb_rtlsdr_dev_t *d)
 {
     esp_err_t err = ESP_OK;
 
     /* USB system control: enable the bulk FIFO path. */
-    err |= rtl_write_reg(RTL_USB_SYSCTL, RTL_BLK_USB, 0x09, 1);
+    err |= rtl_write_reg(d, RTL_USB_SYSCTL, RTL_BLK_USB, 0x09, 1);
 
     /* Max-packet for endpoint A = HS bulk 512. */
-    err |= rtl_write_reg(RTL_USB_EPA_MAXPKT, RTL_BLK_USB, RTLSDR_BULK_MPS_HS, 2);
+    err |= rtl_write_reg(d, RTL_USB_EPA_MAXPKT, RTL_BLK_USB, RTLSDR_BULK_MPS_HS, 2);
 
     /* Reset the endpoint A FIFO (write the reset bit, then clear it). */
-    err |= rtl_write_reg(RTL_USB_EPA_CTL, RTL_BLK_USB, 0x1002, 2);
-    err |= rtl_write_reg(RTL_USB_EPA_CTL, RTL_BLK_USB, 0x0000, 2);
+    err |= rtl_write_reg(d, RTL_USB_EPA_CTL, RTL_BLK_USB, 0x1002, 2);
+    err |= rtl_write_reg(d, RTL_USB_EPA_CTL, RTL_BLK_USB, 0x0000, 2);
 
     /* Demod control: power both ADCs, release digital reset. The I2C-repeater is
      * toggled separately around tuner writes. */
     const uint16_t demod_ctl_val = (RTL_DEMOD_CTL_ADC_I | RTL_DEMOD_CTL_ADC_Q | 0x20);
-    err |= rtl_write_reg(RTL_SYS_DEMOD_CTL, RTL_BLK_SYS, demod_ctl_val, 1);
+    err |= rtl_write_reg(d, RTL_SYS_DEMOD_CTL, RTL_BLK_SYS, demod_ctl_val, 1);
 
     /* Read the demod-control register straight back as a cheap liveness check:
      * a silicon RTL2832U returns the bits we just wrote (the ADC-power + clock
      * field is plain R/W). A mismatch means the control bus is not really
      * answering, which we surface as a fault rather than streaming garbage. */
     uint16_t readback = 0;
-    if (rtl_read_reg(RTL_SYS_DEMOD_CTL, RTL_BLK_SYS, &readback, 1) == ESP_OK) {
+    if (rtl_read_reg(d, RTL_SYS_DEMOD_CTL, RTL_BLK_SYS, &readback, 1) == ESP_OK) {
         if ((readback & demod_ctl_val) != demod_ctl_val) {
             ESP_LOGW(TAG, "demod ctl readback 0x%02x != 0x%02x",
                      readback, demod_ctl_val);
@@ -655,9 +684,9 @@ static esp_err_t rtl_init_baseband(void)
 
     /* GPIO defaults: drive the bias-tee line low (off) until set_bias_tee asks
      * for it. Configure GPIO0 as an output. */
-    err |= rtl_write_reg(RTL_SYS_GPD,  RTL_BLK_SYS, (uint16_t)(~RTL_GPIO_BIAS_TEE & 0xFF), 1);
-    err |= rtl_write_reg(RTL_SYS_GPOE, RTL_BLK_SYS, RTL_GPIO_BIAS_TEE, 1);
-    err |= rtl_write_reg(RTL_SYS_GPO,  RTL_BLK_SYS, 0x00, 1);
+    err |= rtl_write_reg(d, RTL_SYS_GPD,  RTL_BLK_SYS, (uint16_t)(~RTL_GPIO_BIAS_TEE & 0xFF), 1);
+    err |= rtl_write_reg(d, RTL_SYS_GPOE, RTL_BLK_SYS, RTL_GPIO_BIAS_TEE, 1);
+    err |= rtl_write_reg(d, RTL_SYS_GPO,  RTL_BLK_SYS, 0x00, 1);
 
     return (err == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
@@ -668,61 +697,62 @@ static esp_err_t rtl_init_baseband(void)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Retune the R820T2 to the driver's current centre frequency.
+ * @brief Retune the R820T2 to the device's current centre frequency.
  *
  * @details
  *   Folds the ppm trim into the requested centre, then programs the PLL for
  *   LO = centre + IF (the RTL2832U expects the channel at the standard IF).
  *   Wrapped in the I2C repeater so the tuner sees the writes.
  */
-static esp_err_t configure_frequency_locked(void)
+static esp_err_t configure_frequency_locked(usb_rtlsdr_dev_t *d)
 {
     /* Apply the ppm correction: a positive ppm means the crystal runs fast, so
      * we ask the LO for a slightly higher frequency to compensate. */
-    int64_t f = (int64_t)s_ctx.center_freq_hz;
-    f += (f * s_ctx.freq_correction_ppm) / 1000000;
+    int64_t f = (int64_t)d->center_freq_hz;
+    f += (f * d->freq_correction_ppm) / 1000000;
     uint32_t lo = (uint32_t)(f + R820T_IF_FREQ_HZ);
 
-    esp_err_t err = rtl_i2c_repeater(true);
+    esp_err_t err = rtl_i2c_repeater(d, true);
     if (err == ESP_OK) {
-        err = r820t_set_pll(lo);
+        err = r820t_set_pll(d, lo);
     }
     /* Always try to drop the repeater even if the PLL write failed. */
-    esp_err_t er2 = rtl_i2c_repeater(false);
+    esp_err_t er2 = rtl_i2c_repeater(d, false);
     return (err != ESP_OK) ? err : er2;
 }
 
-/** @brief Apply the driver's current gain mode/level to the tuner (locked). */
-static esp_err_t configure_gain_locked(void)
+/** @brief Apply the device's current gain mode/level to the tuner (locked). */
+static esp_err_t configure_gain_locked(usb_rtlsdr_dev_t *d)
 {
-    esp_err_t err = rtl_i2c_repeater(true);
+    esp_err_t err = rtl_i2c_repeater(d, true);
     if (err == ESP_OK) {
-        err = r820t_apply_gain(s_ctx.gain_mode, s_ctx.gain_tenth_db);
+        err = r820t_apply_gain(d, d->gain_mode, d->gain_tenth_db);
     }
-    esp_err_t er2 = rtl_i2c_repeater(false);
+    esp_err_t er2 = rtl_i2c_repeater(d, false);
     return (err != ESP_OK) ? err : er2;
 }
 
 /** @brief Drive the antenna-port bias-tee GPIO to the current state (locked). */
-static esp_err_t configure_bias_tee_locked(void)
+static esp_err_t configure_bias_tee_locked(usb_rtlsdr_dev_t *d)
 {
     /* GPIO0 high feeds 4.5 V to an external LNA; low disconnects it (S8). */
-    uint16_t gpo = s_ctx.bias_tee_enable ? RTL_GPIO_BIAS_TEE : 0x00;
-    return rtl_write_reg(RTL_SYS_GPO, RTL_BLK_SYS, gpo, 1);
+    uint16_t gpo = d->bias_tee_enable ? RTL_GPIO_BIAS_TEE : 0x00;
+    return rtl_write_reg(d, RTL_SYS_GPO, RTL_BLK_SYS, gpo, 1);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Bulk-IN completion — THE HOT PATH (Core 0). Must never block.
  *
  *  Each completed URB carries up to RTLSDR_URB_SIZE bytes of raw IQ. We chop it
- *  into block-sized iq_block_t items and push each into the ring via the
+ *  into block-sized iq_block_t items and push each into the device's ring via the
  *  acquire/complete API so the item's self-referential `samples` pointer is
  *  valid in the ring. On a full ring we DROP and count — never wait. Then we
- *  immediately re-submit the URB to keep the pipe saturated.
+ *  immediately re-submit the URB to keep the pipe saturated. The completion finds
+ *  its device via the `d` stashed in usb_transfer_t.context at alloc time.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Push one IQ chunk into the owned ring as a self-describing block.
+ * @brief Push one IQ chunk into the device's owned ring as a self-describing block.
  *
  * @details
  *   Reserves header+payload contiguously with xRingbufferSendAcquire (zero wait
@@ -733,14 +763,14 @@ static esp_err_t configure_bias_tee_locked(void)
  *
  * @return true if the block was enqueued; false if dropped (ring full).
  */
-static bool push_iq_block(const uint8_t *src, uint32_t n_bytes, int64_t t_cap)
+static bool push_iq_block(usb_rtlsdr_dev_t *d, const uint8_t *src, uint32_t n_bytes, int64_t t_cap)
 {
     /* The ring slot must hold the header plus the payload contiguously so the
      * consumer can read both from one item. */
     const size_t need = sizeof(iq_block_t) + n_bytes;
 
     void *slot = NULL;
-    if (xRingbufferSendAcquire(s_ctx.iq_ring, &slot, need, RTLSDR_RING_NOWAIT) != pdTRUE
+    if (xRingbufferSendAcquire(d->iq_ring, &slot, need, RTLSDR_RING_NOWAIT) != pdTRUE
         || slot == NULL) {
         /* Ring full — drop this block. Counting happens in the caller so the
          * per-URB overflow burst is a single OVERFLOW hint, not one per block. */
@@ -751,7 +781,7 @@ static bool push_iq_block(const uint8_t *src, uint32_t n_bytes, int64_t t_cap)
     iq_block_t *blk = (iq_block_t *)slot;
     blk->samples      = (const uint8_t *)slot + sizeof(iq_block_t);
     blk->n_bytes      = n_bytes;
-    blk->seq          = ++s_ctx.block_seq;   /* hot-path-private monotonic seq.  */
+    blk->seq          = ++d->block_seq;      /* hot-path-private monotonic seq.  */
     blk->t_capture_us = t_cap;
 
     /* Copy the raw IQ in right after the header (this is the borrowed buffer the
@@ -759,13 +789,13 @@ static bool push_iq_block(const uint8_t *src, uint32_t n_bytes, int64_t t_cap)
     memcpy((void *)blk->samples, src, n_bytes);
 
     /* Commit — now visible to xRingbufferReceive on the demod side. */
-    xRingbufferSendComplete(s_ctx.iq_ring, slot);
+    xRingbufferSendComplete(d->iq_ring, slot);
     return true;
 }
 
 /**
  * @brief Bulk-IN transfer completion callback (Core 0). Carves IQ into blocks,
- *        feeds the ring, then re-arms the URB. NEVER blocks.
+ *        feeds the device's ring, then re-arms the URB. NEVER blocks.
  *
  * @details
  *   This fires synchronously inside usb_host_client_handle_events() on the
@@ -773,13 +803,17 @@ static bool push_iq_block(const uint8_t *src, uint32_t n_bytes, int64_t t_cap)
  *   recursive lock for the short stats update and may use the plain (non-ISR)
  *   task-notify to nudge itself. It must never wait on the ring: a full ring
  *   means drop-and-count, then immediately re-arm so the bulk pipe stays
- *   saturated and the dongle's FIFO never backs up.
+ *   saturated and the dongle's FIFO never backs up. The owning device is the `d`
+ *   stashed in xfer->context when the URB was allocated.
  */
 static void bulk_in_cb(usb_transfer_t *xfer)
 {
-    /* If we are tearing down or the device vanished, stop re-arming. */
-    if (!s_ctx.task_run || !s_ctx.want_stream) {
-        s_ctx.urbs_inflight--;
+    usb_rtlsdr_dev_t *d = (usb_rtlsdr_dev_t *)xfer->context;
+
+    /* If we are tearing down (global) or this device stopped streaming, stop
+     * re-arming. task_run is process-global; want_stream is per-device. */
+    if (!s_ctx.task_run || !d->want_stream) {
+        d->urbs_inflight--;
         return;
     }
 
@@ -791,7 +825,8 @@ static void bulk_in_cb(usb_transfer_t *xfer)
         uint32_t       len  = (uint32_t)xfer->actual_num_bytes;
 
         /* Carve the URB into delivered blocks of block_size_pairs*2 bytes. A
-         * trailing partial chunk (rare; short packet) is delivered as-is. */
+         * trailing partial chunk (rare; short packet) is delivered as-is. The
+         * block geometry is install-global, so it reads from s_ctx. */
         const uint32_t block_bytes = (uint32_t)(s_ctx.block_size_pairs * 2u);
         uint32_t off = 0;
         uint64_t dropped_here   = 0;   /* blocks we had to drop (ring full).      */
@@ -805,7 +840,7 @@ static void bulk_in_cb(usb_transfer_t *xfer)
                 chunk &= ~1u;                         /* keep whole IQ pairs.    */
                 if (chunk == 0) break;
             }
-            if (push_iq_block(data + off, chunk, now)) {
+            if (push_iq_block(d, data + off, chunk, now)) {
                 delivered_here++;
                 bytes_here += chunk;
             } else {
@@ -819,23 +854,23 @@ static void bulk_in_cb(usb_transfer_t *xfer)
          * iq_block_t.seq on the consumer side); overflow_drops counts the rest.
          * The hot path only ever increments; readers are the slow status task. */
         lock();
-        s_ctx.stats.total_bytes    += bytes_here;
-        s_ctx.stats.total_blocks   += delivered_here;
-        s_ctx.stats.overflow_drops += dropped_here;
-        s_ctx.last_block_us = now;
+        d->stats.total_bytes    += bytes_here;
+        d->stats.total_blocks   += delivered_here;
+        d->stats.overflow_drops += dropped_here;
+        d->last_block_us = now;
 
         /* Windowed effective-rate measurement (~1 s window). */
-        if (s_ctx.rate_window_us == 0) {
-            s_ctx.rate_window_us = now;
+        if (d->rate_window_us == 0) {
+            d->rate_window_us = now;
         }
-        s_ctx.rate_window_bytes += len;
-        int64_t span = now - s_ctx.rate_window_us;
+        d->rate_window_bytes += len;
+        int64_t span = now - d->rate_window_us;
         if (span >= 1000000) {
             /* bytes/s -> samples/s (2 bytes per IQ pair => 1 sample-pair). */
-            uint64_t bps = (s_ctx.rate_window_bytes * 1000000ull) / (uint64_t)span;
-            s_ctx.stats.measured_sps = (uint32_t)(bps / 2ull);
-            s_ctx.rate_window_us    = now;
-            s_ctx.rate_window_bytes = 0;
+            uint64_t bps = (d->rate_window_bytes * 1000000ull) / (uint64_t)span;
+            d->stats.measured_sps = (uint32_t)(bps / 2ull);
+            d->rate_window_us    = now;
+            d->rate_window_bytes = 0;
         }
         unlock();
 
@@ -854,19 +889,19 @@ static void bulk_in_cb(usb_transfer_t *xfer)
     case USB_TRANSFER_STATUS_NO_DEVICE:
         /* Dongle yanked — let the client DEV_GONE path handle teardown; stop
          * re-arming this URB. */
-        s_ctx.urbs_inflight--;
-        s_ctx.do_recover = true;
+        d->urbs_inflight--;
+        d->do_recover = true;
         return;
 
     case USB_TRANSFER_STATUS_STALL:
         /* Endpoint stalled. Count it and ask the housekeeping task to recover;
          * do not re-arm until the stall is cleared. */
         lock();
-        s_ctx.stats.usb_stall_count++;
-        s_ctx.last_error = ADSBIN_ERR_USB_STALL;
+        d->stats.usb_stall_count++;
+        d->last_error = ADSBIN_ERR_USB_STALL;
         unlock();
-        s_ctx.urbs_inflight--;
-        s_ctx.do_recover = true;
+        d->urbs_inflight--;
+        d->do_recover = true;
         if (s_ctx.task) {
             xTaskNotify(s_ctx.task, 0, eNoAction);
         }
@@ -874,7 +909,7 @@ static void bulk_in_cb(usb_transfer_t *xfer)
 
     case USB_TRANSFER_STATUS_CANCELED:
         /* We cancelled it during stop()/teardown. Just retire it. */
-        s_ctx.urbs_inflight--;
+        d->urbs_inflight--;
         return;
 
     default:
@@ -886,8 +921,8 @@ static void bulk_in_cb(usb_transfer_t *xfer)
      * (device gone mid-flight) retire the URB and request recovery. */
     esp_err_t err = usb_host_transfer_submit(xfer);
     if (err != ESP_OK) {
-        s_ctx.urbs_inflight--;
-        s_ctx.do_recover = true;
+        d->urbs_inflight--;
+        d->do_recover = true;
         if (s_ctx.task) {
             xTaskNotify(s_ctx.task, 0, eNoAction);
         }
@@ -895,11 +930,11 @@ static void bulk_in_cb(usb_transfer_t *xfer)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  Bulk URB pool lifecycle.
+ *  Bulk URB pool lifecycle (per device).
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/** @brief Allocate the bulk-IN URB pool (call once the device is open). */
-static esp_err_t alloc_urbs(void)
+/** @brief Allocate the device's bulk-IN URB pool (call once it is open). */
+static esp_err_t alloc_urbs(usb_rtlsdr_dev_t *d)
 {
     for (uint32_t i = 0; i < RTLSDR_NUM_URBS; i++) {
         usb_transfer_t *x = NULL;
@@ -908,60 +943,61 @@ static esp_err_t alloc_urbs(void)
             ESP_LOGE(TAG, "URB %u alloc failed: %s", i, esp_err_to_name(err));
             return err;
         }
-        x->device_handle    = s_ctx.dev;
-        x->bEndpointAddress = s_ctx.bulk_ep;
+        x->device_handle    = d->dev;
+        x->bEndpointAddress = d->bulk_ep;
         x->callback         = bulk_in_cb;
-        x->context          = NULL;
+        x->context          = d;            /* so bulk_in_cb finds this device.  */
         x->num_bytes        = RTLSDR_URB_SIZE;
         x->timeout_ms       = 0;            /* bulk-IN: no per-transfer timeout. */
-        s_ctx.urb[i]        = x;
+        d->urb[i]           = x;
     }
     return ESP_OK;
 }
 
-/** @brief Free the bulk-IN URB pool (after they are all retired/cancelled). */
-static void free_urbs(void)
+/** @brief Free the device's bulk-IN URB pool (after all are retired/cancelled).*/
+static void free_urbs(usb_rtlsdr_dev_t *d)
 {
     for (uint32_t i = 0; i < RTLSDR_NUM_URBS; i++) {
-        if (s_ctx.urb[i]) {
-            usb_host_transfer_free(s_ctx.urb[i]);
-            s_ctx.urb[i] = NULL;
+        if (d->urb[i]) {
+            usb_host_transfer_free(d->urb[i]);
+            d->urb[i] = NULL;
         }
     }
 }
 
-/** @brief Submit every URB to start the continuous bulk-IN stream. */
-static esp_err_t submit_urbs(void)
+/** @brief Submit every URB to start the device's continuous bulk-IN stream. */
+static esp_err_t submit_urbs(usb_rtlsdr_dev_t *d)
 {
-    s_ctx.urbs_inflight = 0;
+    d->urbs_inflight = 0;
     for (uint32_t i = 0; i < RTLSDR_NUM_URBS; i++) {
-        esp_err_t err = usb_host_transfer_submit(s_ctx.urb[i]);
+        esp_err_t err = usb_host_transfer_submit(d->urb[i]);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "URB %u submit failed: %s", i, esp_err_to_name(err));
             return err;
         }
-        s_ctx.urbs_inflight++;
+        d->urbs_inflight++;
     }
     return ESP_OK;
 }
 
-/** @brief Cancel all in-flight URBs and wait for them to retire. */
-static void cancel_urbs(void)
+/** @brief Cancel all of the device's in-flight URBs and wait for them to retire.*/
+static void cancel_urbs(usb_rtlsdr_dev_t *d)
 {
     /* Halting the endpoint cancels outstanding transfers; their callbacks fire
-     * with STATUS_CANCELLED and decrement urbs_inflight. */
-    if (s_ctx.dev && s_ctx.bulk_ep) {
-        usb_host_endpoint_halt(s_ctx.dev, s_ctx.bulk_ep);
-        usb_host_endpoint_flush(s_ctx.dev, s_ctx.bulk_ep);
+     * with STATUS_CANCELLED and decrement urbs_inflight. Keyed off THIS device's
+     * handle + endpoint so recovering device i never touches device j's pipe. */
+    if (d->dev && d->bulk_ep) {
+        usb_host_endpoint_halt(d->dev, d->bulk_ep);
+        usb_host_endpoint_flush(d->dev, d->bulk_ep);
     }
 
     /* Pump the client event loop briefly so the cancellations complete. */
-    for (int i = 0; i < 50 && s_ctx.urbs_inflight > 0; i++) {
+    for (int i = 0; i < 50 && d->urbs_inflight > 0; i++) {
         usb_host_client_handle_events(s_ctx.client, pdMS_TO_TICKS(10));
     }
 
-    if (s_ctx.dev && s_ctx.bulk_ep) {
-        usb_host_endpoint_clear(s_ctx.dev, s_ctx.bulk_ep);
+    if (d->dev && d->bulk_ep) {
+        usb_host_endpoint_clear(d->dev, d->bulk_ep);
     }
 }
 
@@ -986,9 +1022,10 @@ static bool is_supported_dongle(uint16_t vid, uint16_t pid)
  *   0x0409 (US English) and flattens the UTF-16LE body to ASCII (non-ASCII code
  *   points become '?'). @p out is always NUL-terminated. Best-effort: on any
  *   error @p out is set to an empty string and ESP_OK-ish behaviour is faked by
- *   the caller (identity strings are not load-bearing).
+ *   the caller (identity strings are not load-bearing). The transfer goes over
+ *   @p d's EP0.
  */
-static void read_string_desc(uint8_t index, char *out, size_t out_sz)
+static void read_string_desc(usb_rtlsdr_dev_t *d, uint8_t index, char *out, size_t out_sz)
 {
     out[0] = '\0';
     if (index == 0 || out_sz == 0) {
@@ -999,7 +1036,7 @@ static void read_string_desc(uint8_t index, char *out, size_t out_sz)
     uint8_t buf[RTLSDR_STRDESC_MAX];
     memset(buf, 0, sizeof(buf));
     uint16_t wValue = (uint16_t)((USB_B_DESCRIPTOR_TYPE_STRING << 8) | index);
-    esp_err_t err = ctrl_xfer(USB_BM_REQUEST_TYPE_DIR_IN | USB_BM_REQUEST_TYPE_TYPE_STANDARD
+    esp_err_t err = ctrl_xfer(d, USB_BM_REQUEST_TYPE_DIR_IN | USB_BM_REQUEST_TYPE_TYPE_STANDARD
                                   | USB_BM_REQUEST_TYPE_RECIP_DEVICE,
                               USB_B_REQUEST_GET_DESCRIPTOR, wValue, 0x0409,
                               buf, sizeof(buf) - 1);
@@ -1027,13 +1064,13 @@ static void read_string_desc(uint8_t index, char *out, size_t out_sz)
  *
  * @details
  *   Claims interface 0 / alt 0 and locates its bulk-IN endpoint (the DVB-T data
- *   pipe we repurpose for raw IQ). Fills s_ctx.bulk_ep / bulk_mps. The endpoint
+ *   pipe we repurpose for raw IQ). Fills d->bulk_ep / bulk_mps. The endpoint
  *   address is verified against the descriptor rather than trusting 0x81 blindly.
  */
-static esp_err_t find_and_claim_bulk(void)
+static esp_err_t find_and_claim_bulk(usb_rtlsdr_dev_t *d)
 {
     const usb_config_desc_t *cfg = NULL;
-    esp_err_t err = usb_host_get_active_config_descriptor(s_ctx.dev, &cfg);
+    esp_err_t err = usb_host_get_active_config_descriptor(d->dev, &cfg);
     if (err != ESP_OK || !cfg) {
         return (err != ESP_OK) ? err : ESP_FAIL;
     }
@@ -1048,8 +1085,8 @@ static esp_err_t find_and_claim_bulk(void)
     }
 
     /* Walk the interface's endpoints for the bulk-IN one. */
-    s_ctx.bulk_ep  = 0;
-    s_ctx.bulk_mps = 0;
+    d->bulk_ep  = 0;
+    d->bulk_mps = 0;
     for (int e = 0; e < intf->bNumEndpoints; e++) {
         int ep_off = offset;
         const usb_ep_desc_t *ep =
@@ -1061,18 +1098,18 @@ static esp_err_t find_and_claim_bulk(void)
         bool is_bulk = (ep->bmAttributes & USB_BM_ATTRIBUTES_XFERTYPE_MASK)
                            == USB_BM_ATTRIBUTES_XFER_BULK;
         if (is_in && is_bulk) {
-            s_ctx.bulk_ep  = ep->bEndpointAddress;
-            s_ctx.bulk_mps = USB_EP_DESC_GET_MPS(ep);
+            d->bulk_ep  = ep->bEndpointAddress;
+            d->bulk_mps = USB_EP_DESC_GET_MPS(ep);
             break;
         }
     }
-    if (s_ctx.bulk_ep == 0) {
+    if (d->bulk_ep == 0) {
         ESP_LOGE(TAG, "no bulk-IN endpoint on interface %u", RTLSDR_INTF_NUMBER);
         return ESP_ERR_NOT_FOUND;
     }
 
     /* Claim the interface so the host routes the endpoint to us. */
-    err = usb_host_interface_claim(s_ctx.client, s_ctx.dev,
+    err = usb_host_interface_claim(s_ctx.client, d->dev,
                                    RTLSDR_INTF_NUMBER, RTLSDR_INTF_ALT);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "interface claim failed: %s", esp_err_to_name(err));
@@ -1082,90 +1119,93 @@ static esp_err_t find_and_claim_bulk(void)
 }
 
 /**
- * @brief Open the enumerated device at @p addr, read identity, probe the tuner.
+ * @brief Open the enumerated device at @p addr into slot @p d, read identity,
+ *        probe the tuner.
  *
  * @details
- *   Opens the device, allocates the shared control transfer, parses identity
- *   strings, claims the bulk interface, and probes the R820T2 chip id so
+ *   Opens the device, allocates the device's shared control transfer, parses
+ *   identity strings, claims the bulk interface, and probes the R820T2 chip id so
  *   ::usb_rtlsdr_device_info_t.tuner is honest. Leaves the device OPEN_IDLE.
  */
-static esp_err_t open_device(uint8_t addr)
+static esp_err_t open_device(usb_rtlsdr_dev_t *d, uint8_t addr)
 {
-    esp_err_t err = usb_host_device_open(s_ctx.client, addr, &s_ctx.dev);
+    esp_err_t err = usb_host_device_open(s_ctx.client, addr, &d->dev);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "device_open(%u) failed: %s", addr, esp_err_to_name(err));
         return err;
     }
-    s_ctx.dev_addr = addr;
+    d->dev_addr = addr;
 
-    /* Allocate the reusable EP0 control transfer (setup + small data). */
+    /* Allocate the reusable EP0 control transfer (setup + small data) and stamp
+     * its context with this device so ctrl_xfer_cb can raise the right flag. */
     err = usb_host_transfer_alloc(sizeof(usb_setup_packet_t) + RTLSDR_STRDESC_MAX,
-                                  0, &s_ctx.ctrl_xfer);
+                                  0, &d->ctrl_xfer);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "ctrl transfer alloc failed: %s", esp_err_to_name(err));
         return err;
     }
+    d->ctrl_xfer->context = d;
 
     /* Read the device descriptor for VID/PID and string indices. */
     const usb_device_desc_t *dd = NULL;
-    err = usb_host_get_device_descriptor(s_ctx.dev, &dd);
+    err = usb_host_get_device_descriptor(d->dev, &dd);
     if (err != ESP_OK || !dd) {
         return (err != ESP_OK) ? err : ESP_FAIL;
     }
 
-    memset(&s_ctx.info, 0, sizeof(s_ctx.info));
-    s_ctx.info.vid = dd->idVendor;
-    s_ctx.info.pid = dd->idProduct;
-    s_ctx.info.has_bias_tee = true;     /* GPIO0 bias-tee is wired on our HW.    */
+    memset(&d->info, 0, sizeof(d->info));
+    d->info.vid = dd->idVendor;
+    d->info.pid = dd->idProduct;
+    d->info.has_bias_tee = true;     /* GPIO0 bias-tee is wired on our HW.    */
 
     /* Identity strings (best-effort; not load-bearing). */
-    read_string_desc(dd->iProduct,      s_ctx.info.product_name, sizeof(s_ctx.info.product_name));
-    read_string_desc(dd->iSerialNumber, s_ctx.info.serial,       sizeof(s_ctx.info.serial));
+    read_string_desc(d, dd->iProduct,      d->info.product_name, sizeof(d->info.product_name));
+    read_string_desc(d, dd->iSerialNumber, d->info.serial,       sizeof(d->info.serial));
 
     /* Claim the bulk interface + locate the bulk-IN endpoint. */
-    err = find_and_claim_bulk();
+    err = find_and_claim_bulk(d);
     if (err != ESP_OK) {
         return err;
     }
 
     /* Probe the tuner over I2C to confirm it is an R820T/R820T2. */
-    err = rtl_init_baseband();
+    err = rtl_init_baseband(d);
     if (err == ESP_OK) {
-        err = rtl_i2c_repeater(true);
+        err = rtl_i2c_repeater(d, true);
         uint8_t id = 0;
         if (err == ESP_OK) {
-            r820t_read(R820T_REG_CHIPID, &id);   /* best-effort id read.         */
+            r820t_read(d, R820T_REG_CHIPID, &id);   /* best-effort id read.       */
         }
-        rtl_i2c_repeater(false);
+        rtl_i2c_repeater(d, false);
         /* The R820T2 returns a stable id pattern; treat any successful bus read
          * as R820T2 (the family we support). If the bus failed, mark UNKNOWN. */
-        s_ctx.info.tuner = (err == ESP_OK) ? USB_RTLSDR_TUNER_R820T2
-                                           : USB_RTLSDR_TUNER_UNKNOWN;
+        d->info.tuner = (err == ESP_OK) ? USB_RTLSDR_TUNER_R820T2
+                                        : USB_RTLSDR_TUNER_UNKNOWN;
         (void)id;
     }
 
-    s_ctx.state = USB_RTLSDR_STATE_OPEN_IDLE;
-    ESP_LOGI(TAG, "opened RTL-SDR %04x:%04x '%s' serial '%s'",
-             s_ctx.info.vid, s_ctx.info.pid,
-             s_ctx.info.product_name, s_ctx.info.serial);
+    d->state = USB_RTLSDR_STATE_OPEN_IDLE;
+    ESP_LOGI(TAG, "opened RTL-SDR[%d] %04x:%04x '%s' serial '%s'",
+             d->index, d->info.vid, d->info.pid,
+             d->info.product_name, d->info.serial);
     return ESP_OK;
 }
 
-/** @brief Close the open device, releasing the interface + transfers. */
-static void close_device(void)
+/** @brief Close the device in slot @p d, releasing the interface + transfers. */
+static void close_device(usb_rtlsdr_dev_t *d)
 {
-    if (s_ctx.dev) {
-        if (s_ctx.bulk_ep) {
-            usb_host_interface_release(s_ctx.client, s_ctx.dev, RTLSDR_INTF_NUMBER);
+    if (d->dev) {
+        if (d->bulk_ep) {
+            usb_host_interface_release(s_ctx.client, d->dev, RTLSDR_INTF_NUMBER);
         }
-        if (s_ctx.ctrl_xfer) {
-            usb_host_transfer_free(s_ctx.ctrl_xfer);
-            s_ctx.ctrl_xfer = NULL;
+        if (d->ctrl_xfer) {
+            usb_host_transfer_free(d->ctrl_xfer);
+            d->ctrl_xfer = NULL;
         }
-        usb_host_device_close(s_ctx.client, s_ctx.dev);
-        s_ctx.dev      = NULL;
-        s_ctx.dev_addr = 0;
-        s_ctx.bulk_ep  = 0;
+        usb_host_device_close(s_ctx.client, d->dev);
+        d->dev      = NULL;
+        d->dev_addr = 0;
+        d->bulk_ep  = 0;
     }
 }
 
@@ -1173,71 +1213,71 @@ static void close_device(void)
  *  Start/stop streaming (internal, called under `lock`).
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/** @brief Configure the tuner + demod for the current stream config and arm IQ.*/
-static esp_err_t start_streaming_locked(void)
+/** @brief Configure the tuner + demod for the device's stream config and arm IQ.*/
+static esp_err_t start_streaming_locked(usb_rtlsdr_dev_t *d)
 {
-    if (!s_ctx.dev) {
+    if (!d->dev) {
         return ADSBIN_ERR_NO_DONGLE;
     }
-    if (s_ctx.state == USB_RTLSDR_STATE_STREAMING) {
+    if (d->state == USB_RTLSDR_STATE_STREAMING) {
         return ESP_OK;                      /* idempotent.                       */
     }
 
     esp_err_t err = ESP_OK;
 
     /* 1) Bring the RTL2832U baseband up in raw-IQ mode. */
-    err = rtl_init_baseband();
+    err = rtl_init_baseband(d);
     if (err != ESP_OK) return err;
 
     /* 2) Initialise + tune the R820T2 (under the I2C repeater). */
-    err = rtl_i2c_repeater(true);
-    if (err == ESP_OK) err = r820t_init();
-    rtl_i2c_repeater(false);
+    err = rtl_i2c_repeater(d, true);
+    if (err == ESP_OK) err = r820t_init(d);
+    rtl_i2c_repeater(d, false);
     if (err != ESP_OK) return err;
 
     /* 3) Sample rate, then frequency, then gain, then bias-tee. */
-    err = rtl_set_sample_rate(s_ctx.sample_rate_sps);
-    if (err == ESP_OK) err = configure_frequency_locked();
-    if (err == ESP_OK) err = configure_gain_locked();
-    if (err == ESP_OK) err = configure_bias_tee_locked();
+    err = rtl_set_sample_rate(d, d->sample_rate_sps);
+    if (err == ESP_OK) err = configure_frequency_locked(d);
+    if (err == ESP_OK) err = configure_gain_locked(d);
+    if (err == ESP_OK) err = configure_bias_tee_locked(d);
     if (err != ESP_OK) return err;
 
     /* 4) Reset the demod sample pipe so we start on a clean boundary. */
-    err = rtl_demod_write(RTL_DEMOD_SOFT_RST, RTL_DEMOD_SOFT_RST_ON, 1);
-    if (err == ESP_OK) err = rtl_demod_write(RTL_DEMOD_SOFT_RST, RTL_DEMOD_SOFT_RST_OFF, 1);
+    err = rtl_demod_write(d, RTL_DEMOD_SOFT_RST, RTL_DEMOD_SOFT_RST_ON, 1);
+    if (err == ESP_OK) err = rtl_demod_write(d, RTL_DEMOD_SOFT_RST, RTL_DEMOD_SOFT_RST_OFF, 1);
     if (err != ESP_OK) return err;
 
     /* 5) Allocate (if needed) and submit the bulk URBs. */
-    if (s_ctx.urb[0] == NULL) {
-        err = alloc_urbs();
-        if (err != ESP_OK) { free_urbs(); return err; }
+    if (d->urb[0] == NULL) {
+        err = alloc_urbs(d);
+        if (err != ESP_OK) { free_urbs(d); return err; }
     }
-    s_ctx.block_seq = 0;
-    s_ctx.want_stream = true;
-    err = submit_urbs();
+    d->block_seq = 0;
+    d->want_stream = true;
+    err = submit_urbs(d);
     if (err != ESP_OK) {
-        s_ctx.want_stream = false;
+        d->want_stream = false;
         return err;
     }
 
-    s_ctx.state = USB_RTLSDR_STATE_STREAMING;
-    ESP_LOGI(TAG, "streaming: %u sps @ %u Hz, gain %d (mode %d)",
-             s_ctx.sample_rate_sps, s_ctx.center_freq_hz,
-             s_ctx.gain_tenth_db, (int)s_ctx.gain_mode);
+    d->state = USB_RTLSDR_STATE_STREAMING;
+    ESP_LOGI(TAG, "streaming[%d]: %u sps @ %u Hz, gain %d (mode %d)",
+             d->index, d->sample_rate_sps, d->center_freq_hz,
+             d->gain_tenth_db, (int)d->gain_mode);
     return ESP_OK;
 }
 
 /** @brief Halt bulk-IN, retire URBs, leave the device open. */
-static void stop_streaming_locked(void)
+static void stop_streaming_locked(usb_rtlsdr_dev_t *d)
 {
-    if (s_ctx.state != USB_RTLSDR_STATE_STREAMING) {
+    if (d->state != USB_RTLSDR_STATE_STREAMING) {
         return;
     }
-    s_ctx.want_stream = false;
-    cancel_urbs();
-    s_ctx.state = (s_ctx.dev) ? USB_RTLSDR_STATE_OPEN_IDLE
-                              : USB_RTLSDR_STATE_NO_DEVICE;
-    ESP_LOGI(TAG, "streaming stopped");
+    d->want_stream = false;
+    cancel_urbs(d);
+    d->state = (d->dev) ? USB_RTLSDR_STATE_OPEN_IDLE
+                        : USB_RTLSDR_STATE_NO_DEVICE;
+    ESP_LOGI(TAG, "streaming[%d] stopped", d->index);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1254,16 +1294,20 @@ static void client_event_cb(const usb_host_client_event_msg_t *msg, void *arg)
     (void)arg;
     switch (msg->event) {
     case USB_HOST_CLIENT_EVENT_NEW_DEV:
-        /* A device enumerated; record its address for the task to open. */
+        /* A device enumerated; record its address for the task to open. The
+         * NEW_DEV queue is process-global — the task drains it into a free slot. */
         s_ctx.pending_new_addr = msg->new_dev.address;
         s_ctx.have_pending_new = true;
         break;
 
     case USB_HOST_CLIENT_EVENT_DEV_GONE:
-        /* The open device (or another) went away. Flag recovery; the task body
-         * tears down and, if auto_recover, waits for a fresh NEW_DEV. */
-        if (s_ctx.dev && msg->dev_gone.dev_hdl == s_ctx.dev) {
-            s_ctx.do_recover = true;
+        /* A device went away. Find which slot owns that handle and flag it for
+         * recovery; the task body tears down THAT slot and, if auto_recover,
+         * waits for a fresh NEW_DEV (a replug regains its role via seen_serial). */
+        for (int i = 0; i < (int)RTLSDR_MAX_DEVICES; i++) {
+            if (s_ctx.dev[i].in_use && msg->dev_gone.dev_hdl == s_ctx.dev[i].dev) {
+                s_ctx.dev[i].do_recover = true;
+            }
         }
         break;
 
@@ -1273,18 +1317,70 @@ static void client_event_cb(const usb_host_client_event_msg_t *msg, void *arg)
 }
 
 /**
- * @brief Try to open the pending NEW_DEV if it is a supported dongle.
+ * @brief Resolve the role-slot index for a freshly-opened device by stable
+ *        first-seen serial order.
+ *
+ * @details
+ *   The role a dongle serves must survive an unplug/replug, so it is bound to the
+ *   ORDER in which distinct serials are first seen, not to the volatile bus
+ *   address. We keep a small map (s_ctx.seen_serial[]) of the serials we have
+ *   adopted; a serial already in the map regains its original index, a new serial
+ *   appends. If the serial is empty or the well-known default "00000001" (two
+ *   identical sticks), first-seen order STILL applies — distinct entries are
+ *   appended in adoption order, which is the natural port-enumeration order. This
+ *   means two identical-serial dongles fall back to adoption order, documented.
+ *
+ * @return The role index 0..RTLSDR_MAX_DEVICES-1, or -1 if the map is full.
+ */
+static int role_index_for_serial(const char *serial)
+{
+    /* Already mapped? Return its existing index (stable across replug). */
+    for (int i = 0; i < s_ctx.seen_count; i++) {
+        if (strncmp(s_ctx.seen_serial[i], serial, sizeof(s_ctx.seen_serial[0]) - 1) == 0) {
+            return i;
+        }
+    }
+    /* New serial: append in first-seen order if there is room. */
+    if (s_ctx.seen_count < (int)RTLSDR_MAX_DEVICES) {
+        int idx = s_ctx.seen_count;
+        strncpy(s_ctx.seen_serial[idx], serial, sizeof(s_ctx.seen_serial[0]) - 1);
+        s_ctx.seen_serial[idx][sizeof(s_ctx.seen_serial[0]) - 1] = '\0';
+        s_ctx.seen_count++;
+        return idx;
+    }
+    return -1;
+}
+
+/**
+ * @brief Try to open the pending NEW_DEV into a free slot if it is a supported
+ *        dongle, then assign its role and (if intent is latched) start it.
  *
  * @details
  *   Reads the candidate's device descriptor (a transient open to peek VID/PID),
- *   and if it matches our family, keeps it open + configured. We honour
- *   device_index by skipping the first N matches.
+ *   and if it matches our family, adopts it into the first free slot. The slot's
+ *   role is then assigned by stable serial order (with the first-device override
+ *   hook honoured); the slot's stream config is seeded from the role's band, and
+ *   if the global streaming intent is latched the slot is started immediately.
  */
 static void task_try_open_pending(void)
 {
-    if (!s_ctx.have_pending_new || s_ctx.dev) {
+    if (!s_ctx.have_pending_new) {
         return;
     }
+
+    /* Find the first free slot. If none, the queue is moot — clear it and bail. */
+    usb_rtlsdr_dev_t *d = NULL;
+    for (int i = 0; i < (int)RTLSDR_MAX_DEVICES; i++) {
+        if (!s_ctx.dev[i].in_use) {
+            d = &s_ctx.dev[i];
+            break;
+        }
+    }
+    if (!d) {
+        s_ctx.have_pending_new = false;
+        return;
+    }
+
     uint8_t addr = s_ctx.pending_new_addr;
     s_ctx.have_pending_new = false;
 
@@ -1303,136 +1399,154 @@ static void task_try_open_pending(void)
         return;
     }
 
-    /* Honour device_index: rank every currently-present supported dongle by bus
-     * address and only adopt this one if its rank matches the requested index.
-     * Ranking the full list (rather than counting NEW_DEV arrivals) keeps the
-     * selection deterministic no matter what order the events came in. */
-    {
-        uint8_t addrs[16];
-        int num = 0;
-        int rank = 0;
-        if (usb_host_device_addr_list_fill(sizeof(addrs), addrs, &num) == ESP_OK) {
-            for (int i = 0; i < num; i++) {
-                if (addrs[i] >= addr) {
-                    continue;       /* count only dongles ahead of this one.     */
-                }
-                usb_device_handle_t h = NULL;
-                if (usb_host_device_open(s_ctx.client, addrs[i], &h) != ESP_OK) {
-                    continue;
-                }
-                const usb_device_desc_t *d2 = NULL;
-                if (usb_host_get_device_descriptor(h, &d2) == ESP_OK && d2 &&
-                    is_supported_dongle(d2->idVendor, d2->idProduct)) {
-                    rank++;
-                }
-                usb_host_device_close(s_ctx.client, h);
-            }
-        }
-        if (rank != s_ctx.device_index) {
-            /* Not the dongle the caller asked for — leave it for a later index. */
-            return;
-        }
-    }
-
     /* It is a supported dongle — open it for real under the lock. The open path
-     * reads identity, claims the bulk interface and probes the tuner. */
+     * reads identity (including the serial), claims the bulk interface and
+     * probes the tuner. */
     lock();
-    esp_err_t err = open_device(addr);
+    esp_err_t err = open_device(d, addr);
     unlock();
 
-    if (err == ESP_OK) {
-        /* CONNECTED first, then auto-start streaming if start() latched intent. */
-        emit_event(USB_RTLSDR_EVENT_CONNECTED);
-        if (s_ctx.want_stream) {
-            lock();
-            esp_err_t serr = start_streaming_locked();
-            unlock();
-            if (serr == ESP_OK) {
-                emit_event(USB_RTLSDR_EVENT_STREAM_STARTED);
-            } else {
-                set_last_error(serr);
-            }
-        }
-    } else {
+    if (err != ESP_OK) {
         /* Open/configure failed — record it and tidy up the half-open device. */
-        set_last_error(err);
+        set_last_error(d, err);
         lock();
-        close_device();
+        close_device(d);
         unlock();
+        return;
+    }
+
+    /* ── ROLE ASSIGNMENT ─────────────────────────────────────────────────────
+     * Resolve the role slot by stable first-seen serial order. We capture whether
+     * this is the FIRST adopted device (seen_count == 0) BEFORE the lookup, since
+     * the override only forces the very first dongle's role. */
+    bool first_device = (s_ctx.seen_count == 0);
+    int role_idx = role_index_for_serial(d->info.serial);
+    if (role_idx < 0) {
+        role_idx = d->index;   /* map full (shouldn't happen) — fall back to slot.*/
+    }
+
+    /* Default role: index 0 => 1090, index 1 => 978 UAT. */
+    adsbin_rf_role_t role = (role_idx == 0) ? ADSBIN_ROLE_1090 : ADSBIN_ROLE_978_UAT;
+
+    /* Override hook: a lone dongle can be forced to 978 (or pinned to 1090). The
+     * override only applies to the FIRST adopted device so a second stick still
+     * takes the next free band. */
+    if (first_device && s_role_override != ADSBIN_ROLE_NONE) {
+        role = s_role_override;
+    }
+    d->role = role;
+
+    /* Seed the slot's stream config from its role's band. Gain/ppm/bias defaults
+     * were already seeded into every slot at init; the band is what differs. */
+    if (role == ADSBIN_ROLE_978_UAT) {
+        d->center_freq_hz  = UAT_CENTER_FREQ_HZ;
+        d->sample_rate_sps = UAT_SAMPLE_RATE_HZ;
+    } else {
+        d->center_freq_hz  = ADSB_CENTER_FREQ_HZ;
+        d->sample_rate_sps = ADSB_SAMPLE_RATE_HZ;
+    }
+
+    /* The slot is now occupied. Latch this device's streaming intent from the
+     * GLOBAL latched intent so a start() issued before plug-in still auto-starts. */
+    d->in_use      = true;
+    d->want_stream = s_ctx.want_stream_latched;
+
+    /* CONNECTED first, then auto-start streaming if intent is latched. */
+    emit_event(d->index, USB_RTLSDR_EVENT_CONNECTED);
+    if (d->want_stream) {
+        lock();
+        esp_err_t serr = start_streaming_locked(d);
+        unlock();
+        if (serr == ESP_OK) {
+            emit_event(d->index, USB_RTLSDR_EVENT_STREAM_STARTED);
+        } else {
+            set_last_error(d, serr);
+        }
     }
 }
 
 /**
- * @brief Tear down the current device on disconnect/stall and (optionally)
- *        re-enumerate. Runs in the housekeeping task only.
+ * @brief Tear down any device flagged for recovery and (optionally) re-latch its
+ *        streaming intent so a replug auto-restarts. Runs in the housekeeping
+ *        task only. Iterates all slots; recovering slot i never touches slot j.
  */
 static void task_do_recovery(void)
 {
-    if (!s_ctx.do_recover) {
-        return;
-    }
-    s_ctx.do_recover = false;
+    for (int i = 0; i < (int)RTLSDR_MAX_DEVICES; i++) {
+        usb_rtlsdr_dev_t *d = &s_ctx.dev[i];
+        if (!d->do_recover) {
+            continue;
+        }
+        d->do_recover = false;
 
-    /* Capture "were we (meant to be) streaming?" BEFORE we mutate state — both
-     * the live STREAMING state and the latched want_stream count, so a stall
-     * mid-stream re-arms after recovery. Reading it first avoids the trap where
-     * setting RECOVERING below would erase the evidence. */
-    bool was_streaming = (s_ctx.state == USB_RTLSDR_STATE_STREAMING) || s_ctx.want_stream;
+        /* Capture "were we (meant to be) streaming?" BEFORE we mutate state —
+         * both the live STREAMING state and the latched want_stream count, so a
+         * stall mid-stream re-arms after recovery. Reading it first avoids the
+         * trap where setting RECOVERING below would erase the evidence. */
+        bool was_streaming = (d->state == USB_RTLSDR_STATE_STREAMING) || d->want_stream;
 
-    s_ctx.state = USB_RTLSDR_STATE_RECOVERING;
-    emit_event(USB_RTLSDR_EVENT_USB_STALL);
+        d->state = USB_RTLSDR_STATE_RECOVERING;
+        emit_event(d->index, USB_RTLSDR_EVENT_USB_STALL);
 
-    lock();
-    /* Retire URBs + close the (possibly-dead) device. */
-    s_ctx.want_stream = false;
-    cancel_urbs();
-    free_urbs();
-    close_device();
-    s_ctx.stats.reset_count++;
-    s_ctx.state = USB_RTLSDR_STATE_NO_DEVICE;
-    unlock();
+        lock();
+        /* Retire URBs + close the (possibly-dead) device — all keyed off d so we
+         * only touch THIS device's endpoints. */
+        d->want_stream = false;
+        cancel_urbs(d);
+        free_urbs(d);
+        close_device(d);
+        d->stats.reset_count++;
+        d->state  = USB_RTLSDR_STATE_NO_DEVICE;
+        /* Free the slot so a fresh NEW_DEV can be adopted, but KEEP the
+         * seen_serial mapping intact so a replug of the same dongle regains the
+         * same role/index. */
+        d->in_use = false;
+        unlock();
 
-    emit_event(USB_RTLSDR_EVENT_DISCONNECTED);
+        emit_event(d->index, USB_RTLSDR_EVENT_DISCONNECTED);
 
-    /* If auto-recover is on, re-latch the streaming intent so the next NEW_DEV
-     * (from a re-plug or stack re-enumeration) auto-starts the bulk path. */
-    if (s_ctx.auto_recover) {
-        s_ctx.want_stream = was_streaming;
-        emit_event(USB_RTLSDR_EVENT_RECOVERED);
+        /* If auto-recover is on, re-latch the streaming intent so the next
+         * NEW_DEV (from a re-plug or stack re-enumeration) auto-starts the bulk
+         * path. The re-adopted slot copies this from want_stream when it opens. */
+        if (s_ctx.auto_recover) {
+            d->want_stream = was_streaming;
+            emit_event(d->index, USB_RTLSDR_EVENT_RECOVERED);
+        }
     }
 }
 
 /**
- * @brief Apply any deferred runtime-config requests on the usb_task.
+ * @brief Apply one device's deferred runtime-config requests on the usb_task.
  *
  * @details
  *   This is where Core-1 set_* / start/stop requests actually reach the chip — on
  *   the one task that owns the USB client event loop. Each dirty flag is cleared
- *   under the lock and the matching chip write is performed (only if a device is
- *   open). Failures are recorded in last_error rather than propagated, since the
- *   originating call already returned "accepted".
+ *   under the lock and the matching chip write is performed (only if the device
+ *   is open). Failures are recorded in last_error rather than propagated, since
+ *   the originating call already returned "accepted". Called once per in-use slot
+ *   by task_apply_config().
  */
-static void task_apply_config(void)
+static void apply_device_config(usb_rtlsdr_dev_t *d)
 {
     /* Snapshot + clear the dirty flags under the lock so a concurrent set_* that
      * lands mid-apply simply re-arms for the next pass. */
     lock();
-    bool d_freq  = s_ctx.cfg_dirty_freq;  s_ctx.cfg_dirty_freq  = false;
-    bool d_rate  = s_ctx.cfg_dirty_rate;  s_ctx.cfg_dirty_rate  = false;
-    bool d_gain  = s_ctx.cfg_dirty_gain;  s_ctx.cfg_dirty_gain  = false;
-    bool d_bias  = s_ctx.cfg_dirty_bias;  s_ctx.cfg_dirty_bias  = false;
-    bool d_start = s_ctx.cfg_dirty_start; s_ctx.cfg_dirty_start = false;
-    bool d_stop  = s_ctx.cfg_dirty_stop;  s_ctx.cfg_dirty_stop  = false;
-    bool have_dev = (s_ctx.dev != NULL);
+    bool d_freq  = d->cfg_dirty_freq;  d->cfg_dirty_freq  = false;
+    bool d_rate  = d->cfg_dirty_rate;  d->cfg_dirty_rate  = false;
+    bool d_gain  = d->cfg_dirty_gain;  d->cfg_dirty_gain  = false;
+    bool d_bias  = d->cfg_dirty_bias;  d->cfg_dirty_bias  = false;
+    bool d_start = d->cfg_dirty_start; d->cfg_dirty_start = false;
+    bool d_stop  = d->cfg_dirty_stop;  d->cfg_dirty_stop  = false;
+    bool have_dev = (d->dev != NULL);
     unlock();
 
     /* Stop takes priority — if both were requested, the latest intent wins. */
     if (d_stop) {
         lock();
-        s_ctx.want_stream = false;
-        stop_streaming_locked();
+        d->want_stream = false;
+        stop_streaming_locked(d);
         unlock();
-        emit_event(USB_RTLSDR_EVENT_STREAM_STOPPED);
+        emit_event(d->index, USB_RTLSDR_EVENT_STREAM_STOPPED);
         return;     /* nothing else makes sense after a stop this pass.         */
     }
 
@@ -1440,13 +1554,13 @@ static void task_apply_config(void)
      * Otherwise the open path will auto-start when the dongle enumerates. */
     if (d_start) {
         lock();
-        s_ctx.want_stream = true;
-        esp_err_t err = have_dev ? start_streaming_locked() : ESP_OK;
+        d->want_stream = true;
+        esp_err_t err = have_dev ? start_streaming_locked(d) : ESP_OK;
         unlock();
-        if (err == ESP_OK && s_ctx.state == USB_RTLSDR_STATE_STREAMING) {
-            emit_event(USB_RTLSDR_EVENT_STREAM_STARTED);
+        if (err == ESP_OK && d->state == USB_RTLSDR_STATE_STREAMING) {
+            emit_event(d->index, USB_RTLSDR_EVENT_STREAM_STARTED);
         } else if (err != ESP_OK) {
-            set_last_error(err);
+            set_last_error(d, err);
         }
     }
 
@@ -1459,27 +1573,44 @@ static void task_apply_config(void)
      * then gain, then the bias-tee GPIO. Order mirrors a fresh stream bring-up. */
     if (d_rate) {
         lock();
-        esp_err_t err = rtl_set_sample_rate(s_ctx.sample_rate_sps);
+        esp_err_t err = rtl_set_sample_rate(d, d->sample_rate_sps);
         unlock();
-        if (err != ESP_OK) set_last_error(err);
+        if (err != ESP_OK) set_last_error(d, err);
     }
     if (d_freq) {
         lock();
-        esp_err_t err = configure_frequency_locked();
+        esp_err_t err = configure_frequency_locked(d);
         unlock();
-        if (err != ESP_OK) set_last_error(err);
+        if (err != ESP_OK) set_last_error(d, err);
     }
     if (d_gain) {
         lock();
-        esp_err_t err = configure_gain_locked();
+        esp_err_t err = configure_gain_locked(d);
         unlock();
-        if (err != ESP_OK) set_last_error(err);
+        if (err != ESP_OK) set_last_error(d, err);
     }
     if (d_bias) {
         lock();
-        esp_err_t err = configure_bias_tee_locked();
+        esp_err_t err = configure_bias_tee_locked(d);
         unlock();
-        if (err != ESP_OK) set_last_error(err);
+        if (err != ESP_OK) set_last_error(d, err);
+    }
+}
+
+/**
+ * @brief Apply deferred config across every device slot.
+ *
+ * @details
+ *   A device that is in_use OR still has its start dirty-bit pending (legacy
+ *   start() before any dongle enumerated sets dev0's cfg_dirty_start) gets
+ *   serviced. Servicing an empty slot is harmless — apply_device_config short-
+ *   circuits the retunes when no device is open — but we still need to run it so
+ *   a pending start latches want_stream on dev0 even before a dongle is present.
+ */
+static void task_apply_config(void)
+{
+    for (int i = 0; i < (int)RTLSDR_MAX_DEVICES; i++) {
+        apply_device_config(&s_ctx.dev[i]);
     }
 }
 
@@ -1514,20 +1645,27 @@ static void usb_task(void *arg)
         /* Consume any hot-path notification (overflow/stall nudge). Non-blocking.*/
         ulTaskNotifyTake(pdTRUE, 0);
 
-        /* Act on queued lifecycle work, then apply any deferred config. */
+        /* Act on queued lifecycle work, then apply any deferred config. These
+         * iterate every device slot internally. */
         task_do_recovery();
         task_try_open_pending();
         task_apply_config();
 
-        /* Debounced OVERFLOW event from the hot path's drop counter. */
+        /* Debounced OVERFLOW event from the hot path's drop counter. Aggregate
+         * drops across all in-use devices so a burst on either dongle collapses
+         * to a single OVERFLOW event. */
         lock();
-        uint64_t drops = s_ctx.stats.overflow_drops;
+        uint64_t drops = 0;
+        for (int i = 0; i < (int)RTLSDR_MAX_DEVICES; i++) {
+            drops += s_ctx.dev[i].stats.overflow_drops;
+        }
         unlock();
         int64_t now = adsbin_now_us();
         if (drops > last_drops_seen && (now - last_overflow_evt) > 200000) {
             last_overflow_evt = now;
             last_drops_seen   = drops;
-            emit_event(USB_RTLSDR_EVENT_OVERFLOW);
+            /* The aggregate event is not slot-specific; report slot 0. */
+            emit_event(0, USB_RTLSDR_EVENT_OVERFLOW);
         }
     }
 
@@ -1538,6 +1676,33 @@ static void usb_task(void *arg)
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Public API — lifecycle.
  * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Seed one device slot's defaults at init.
+ *
+ * @details
+ *   Sets the slot index, the band/stream defaults and the gain/ppm/bias defaults
+ *   that init used to seed into the lone singleton. Slot 0 gets the canonical
+ *   1090 band; slot 1 gets sane 1090 defaults too (its real band is set at adopt
+ *   from its role). The ring is allocated by the caller (init).
+ */
+static void seed_device_defaults(usb_rtlsdr_dev_t *d, int index)
+{
+    d->index = index;
+
+    /* Stream config: both slots start on the 1090 band so a slot adopted as the
+     * 1090 device needs no change; a slot adopted as 978 is re-seeded at adopt. */
+    d->center_freq_hz      = ADSB_CENTER_FREQ_HZ;
+    d->sample_rate_sps     = ADSB_SAMPLE_RATE_HZ;
+    d->gain_mode           = USB_RTLSDR_GAIN_MANUAL_FIXED;
+    d->gain_tenth_db       = 496;
+    d->freq_correction_ppm = 0;
+    d->bias_tee_enable     = false;
+
+    d->role   = ADSBIN_ROLE_NONE;
+    d->in_use = false;
+    d->state  = USB_RTLSDR_STATE_UNINIT;
+}
 
 esp_err_t usb_rtlsdr_init(const usb_rtlsdr_config_t *cfg)
 {
@@ -1557,38 +1722,39 @@ esp_err_t usb_rtlsdr_init(const usb_rtlsdr_config_t *cfg)
                                                                 : ADSBIN_CORE_DSP;
     s_ctx.auto_recover         = (cfg) ? cfg->auto_recover : true;
 
-    /* Seed the stream config with the 1090ES defaults so a NULL start() works. */
-    s_ctx.center_freq_hz       = ADSB_CENTER_FREQ_HZ;
-    s_ctx.sample_rate_sps      = ADSB_SAMPLE_RATE_HZ;
-    s_ctx.gain_mode            = USB_RTLSDR_GAIN_MANUAL_FIXED;
-    s_ctx.gain_tenth_db        = 496;
-    s_ctx.freq_correction_ppm  = 0;
-    s_ctx.bias_tee_enable      = false;
-    s_ctx.device_index         = 0;
+    /* Seed each device slot's stream-config defaults (slot 0 = 1090 exactly as
+     * the old code seeded the singleton; slot 1 also gets sane 1090 defaults and
+     * is re-banded at adopt from its role). */
+    for (int i = 0; i < (int)RTLSDR_MAX_DEVICES; i++) {
+        seed_device_defaults(&s_ctx.dev[i], i);
+    }
 
-    s_ctx.state = USB_RTLSDR_STATE_UNINIT;
-
-    /* Driver lock (serialises config / stats / handles / control bus). Recursive
-     * so the control path can hold it while the event pump re-enters via the
-     * bulk completion callback on the same task — see the lock() comment. */
+    /* Driver lock (serialises config / stats / handles / control bus for ALL
+     * slots). Recursive so the control path can hold it while the event pump
+     * re-enters via the bulk completion callback on the same task — see lock(). */
     s_ctx.lock = xSemaphoreCreateRecursiveMutex();
     if (!s_ctx.lock) {
         ESP_LOGE(TAG, "sync primitive alloc failed");
         goto fail;
     }
 
-    /* Allocate the owned IQ no-split ring. Size = depth * (header + payload),
-     * plus the 8-byte per-item ring header the no-split type adds. */
+    /* Allocate one owned IQ no-split ring PER device slot. Size = depth *
+     * (header + payload), plus the 8-byte per-item ring header the no-split type
+     * adds. Both slots get an identical ring so either can be the 1090 device. */
     {
         const size_t item_payload = sizeof(iq_block_t) + s_ctx.block_size_pairs * 2u;
         const size_t per_item     = item_payload + 8u + 4u;   /* hdr + alignment.*/
         const size_t ring_bytes   = per_item * s_ctx.ring_capacity_blocks;
-        s_ctx.iq_ring = xRingbufferCreate(ring_bytes, RINGBUF_TYPE_NOSPLIT);
-        if (!s_ctx.iq_ring) {
-            ESP_LOGE(TAG, "IQ ring alloc (%u bytes) failed", (unsigned)ring_bytes);
-            goto fail;
+        for (int i = 0; i < (int)RTLSDR_MAX_DEVICES; i++) {
+            s_ctx.dev[i].iq_ring = xRingbufferCreate(ring_bytes, RINGBUF_TYPE_NOSPLIT);
+            if (!s_ctx.dev[i].iq_ring) {
+                ESP_LOGE(TAG, "IQ ring %d alloc (%u bytes) failed",
+                         i, (unsigned)ring_bytes);
+                goto fail;
+            }
         }
-        ESP_LOGI(TAG, "IQ ring: %u blocks x %u pairs (%u bytes)",
+        ESP_LOGI(TAG, "IQ rings: %u x [%u blocks x %u pairs (%u bytes)]",
+                 (unsigned)RTLSDR_MAX_DEVICES,
                  (unsigned)s_ctx.ring_capacity_blocks,
                  (unsigned)s_ctx.block_size_pairs, (unsigned)ring_bytes);
     }
@@ -1636,14 +1802,23 @@ esp_err_t usb_rtlsdr_init(const usb_rtlsdr_config_t *cfg)
         goto fail;
     }
 
-    s_ctx.state  = USB_RTLSDR_STATE_NO_DEVICE;
+    /* Each slot starts NO_DEVICE; the host is up waiting for enumeration. */
+    for (int i = 0; i < (int)RTLSDR_MAX_DEVICES; i++) {
+        s_ctx.dev[i].state = USB_RTLSDR_STATE_NO_DEVICE;
+    }
     s_ctx.inited = true;
     ESP_LOGI(TAG, "init complete (auto_recover=%d)", (int)s_ctx.auto_recover);
     return ESP_OK;
 
 fail:
-    if (s_ctx.iq_ring)  { vRingbufferDelete(s_ctx.iq_ring);  s_ctx.iq_ring = NULL; }
-    if (s_ctx.lock)     { vSemaphoreDelete(s_ctx.lock);      s_ctx.lock = NULL; }
+    /* Free BOTH rings on the failure path. */
+    for (int i = 0; i < (int)RTLSDR_MAX_DEVICES; i++) {
+        if (s_ctx.dev[i].iq_ring) {
+            vRingbufferDelete(s_ctx.dev[i].iq_ring);
+            s_ctx.dev[i].iq_ring = NULL;
+        }
+    }
+    if (s_ctx.lock) { vSemaphoreDelete(s_ctx.lock); s_ctx.lock = NULL; }
     return ESP_FAIL;
 }
 
@@ -1656,31 +1831,37 @@ esp_err_t usb_rtlsdr_deinit(void)
     /* Stop the housekeeping task FIRST and wait for it to exit. Once it is gone,
      * this thread is the sole owner of the USB client, so the teardown below can
      * safely pump the event loop (cancel_urbs) without racing the task. We also
-     * clear want_stream so the task doesn't re-arm a URB on its way out. */
-    s_ctx.want_stream = false;
-    s_ctx.task_run    = false;
+     * clear each device's want_stream so the task doesn't re-arm a URB on its
+     * way out. */
+    for (int i = 0; i < (int)RTLSDR_MAX_DEVICES; i++) {
+        s_ctx.dev[i].want_stream = false;
+    }
+    s_ctx.want_stream_latched = false;
+    s_ctx.task_run            = false;
     for (int i = 0; i < 200 && s_ctx.task_alive; i++) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 
-    /* Now quiescent: retire URBs + close the device. */
-    cancel_urbs();
-    free_urbs();
-    close_device();
+    /* Now quiescent: retire URBs + close each device, then delete its ring. */
+    for (int i = 0; i < (int)RTLSDR_MAX_DEVICES; i++) {
+        usb_rtlsdr_dev_t *d = &s_ctx.dev[i];
+        cancel_urbs(d);
+        free_urbs(d);
+        close_device(d);
+        if (d->iq_ring) { vRingbufferDelete(d->iq_ring); d->iq_ring = NULL; }
+    }
 
-    /* Deregister the client + uninstall the host stack. */
+    /* Deregister the client + uninstall the host stack (one of each). */
     if (s_ctx.client) {
         usb_host_client_deregister(s_ctx.client);
         s_ctx.client = NULL;
     }
     usb_host_uninstall();
 
-    /* Free owned resources. */
-    if (s_ctx.iq_ring)   { vRingbufferDelete(s_ctx.iq_ring);   s_ctx.iq_ring = NULL; }
-    if (s_ctx.lock)      { vSemaphoreDelete(s_ctx.lock);       s_ctx.lock = NULL; }
+    /* Free the one lock. */
+    if (s_ctx.lock) { vSemaphoreDelete(s_ctx.lock); s_ctx.lock = NULL; }
 
     s_ctx.inited = false;
-    s_ctx.state  = USB_RTLSDR_STATE_UNINIT;
     ESP_LOGI(TAG, "deinit complete");
     return ESP_OK;
 }
@@ -1695,28 +1876,34 @@ esp_err_t usb_rtlsdr_start(const usb_rtlsdr_stream_config_t *stream_cfg)
         return ESP_ERR_INVALID_STATE;
     }
 
-    /* Resolve the per-stream config (defaults for zero fields). */
+    /* Legacy device-0 (1090) shim. Resolve the per-stream config into device 0
+     * (defaults for zero fields) so an explicit start() with a 1090 cfg still
+     * configures dev0 exactly as the single-dongle build did. The stream_cfg's
+     * device_index is ignored — the band follows the device's role. */
+    usb_rtlsdr_dev_t *d0 = &s_ctx.dev[0];
     lock();
     if (stream_cfg) {
-        s_ctx.center_freq_hz      = stream_cfg->center_freq_hz  ? stream_cfg->center_freq_hz
-                                                                : ADSB_CENTER_FREQ_HZ;
-        s_ctx.sample_rate_sps     = stream_cfg->sample_rate_sps ? stream_cfg->sample_rate_sps
-                                                                : ADSB_SAMPLE_RATE_HZ;
-        s_ctx.gain_mode           = stream_cfg->gain_mode;
-        s_ctx.gain_tenth_db       = stream_cfg->gain_tenth_db ? stream_cfg->gain_tenth_db : 496;
-        s_ctx.freq_correction_ppm = stream_cfg->freq_correction_ppm;
-        s_ctx.bias_tee_enable     = stream_cfg->bias_tee_enable;
-        s_ctx.device_index        = stream_cfg->device_index;
+        d0->center_freq_hz      = stream_cfg->center_freq_hz  ? stream_cfg->center_freq_hz
+                                                              : ADSB_CENTER_FREQ_HZ;
+        d0->sample_rate_sps     = stream_cfg->sample_rate_sps ? stream_cfg->sample_rate_sps
+                                                              : ADSB_SAMPLE_RATE_HZ;
+        d0->gain_mode           = stream_cfg->gain_mode;
+        d0->gain_tenth_db       = stream_cfg->gain_tenth_db ? stream_cfg->gain_tenth_db : 496;
+        d0->freq_correction_ppm = stream_cfg->freq_correction_ppm;
+        d0->bias_tee_enable     = stream_cfg->bias_tee_enable;
     }
 
-    /* Latch the streaming intent and ask the usb_task to bring the stream up.
-     * We never touch the chip from here — start() may be called from Core 1, and
-     * only the usb_task is allowed to drive the USB client (see set_* note). If
-     * no dongle is connected yet the intent persists and the open path auto-
-     * starts on enumeration. */
-    s_ctx.want_stream     = true;
-    s_ctx.cfg_dirty_start = true;
-    s_ctx.cfg_dirty_stop  = false;
+    /* Latch the GLOBAL streaming intent (so a dongle that enumerates LATER still
+     * auto-starts) and ask the usb_task to bring dev0's stream up. We never touch
+     * the chip from here — start() may be called from Core 1, and only the
+     * usb_task is allowed to drive the USB client (see set_* note). If no dongle
+     * is connected yet the intent persists and the open path auto-starts on
+     * enumeration. dev0's want_stream is also latched immediately for the case
+     * where dev0 is already open. */
+    s_ctx.want_stream_latched = true;
+    d0->want_stream     = true;
+    d0->cfg_dirty_start = true;
+    d0->cfg_dirty_stop  = false;
     unlock();
 
     kick_task();
@@ -1729,13 +1916,16 @@ esp_err_t usb_rtlsdr_stop(void)
     if (!s_ctx.inited) {
         return ESP_ERR_INVALID_STATE;
     }
-    /* Defer the actual bulk-IN teardown to the usb_task (it owns the client
-     * event loop the cancellation pumps). Clearing want_stream immediately also
-     * makes the hot-path completion stop re-arming right away. */
+    /* Legacy device-0 stop. Clear the global intent and stop dev0. Defer the
+     * actual bulk-IN teardown to the usb_task (it owns the client event loop the
+     * cancellation pumps). Clearing want_stream immediately also makes the
+     * hot-path completion stop re-arming right away. */
+    usb_rtlsdr_dev_t *d0 = &s_ctx.dev[0];
     lock();
-    s_ctx.want_stream    = false;
-    s_ctx.cfg_dirty_stop = true;
-    s_ctx.cfg_dirty_start = false;
+    s_ctx.want_stream_latched = false;
+    d0->want_stream     = false;
+    d0->cfg_dirty_stop  = true;
+    d0->cfg_dirty_start = false;
     unlock();
     kick_task();
     return ESP_OK;
@@ -1743,8 +1933,86 @@ esp_err_t usb_rtlsdr_stop(void)
 
 RingbufHandle_t usb_rtlsdr_get_iq_ring(void)
 {
-    /* Valid after init; NULL otherwise (the contract). */
-    return s_ctx.inited ? s_ctx.iq_ring : NULL;
+    /* Device 0 (the 1090 slot) ring; valid after init, NULL otherwise. */
+    return s_ctx.inited ? s_ctx.dev[0].iq_ring : NULL;
+}
+
+RingbufHandle_t usb_rtlsdr_get_iq_ring_for_role(adsbin_rf_role_t role)
+{
+    if (!s_ctx.inited) {
+        return NULL;
+    }
+    /* Return the ring of whichever IN-USE device currently holds this role. The
+     * ring exists from init per slot, but we only hand it out when a dongle is
+     * actually adopted into that role. */
+    for (int i = 0; i < (int)RTLSDR_MAX_DEVICES; i++) {
+        if (s_ctx.dev[i].in_use && s_ctx.dev[i].role == role) {
+            return s_ctx.dev[i].iq_ring;
+        }
+    }
+    return NULL;
+}
+
+int usb_rtlsdr_active_count(void)
+{
+    if (!s_ctx.inited) {
+        return 0;
+    }
+    int n = 0;
+    for (int i = 0; i < (int)RTLSDR_MAX_DEVICES; i++) {
+        if (s_ctx.dev[i].in_use) {
+            n++;
+        }
+    }
+    return n;
+}
+
+adsbin_rf_role_t usb_rtlsdr_role_of(int idx)
+{
+    if (!s_ctx.inited || idx < 0 || idx >= (int)RTLSDR_MAX_DEVICES) {
+        return ADSBIN_ROLE_NONE;
+    }
+    return s_ctx.dev[idx].role;
+}
+
+void usb_rtlsdr_set_role_override(adsbin_rf_role_t role)
+{
+    /* A bare file-scope assignment — safe before or after init. The adopt path
+     * reads it once, for the first device. */
+    s_role_override = role;
+}
+
+esp_err_t usb_rtlsdr_start_index(int idx, const usb_rtlsdr_stream_config_t *cfg)
+{
+    if (!s_ctx.inited) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (idx < 0 || idx >= (int)RTLSDR_MAX_DEVICES) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    /* Store cfg into the target slot, latch ITS streaming intent + start bit. The
+     * GLOBAL latch is also raised so a not-yet-enumerated dongle still auto-starts
+     * when it appears. The band still follows the device's role; cfg fields that
+     * matter (gain/ppm/bias) are applied to this slot. */
+    usb_rtlsdr_dev_t *d = &s_ctx.dev[idx];
+    lock();
+    if (cfg) {
+        d->center_freq_hz      = cfg->center_freq_hz  ? cfg->center_freq_hz  : d->center_freq_hz;
+        d->sample_rate_sps     = cfg->sample_rate_sps ? cfg->sample_rate_sps : d->sample_rate_sps;
+        d->gain_mode           = cfg->gain_mode;
+        d->gain_tenth_db       = cfg->gain_tenth_db ? cfg->gain_tenth_db : 496;
+        d->freq_correction_ppm = cfg->freq_correction_ppm;
+        d->bias_tee_enable     = cfg->bias_tee_enable;
+    }
+    s_ctx.want_stream_latched = true;
+    d->want_stream     = true;
+    d->cfg_dirty_start = true;
+    d->cfg_dirty_stop  = false;
+    unlock();
+
+    kick_task();
+    return ESP_OK;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1758,7 +2026,8 @@ int usb_rtlsdr_count(void)
     }
 
     /* Ask the host stack for the current device address list, then count the
-     * ones whose descriptor matches our supported family. */
+     * ones whose descriptor matches our supported family. Scans the BUS — not
+     * the adopted slots (see usb_rtlsdr_active_count for that). */
     uint8_t addrs[16];
     int num = 0;
     if (usb_host_device_addr_list_fill(sizeof(addrs), addrs, &num) != ESP_OK) {
@@ -1783,19 +2052,29 @@ int usb_rtlsdr_count(void)
 
 esp_err_t usb_rtlsdr_get_device_info(usb_rtlsdr_device_info_t *out_info)
 {
-    if (!out_info) {
+    /* Legacy device-0 shim. */
+    return usb_rtlsdr_get_device_info_index(0, out_info);
+}
+
+esp_err_t usb_rtlsdr_get_device_info_index(int idx, usb_rtlsdr_device_info_t *out)
+{
+    if (!out) {
         return ESP_ERR_INVALID_ARG;
     }
     if (!s_ctx.inited) {
         return ESP_ERR_INVALID_STATE;
     }
+    if (idx < 0 || idx >= (int)RTLSDR_MAX_DEVICES) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    usb_rtlsdr_dev_t *d = &s_ctx.dev[idx];
     lock();
-    bool open = (s_ctx.dev != NULL);
-    if (open) {
-        *out_info = s_ctx.info;
+    bool present = d->in_use;
+    if (present) {
+        *out = d->info;
     }
     unlock();
-    return open ? ESP_OK : ESP_ERR_NOT_FOUND;
+    return present ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1809,6 +2088,8 @@ esp_err_t usb_rtlsdr_get_device_info(usb_rtlsdr_device_info_t *out_info)
  *  it up and applies it to the chip on its next pass. The call returns ESP_OK
  *  for "request accepted" — the chip-write result surfaces via get_status's
  *  last_error if it fails. When no device is open the value is simply stored.
+ *
+ *  The legacy set_* entry points target DEVICE 0 (the 1090 slot).
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /** @brief Wake the usb_task so it services a freshly-raised dirty flag now. */
@@ -1824,9 +2105,10 @@ esp_err_t usb_rtlsdr_set_center_freq(uint32_t freq_hz)
     if (!s_ctx.inited) return ESP_ERR_INVALID_STATE;
     if (freq_hz == 0)  return ESP_ERR_INVALID_ARG;
 
+    usb_rtlsdr_dev_t *d = &s_ctx.dev[0];
     lock();
-    s_ctx.center_freq_hz  = freq_hz;
-    s_ctx.cfg_dirty_freq  = true;      /* usb_task re-tunes the LO.              */
+    d->center_freq_hz  = freq_hz;
+    d->cfg_dirty_freq  = true;      /* usb_task re-tunes the LO.              */
     unlock();
     kick_task();
     return ESP_OK;
@@ -1837,9 +2119,10 @@ esp_err_t usb_rtlsdr_set_sample_rate(uint32_t sample_rate_sps)
     if (!s_ctx.inited)        return ESP_ERR_INVALID_STATE;
     if (sample_rate_sps == 0) return ESP_ERR_INVALID_ARG;
 
+    usb_rtlsdr_dev_t *d = &s_ctx.dev[0];
     lock();
-    s_ctx.sample_rate_sps = sample_rate_sps;
-    s_ctx.cfg_dirty_rate  = true;      /* usb_task re-programs the resampler.    */
+    d->sample_rate_sps = sample_rate_sps;
+    d->cfg_dirty_rate  = true;      /* usb_task re-programs the resampler.    */
     unlock();
     kick_task();
     return ESP_OK;
@@ -1849,10 +2132,11 @@ esp_err_t usb_rtlsdr_set_tuner_gain(usb_rtlsdr_gain_mode_t mode, int gain_tenth_
 {
     if (!s_ctx.inited) return ESP_ERR_INVALID_STATE;
 
+    usb_rtlsdr_dev_t *d = &s_ctx.dev[0];
     lock();
-    s_ctx.gain_mode      = mode;
-    s_ctx.gain_tenth_db  = gain_tenth_db;
-    s_ctx.cfg_dirty_gain = true;       /* usb_task re-applies tuner gain.        */
+    d->gain_mode      = mode;
+    d->gain_tenth_db  = gain_tenth_db;
+    d->cfg_dirty_gain = true;       /* usb_task re-applies tuner gain.        */
     unlock();
     kick_task();
     return ESP_OK;
@@ -1862,10 +2146,11 @@ esp_err_t usb_rtlsdr_set_freq_correction(int ppm)
 {
     if (!s_ctx.inited) return ESP_ERR_INVALID_STATE;
 
+    usb_rtlsdr_dev_t *d = &s_ctx.dev[0];
     lock();
-    s_ctx.freq_correction_ppm = ppm;
+    d->freq_correction_ppm = ppm;
     /* The ppm trim is folded into the LO on the next retune. */
-    s_ctx.cfg_dirty_freq = true;
+    d->cfg_dirty_freq = true;
     unlock();
     kick_task();
     return ESP_OK;
@@ -1875,9 +2160,10 @@ esp_err_t usb_rtlsdr_set_bias_tee(bool enable)
 {
     if (!s_ctx.inited) return ESP_ERR_INVALID_STATE;
 
+    usb_rtlsdr_dev_t *d = &s_ctx.dev[0];
     lock();
-    s_ctx.bias_tee_enable = enable;
-    s_ctx.cfg_dirty_bias  = true;      /* usb_task drives the GPIO.              */
+    d->bias_tee_enable = enable;
+    d->cfg_dirty_bias  = true;      /* usb_task drives the GPIO.              */
     unlock();
     kick_task();
     return ESP_OK;
@@ -1889,15 +2175,23 @@ esp_err_t usb_rtlsdr_set_bias_tee(bool enable)
 
 esp_err_t usb_rtlsdr_get_status(usb_rtlsdr_status_t *out_status)
 {
-    if (!out_status) return ESP_ERR_INVALID_ARG;
-    if (!s_ctx.inited) return ESP_ERR_INVALID_STATE;
+    /* Legacy device-0 shim. */
+    return usb_rtlsdr_get_status_index(0, out_status);
+}
 
+esp_err_t usb_rtlsdr_get_status_index(int idx, usb_rtlsdr_status_t *out)
+{
+    if (!out) return ESP_ERR_INVALID_ARG;
+    if (!s_ctx.inited) return ESP_ERR_INVALID_STATE;
+    if (idx < 0 || idx >= (int)RTLSDR_MAX_DEVICES) return ESP_ERR_INVALID_ARG;
+
+    usb_rtlsdr_dev_t *d = &s_ctx.dev[idx];
     lock();
-    out_status->state          = s_ctx.state;
-    out_status->device_present = (s_ctx.dev != NULL);
-    out_status->streaming      = (s_ctx.state == USB_RTLSDR_STATE_STREAMING);
-    out_status->last_error     = s_ctx.last_error;
-    out_status->last_block_us  = s_ctx.last_block_us;
+    out->state          = d->state;
+    out->device_present = (d->dev != NULL);
+    out->streaming      = (d->state == USB_RTLSDR_STATE_STREAMING);
+    out->last_error     = d->last_error;
+    out->last_block_us  = d->last_block_us;
     unlock();
     return ESP_OK;
 }
@@ -1907,8 +2201,9 @@ esp_err_t usb_rtlsdr_get_stats(usb_rtlsdr_stats_t *out_stats)
     if (!out_stats) return ESP_ERR_INVALID_ARG;
     if (!s_ctx.inited) return ESP_ERR_INVALID_STATE;
 
+    /* Legacy device-0 stats. */
     lock();
-    *out_stats = s_ctx.stats;
+    *out_stats = s_ctx.dev[0].stats;
     unlock();
     return ESP_OK;
 }
@@ -1916,10 +2211,12 @@ esp_err_t usb_rtlsdr_get_stats(usb_rtlsdr_stats_t *out_stats)
 void usb_rtlsdr_reset_stats(void)
 {
     if (!s_ctx.inited) return;
+    /* Legacy device-0 stats reset. */
+    usb_rtlsdr_dev_t *d = &s_ctx.dev[0];
     lock();
-    memset(&s_ctx.stats, 0, sizeof(s_ctx.stats));
-    s_ctx.rate_window_us    = 0;
-    s_ctx.rate_window_bytes = 0;
+    memset(&d->stats, 0, sizeof(d->stats));
+    d->rate_window_us    = 0;
+    d->rate_window_bytes = 0;
     unlock();
 }
 

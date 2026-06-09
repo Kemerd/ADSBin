@@ -83,8 +83,13 @@ typedef enum {
 /**
  * @brief Event callback. Runs in the driver housekeeping task (NOT the hot
  *        path): may post to queues / do light work. Pass NULL to clear.
+ *
+ * @param event         Which lifecycle event fired.
+ * @param device_index  The slot (0 or 1) the event pertains to. Slot 0 is the
+ *                      1090 device, slot 1 the 978 device (by adoption order).
+ * @param user_ctx      The opaque pointer registered alongside the callback.
  */
-typedef void (*usb_rtlsdr_event_cb_t)(usb_rtlsdr_event_id_t event, void *user_ctx);
+typedef void (*usb_rtlsdr_event_cb_t)(usb_rtlsdr_event_id_t event, int device_index, void *user_ctx);
 
 /** @brief One-time install config (usb_rtlsdr_init). Zeroed fields take defaults. */
 typedef struct {
@@ -103,7 +108,11 @@ typedef struct {
     int                    gain_tenth_db;       /**< Default 496 (49.6 dB).       */
     int                    freq_correction_ppm; /**< Default 0 (plan S5.5).       */
     bool                   bias_tee_enable;     /**< Default false (S8 LNA opt-in).*/
-    int                    device_index;        /**< Which dongle (default 0).    */
+    int                    device_index;        /**< LEGACY/IGNORED: the band is
+                                                 *   now driven by the device's
+                                                 *   role (1090/978), assigned by
+                                                 *   stable adoption order, not by
+                                                 *   this selector. Kept for ABI.  */
 } usb_rtlsdr_stream_config_t;
 
 /** @brief Opened-device identity (usb_rtlsdr_get_device_info). */
@@ -147,26 +156,69 @@ esp_err_t usb_rtlsdr_init(const usb_rtlsdr_config_t *cfg);
 esp_err_t usb_rtlsdr_deinit(void);
 
 /** @brief Open the dongle, apply @p stream_cfg, begin continuous bulk-IN.
- *  Idempotent if already streaming the same config. @param stream_cfg NULL => defaults. */
+ *  Idempotent if already streaming the same config. @param stream_cfg NULL => defaults.
+ *
+ *  Legacy single-dongle shim: latches a GLOBAL streaming intent (so a dongle that
+ *  enumerates LATER still auto-starts) AND applies @p stream_cfg to device 0 (the
+ *  1090 slot), exactly as the single-dongle build did. The stream_cfg.device_index
+ *  field is ignored — the band follows the device's role. */
 esp_err_t usb_rtlsdr_start(const usb_rtlsdr_stream_config_t *stream_cfg);
 
-/** @brief Halt streaming but keep the device open + host stack installed. */
+/** @brief Halt streaming but keep the device open + host stack installed.
+ *  Legacy shim: clears the global intent and stops device 0. */
 esp_err_t usb_rtlsdr_stop(void);
 
 /** @brief Get the IQ ring this driver produces into; main hands it to demod1090.
+ *  Returns DEVICE 0's ring (the 1090 slot); valid right after init.
  *  @return Ring handle (valid after init), or NULL if uninitialized. */
 RingbufHandle_t usb_rtlsdr_get_iq_ring(void);
+
+/** @brief Get the IQ ring of whichever in-use device currently holds @p role.
+ *  Each slot owns a ring from init, but this only returns it when a device is
+ *  actually adopted AND assigned that role (so the caller never feeds a demod
+ *  from a slot with no dongle). @return The matching ring, or NULL if no in-use
+ *  device holds @p role. */
+RingbufHandle_t usb_rtlsdr_get_iq_ring_for_role(adsbin_rf_role_t role);
+
+/** @brief Number of dongles currently adopted (in_use), 0..RTLSDR_MAX_DEVICES.
+ *  Unlike usb_rtlsdr_count() (which scans the bus) this reflects ADOPTED slots. */
+int usb_rtlsdr_active_count(void);
+
+/** @brief The role (1090 / 978 / NONE) currently assigned to slot @p idx. */
+adsbin_rf_role_t usb_rtlsdr_role_of(int idx);
+
+/** @brief Pin the role of the FIRST adopted dongle (call before/after init).
+ *  When set to anything other than ::ADSBIN_ROLE_NONE, the very first dongle the
+ *  driver adopts is forced into this role instead of the default 1090 — so a lone
+ *  stick can be commanded to serve 978 UAT. Subsequent dongles still take the
+ *  next free role by adoption order. This is a SETTER, not a config-component
+ *  dependency: the app calls it; the driver never reads the config component. */
+void usb_rtlsdr_set_role_override(adsbin_rf_role_t role);
+
+/* ---- Indexed variants of the start/status/identity calls (multi-device) ---- */
+
+/** @brief Like usb_rtlsdr_start() but targets a specific slot @p idx. Stores
+ *  @p cfg into that device and latches ITS streaming intent. */
+esp_err_t usb_rtlsdr_start_index(int idx, const usb_rtlsdr_stream_config_t *cfg);
+
+/** @brief Like usb_rtlsdr_get_status() but for a specific slot @p idx. */
+esp_err_t usb_rtlsdr_get_status_index(int idx, usb_rtlsdr_status_t *out);
+
+/** @brief Like usb_rtlsdr_get_device_info() but for a specific slot @p idx.
+ *  @return ESP_ERR_NOT_FOUND if that slot is not in use. */
+esp_err_t usb_rtlsdr_get_device_info_index(int idx, usb_rtlsdr_device_info_t *out);
 
 /* ───────────────────────────────────────────────────────────────────────────
  *  Discovery / identity
  * ─────────────────────────────────────────────────────────────────────────── */
 
 /** @brief Number of supported dongles enumerated (feeds band auto-detect S0/S4.4).
+ *  Scans the BUS (not adopted slots); see usb_rtlsdr_active_count() for adopted.
  *  @return 0/1/...; -1 on error before init. */
 int usb_rtlsdr_count(void);
 
-/** @brief Fill @p out_info with the opened dongle's identity.
- *  @return ESP_ERR_NOT_FOUND if no device is open. */
+/** @brief Fill @p out_info with device 0's (the 1090 slot's) identity.
+ *  @return ESP_ERR_NOT_FOUND if device 0 is not open. */
 esp_err_t usb_rtlsdr_get_device_info(usb_rtlsdr_device_info_t *out_info);
 
 /* ───────────────────────────────────────────────────────────────────────────

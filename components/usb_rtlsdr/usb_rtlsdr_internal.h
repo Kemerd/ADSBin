@@ -211,6 +211,16 @@ extern "C" {
 #define RTLSDR_URB_SIZE              (256u * 1024u)
 #define RTLSDR_NUM_URBS              8u
 
+/* Maximum number of RTL-SDR dongles this driver owns at once. Slot 0 serves the
+ * 1090ES band, slot 1 the 978 MHz UAT band — the role is auto-tiered by stable
+ * adoption order (see the role-assignment block in usb_rtlsdr.c). EVERYTHING
+ * per-device is replicated ::RTLSDR_MAX_DEVICES times in ::usb_rtlsdr_dev_t; the
+ * single housekeeping task, the one USB client and the one recursive lock stay
+ * process-global in ::usb_rtlsdr_ctx_t and guard all slots. Bumping this to add a
+ * third band would Just Work given a third antenna + role, but two is the design
+ * point (1090 + 978). */
+#define RTLSDR_MAX_DEVICES           2u
+
 /* HS bulk max-packet for the RTL2832U data endpoint (USB 2.0 high speed). */
 #define RTLSDR_BULK_MPS_HS           512u
 
@@ -224,64 +234,69 @@ extern "C" {
 #define RTLSDR_STRDESC_MAX           128
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  The module-private singleton.
+ *  Per-device state — ONE of these per adopted dongle (::RTLSDR_MAX_DEVICES).
  *
- *  One dongle per firmware image. All cross-thread access to mutable config /
- *  stats / device handles goes through s_ctx.lock so a Core-1 set_* / get_* call
- *  cannot tear a value the Core-0 completion path is updating.
+ *  Everything that is bound to a SPECIFIC physical dongle lives here: its USB
+ *  handles, its owned IQ ring, its tuner-register shadow, its stream config, its
+ *  lifecycle flags and its stats. The driver previously kept exactly one copy of
+ *  all of this inline in the singleton; the dual-dongle split moves it into this
+ *  struct and stamps an array of them in ::usb_rtlsdr_ctx_t.
+ *
+ *  CONCURRENCY. These fields are still guarded by the ONE process-global
+ *  recursive `lock` in ::usb_rtlsdr_ctx_t — there is no per-device mutex. The hot
+ *  path reaches the right slot WITHOUT the lock by carrying a `usb_rtlsdr_dev_t*`
+ *  in usb_transfer_t.context (set when the URB / ctrl transfer is allocated), so a
+ *  bulk-IN completion knows which device it belongs to before it takes the lock
+ *  for its short stats update. The single usb_task drives ALL chip I/O, so two
+ *  devices are configured serially on the same task — never concurrently.
  * ═══════════════════════════════════════════════════════════════════════════ */
 typedef struct {
-    /* ---- resolved install config (post-defaults) ---- */
-    size_t  ring_capacity_blocks;   /**< IQ ring depth in blocks.               */
-    size_t  block_size_pairs;       /**< IQ pairs per delivered block.          */
-    int     task_priority;          /**< Housekeeping/USB task priority.        */
-    int     task_core_id;           /**< Core pinned to (ADSBIN_CORE_DSP).      */
-    bool    auto_recover;           /**< Re-enumerate on stall/disconnect.      */
+    /* ---- role + slot identity (NEW for the dual-dongle split) ---- */
+    adsbin_rf_role_t role;          /**< NONE / 1090 / 978-UAT this slot serves.*/
+    bool             in_use;        /**< Slot currently holds an open device.   */
+    int              index;         /**< This slot's index (0 or 1) for events. */
 
-    /* ---- resolved stream config (post-defaults) ---- */
+    /* ---- resolved stream config (post-defaults), PER device ---- */
     uint32_t center_freq_hz;        /**< Current tuned centre frequency.        */
     uint32_t sample_rate_sps;       /**< Current sample rate.                   */
     usb_rtlsdr_gain_mode_t gain_mode;
     int      gain_tenth_db;         /**< Requested fixed gain (tenths of dB).   */
     int      freq_correction_ppm;   /**< Frequency-correction trim.             */
     bool     bias_tee_enable;       /**< Antenna-port bias-tee state.           */
-    int      device_index;          /**< Which enumerated dongle.               */
 
-    /* ---- USB host handles ---- */
-    usb_host_client_handle_t client;     /**< Our USB Host client.              */
+    /* ---- USB host handles for THIS device ---- */
     usb_device_handle_t      dev;        /**< Open device (NULL if none).        */
     uint8_t                  dev_addr;   /**< Bus address of the open device.    */
     uint8_t                  bulk_ep;    /**< Bulk-IN endpoint address.          */
     uint16_t                 bulk_mps;   /**< Bulk-IN max packet size.           */
 
-    /* ---- control-transfer plumbing (one shared, serialised by `lock`) ---- */
+    /* ---- control-transfer plumbing (per device: the EP0 transfer + its flag) -
+     *      Each device owns its OWN reusable EP0 transfer and completion flag.
+     *      ctrl_complete MUST be per-device because two devices' control I/O is
+     *      driven by the same task but against distinct endpoints. -------------- */
     usb_transfer_t   *ctrl_xfer;         /**< Reusable EP0 control transfer.     */
-    volatile bool     ctrl_complete;     /**< Raised by the control callback.    */
+    volatile bool     ctrl_complete;     /**< Raised by this device's ctrl cb.   */
 
-    /* ---- bulk-IN transfers (URBs) kept continuously in flight ---- */
+    /* ---- bulk-IN transfers (URBs) kept continuously in flight, per device ---- */
     usb_transfer_t   *urb[RTLSDR_NUM_URBS];
     volatile uint32_t urbs_inflight;     /**< How many URBs are submitted now.   */
 
     /* ---- the owned IQ ring (no-split; producer = Core-0 completion) ---- */
-    RingbufHandle_t  iq_ring;
+    RingbufHandle_t  iq_ring;            /**< Allocated at init, one per slot.   */
     uint32_t         block_seq;          /**< Monotonic iq_block_t.seq counter.  */
 
     /* ---- R820T2 writable-register shadow (no RMW on the chip) ---- */
     uint8_t          r82_shadow[R820T_NUM_REGS];
 
-    /* ---- task / lifecycle ---- */
-    TaskHandle_t     task;               /**< USB host + housekeeping task.      */
-    volatile bool    task_run;           /**< Task keeps looping while true.     */
-    volatile bool    task_alive;         /**< Set on entry, cleared on exit.     */
+    /* ---- per-device lifecycle ---- */
     volatile usb_rtlsdr_state_t state;   /**< Liveness state machine.            */
-    volatile bool    want_stream;        /**< Streaming requested by start().    */
+    volatile bool    want_stream;        /**< Streaming requested for THIS dev.  */
     volatile bool    do_recover;         /**< Recovery requested by callback.    */
-    volatile uint8_t pending_new_addr;   /**< NEW_DEV address awaiting open.     */
-    volatile bool    have_pending_new;   /**< A NEW_DEV is queued for the task.   */
 
     /* ---- deferred runtime-tune requests (set by Core-1 set_*; applied by the
      *      single usb_task so ALL USB I/O stays on one task). Each bit asks the
-     *      task to push the matching already-stored config field to the chip. -- */
+     *      task to push the matching already-stored config field to the chip.
+     *      These are PER-DEVICE: a retune of slot 1 must not disturb slot 0. ---- */
     volatile bool    cfg_dirty_freq;     /**< Re-tune the LO.                    */
     volatile bool    cfg_dirty_rate;     /**< Re-program the resampler.          */
     volatile bool    cfg_dirty_gain;     /**< Re-apply tuner gain.               */
@@ -300,12 +315,63 @@ typedef struct {
     usb_rtlsdr_stats_t  stats;
     esp_err_t           last_error;
     int64_t             last_block_us;
+} usb_rtlsdr_dev_t;
 
-    /* ---- async event callback ---- */
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  The module-private singleton (PROCESS-GLOBAL state).
+ *
+ *  Holds the one-and-only things that the whole driver shares regardless of how
+ *  many dongles are present: the install config, the single USB Host client, the
+ *  one housekeeping/USB task, the NEW_DEV queue, the event callback and the ONE
+ *  recursive lock. The per-device state lives in the `dev[]` array — each slot is
+ *  a ::usb_rtlsdr_dev_t with its own ring, URBs, tuner shadow and stats.
+ *
+ *  All cross-thread access to any mutable per-device field still goes through
+ *  `lock` so a Core-1 set_* / get_* call cannot tear a value the Core-0
+ *  completion path is updating — there is exactly one lock for every slot.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+typedef struct {
+    /* ---- resolved install config (post-defaults), shared by all slots ---- */
+    size_t  ring_capacity_blocks;   /**< IQ ring depth in blocks.               */
+    size_t  block_size_pairs;       /**< IQ pairs per delivered block.          */
+    int     task_priority;          /**< Housekeeping/USB task priority.        */
+    int     task_core_id;           /**< Core pinned to (ADSBIN_CORE_DSP).      */
+    bool    auto_recover;           /**< Re-enumerate on stall/disconnect.      */
+
+    /* ---- the per-device slots (slot 0 = 1090, slot 1 = 978 by adoption order).
+     *      NOTE the per-device USB handle is `dev[i].dev`; this array is `dev`. -*/
+    usb_rtlsdr_dev_t dev[RTLSDR_MAX_DEVICES];
+
+    /* ---- serial-stable role map: first-seen order assigns the role slot, so a
+     *      replug of the SAME dongle regains the SAME role/index. Two dongles
+     *      with identical (or empty / default "00000001") serials simply fall
+     *      back to adoption order, which is the natural port-enumeration order. -*/
+    char seen_serial[RTLSDR_MAX_DEVICES][64]; /**< First-seen serials, in order. */
+    int  seen_count;                          /**< How many slots are mapped.    */
+
+    /* ---- USB host client (ONE, shared) ---- */
+    usb_host_client_handle_t client;     /**< Our USB Host client.              */
+
+    /* ---- task / lifecycle (ONE task drives every slot) ---- */
+    TaskHandle_t     task;               /**< USB host + housekeeping task.      */
+    volatile bool    task_run;           /**< Task keeps looping while true.     */
+    volatile bool    task_alive;         /**< Set on entry, cleared on exit.     */
+
+    /* ---- global streaming intent. usb_rtlsdr_start() latches this so a dongle
+     *      that enumerates LATER still auto-starts; each adopted device copies it
+     *      into its own want_stream at adopt time (legacy single-dongle behaviour
+     *      where start() before plug-in auto-starts on enumerate). -------------- */
+    volatile bool    want_stream_latched;
+
+    /* ---- NEW_DEV queue (global; the task drains it into a free slot) ---- */
+    volatile uint8_t pending_new_addr;   /**< NEW_DEV address awaiting open.     */
+    volatile bool    have_pending_new;   /**< A NEW_DEV is queued for the task.   */
+
+    /* ---- async event callback (one sink; carries the device index) ---- */
     usb_rtlsdr_event_cb_t event_cb;
     void                 *event_ctx;
 
-    SemaphoreHandle_t lock;              /**< Guards mutable config/stats/handles*/
+    SemaphoreHandle_t lock;              /**< Guards EVERY slot's mutable fields.*/
     bool inited;                         /**< usb_rtlsdr_init() succeeded.       */
 } usb_rtlsdr_ctx_t;
 
