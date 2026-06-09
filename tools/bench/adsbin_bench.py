@@ -602,12 +602,120 @@ def build_parser() -> argparse.ArgumentParser:
                             "Default: 3.0.")
     p_ver.set_defaults(func=cmd_inject_verify)
 
+    # spoof — synthesize live traffic around a point and stream it via +INJECT.
+    p_spoof = sub.add_parser(
+        "spoof",
+        help="Spawn moving fake traffic around you (or --lat/--lon) for ForeFlight.")
+    _add_link_args(p_spoof)
+    p_spoof.add_argument("--lat", type=float, default=None,
+                         help="Scenario centre latitude (deg). Default: locate by IP.")
+    p_spoof.add_argument("--lon", type=float, default=None,
+                         help="Scenario centre longitude (deg). Default: locate by IP.")
+    p_spoof.add_argument("--interval", type=float, default=1.0,
+                         help="Seconds between position updates. Default: 1.0.")
+    p_spoof.add_argument("--timeout", type=float, default=2.0,
+                         help="Seconds to await each +OK/+ERR. Default: 2.0.")
+    p_spoof.add_argument("--verbose", action="store_true",
+                         help="Print per-cycle injection diagnostics.")
+    p_spoof.set_defaults(func=cmd_spoof)
+
     # list-canned — a convenience that needs no device.
     p_can = sub.add_parser("list-canned",
                            help="List the built-in canned frames and CPR pairs.")
     p_can.set_defaults(func=cmd_list_canned)
 
     return parser
+
+
+def _resolve_center(args: argparse.Namespace) -> Optional[Tuple[float, float]]:
+    """
+    Resolve the scenario centre: explicit --lat/--lon, else IP geolocation.
+
+    @return  (lat, lon) in degrees, or None after printing a diagnostic.
+    """
+    # Explicit coordinates always win - no network, fully deterministic.
+    if args.lat is not None and args.lon is not None:
+        return (args.lat, args.lon)
+
+    # Otherwise approximate the host's location by IP (city-level; plenty close
+    # for "put some planes near me"). Kept optional so the bench's core has no
+    # network dependency - only this convenience path reaches out.
+    _info("No --lat/--lon given; locating you by IP ...")
+    try:
+        import json
+        import urllib.request
+        with urllib.request.urlopen(
+                "http://ip-api.com/json/?fields=status,lat,lon,city,regionName",
+                timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if data.get("status") == "success":
+            _ok(f"Located near {data.get('city')}, {data.get('regionName')} "
+                f"({data['lat']:.4f}, {data['lon']:.4f})")
+            return (float(data["lat"]), float(data["lon"]))
+        _fail(f"IP geolocation failed: {data.get('status')}")
+    except Exception as e:
+        _fail(f"IP geolocation error: {e}")
+    _fail("Pass --lat <deg> --lon <deg> explicitly.")
+    return None
+
+
+def cmd_spoof(args: argparse.Namespace) -> int:
+    """
+    Synthesize live ADS-B traffic around a point and stream it via +INJECT.
+
+    Builds a few low/slow aircraft around the resolved centre, then loops:
+    advance each target by the publish interval, render its position/velocity/
+    id frames, inject them, and sleep - so the targets crawl across the
+    ForeFlight map in real time over the device's WiFi GDL90 broadcast.
+    """
+    import time as _time
+    import spoof_traffic
+
+    center = _resolve_center(args)
+    if center is None:
+        return 2
+    clat, clon = center
+
+    # Build the scenario. Only "low-slow" is shipped today; the flag is here so
+    # more scenarios can slot in without changing the CLI surface.
+    targets = spoof_traffic.low_slow_scenario(clat, clon)
+    _info(f"Spoofing {len(targets)} target(s) around ({clat:.4f}, {clon:.4f}); "
+          f"Ctrl-C to stop.")
+    for t in targets:
+        _info(f"  {t.callsign} ICAO={t.icao:06X} alt={t.alt_ft}ft "
+              f"gs={t.gs_kt:.0f}kt trk={t.track_deg:.0f}")
+
+    try:
+        link = cdc_link.open_link(args.port, args.baud)
+    except RuntimeError as e:
+        _fail(str(e))
+        return 2
+
+    # Cadence: one update per --interval seconds. Each cycle we send, per target,
+    # an identification frame (so ForeFlight shows the callsign), a velocity
+    # frame, and a position frame (alternating even/odd so a CPR pair completes
+    # within two cycles and ForeFlight can globally resolve the fix).
+    sent = 0
+    with link:
+        try:
+            while True:
+                for t in targets:
+                    for fhex in (t.frame_ident(), t.frame_velocity(),
+                                 t.frame_position()):
+                        res = inject_frame(link, fhex, timeout=args.timeout)
+                        if res.ok:
+                            sent += 1
+                        elif args.verbose:
+                            _fail(f"{t.callsign}: {res.raw_reply or res.reason}")
+                    # Move the aircraft for next cycle.
+                    t.step(args.interval)
+                if args.verbose:
+                    _info(f"cycle done; {sent} frames injected total")
+                _time.sleep(args.interval)
+        except KeyboardInterrupt:
+            print()
+            _ok(f"Stopped. Injected {sent} frames across {len(targets)} targets.")
+    return 0
 
 
 def cmd_list_canned(args: argparse.Namespace) -> int:
