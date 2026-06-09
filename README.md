@@ -40,8 +40,9 @@ Antenna is just as flexible: use the **built-in antenna** for a self-contained r
 Commercial ADS-B receivers are comparatively expensive, and some gate decode features behind an app
 subscription despite the hardware being capable. The decode path is well-documented and the radio is
 a commodity RTL-SDR, so the full receive → decode → output chain can be implemented on low-cost
-hardware. ADSBin does that on a ~$55–80 bill of materials, with source available for inspection and
-modification under a noncommercial license.
+hardware. ADSBin does that from a **~$73 traffic build up to a ~$138 traffic + weather build** (see
+the [bill of materials](#bill-of-materials)), with source available for inspection and modification
+under a noncommercial license.
 
 Design constraints carried throughout:
 
@@ -100,18 +101,63 @@ component compiles against). Full design rationale: [IMPLEMENTATION_PLAN.md](IMP
 
 ## Bill of materials
 
-| Part | Specification | Cost |
-|---|---|---|
-| Compute | ESP32-P4 dev board (optionally with on-board ESP32-C6 for later WiFi). Dual-core RISC-V, USB 2.0 High-Speed host. | $30–40 |
-| Receiver | Nooelec NESDR Nano 3 (RTL2832U + R820T2). A generic R820T2 dongle is also compatible. | $30–45 (~$15–20 generic) |
-| Antenna | 1090 MHz quarter-wave whip (~68 mm) on SMA, with a small ground plane. | $2–3 |
-| Power | USB-C, 5 V, ≥ 1.5 A headroom (P4 + dongle + future C6). | — |
-| Enclosure | Plastic/composite (RF-transparent; metal blocks an internal antenna). | ~$10 |
-| Indicators | 1–2 LEDs (power; traffic-heard). | — |
-| | **Total** | **≈ $55–80** |
+The firmware is **one binary that auto-tiers by the hardware you populate** — plug one dongle and
+you have a traffic receiver; plug a second and the box auto-detects it, assigns it to 978 MHz, and
+adds free FIS-B weather. Build the cheapest tier now and upgrade later without reflashing. All prices
+are approximate and from the linked vendors at the time of writing.
 
-A single 1090-only dongle is expected to be passively coolable. The firmware samples and logs peak
-die temperature for thermal validation before the enclosure is sealed.
+### Shared base (every tier)
+
+| Part | Specification | Cost | Link |
+|---|---|---|---|
+| Compute | **Waveshare ESP32-P4-WIFI6** dev board. Dual-core RISC-V, USB 2.0 HS host, on-board ESP32-C6 (WiFi → ForeFlight). | **$23.03** | [Amazon B0FKN8GCW6](https://www.amazon.com/dp/B0FKN8GCW6) |
+| USB splitter | **1-to-4 USB-A expansion board** (breaks the P4's single HS host port out to multiple ports for the dongle(s)). | **$1.66** | [AliExpress](https://www.aliexpress.us/item/3256804070458646.html) |
+| USB-A ports | USB-A connectors (5-pack; you need ~2). | **$1.54 / 5** | [AliExpress](https://www.aliexpress.us/item/3256808331104442.html) |
+| Enclosure | **3D-printed PA612-CF** (carbon-fibre nylon; RF-transparent enough for the internal radio, stiff and heat-tolerant). | **~$1** filament | print it yourself |
+| Fasteners | M2 self-tapping screws (case assembly). | **<$1** | hardware store |
+| Power | USB-C, 5 V, ≥ 1.5 A headroom. | — | — |
+
+> **Assembly note:** requires a **soldering iron** (USB-A ports → expansion board) and basic M2
+> tapping. No exotic tools.
+
+### Tier 1 — Traffic only (1090ES)
+
+Shared base **+ one** receiver. One dongle is always assigned the **1090 traffic** role, in either
+port.
+
+| Part | Cost | Link |
+|---|---|---|
+| Nooelec NESDR Nano 3 (RTL2832U + R820T2, 0.5 ppm TCXO) | **$44.95** | [nooelec.com](https://www.nooelec.com/store/nesdr-nano-three.html) |
+
+**Tier 1 total: ≈ $73** (base ≈ $28 + one Nano 3).
+
+### Tier 2 — Traffic + Weather (1090 + 978 UAT/FIS-B)
+
+Shared base **+ two** receivers. The firmware auto-assigns the first dongle to **1090 traffic** and
+the second to **978 weather**; weather streams to ForeFlight as GDL90 Uplink (FIS-B) frames.
+
+| Part | Cost | Link |
+|---|---|---|
+| 2× NESDR Nano 3 — **or** the Stratux bundle (two Nano 3 + dual-band antennas) | **$89.90** (2×$44.95) / **bundle** | [Stratux Nano 3 bundle](https://www.nooelec.com/store/stratux-bundle-nano-3.html) |
+| Antennas — the bands are tuned differently, so a 978 antenna is required. The **ADS-B Discovery 5 dBi dual-band antenna bundle** covers both 1090 + 978. | **$19.95** | [antenna bundle](https://www.nooelec.com/store/ads-b-discovery-antenna-bundle-5dbi.html) |
+
+**Tier 2 total: ≈ $138** (base ≈ $28 + two Nano 3 ≈ $90 + antenna bundle ≈ $20). The Stratux bundle
+can replace the two loose dongles + antennas for a similar all-in price.
+
+### Tier 3 — Traffic + Weather + GPS (ownship)
+
+Tier 2 **+** a GPS module for live ownship position (enables relative formats and range/altitude
+filtering). *GPS firmware support is not yet implemented — listed so you can buy ahead.*
+
+| Part | Cost | Link |
+|---|---|---|
+| GPS / NMEA module | **~$15** | [AliExpress](https://www.aliexpress.us/item/3256810616275036.html) |
+
+**Tier 3 total: ≈ $153** (Tier 2 + GPS).
+
+> A single 1090-only dongle is expected to be passively coolable. With two dongles + WiFi the box
+> works harder; the firmware samples and logs peak die temperature for thermal validation before the
+> enclosure is sealed.
 
 ---
 
