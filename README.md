@@ -128,7 +128,7 @@ port.
 | Part | Cost | Link |
 |---|---|---|
 | Nooelec NESDR Nano 3 (RTL2832U + R820T2, 0.5 ppm TCXO) | **$44.95** | [nooelec.com](https://www.nooelec.com/store/nesdr-nano-three.html) |
-| Nooelec 1090MHz Antenna | **7.95** | [nooelec.com](https://www.nooelec.com/store/sdr/sdr-addons/antennas/1090mhz-ads-b-antenna-5dbi-sma.html)
+| Nooelec 1090MHz Antenna | **$7.95** | [nooelec.com](https://www.nooelec.com/store/sdr/sdr-addons/antennas/1090mhz-ads-b-antenna-5dbi-sma.html)
 
 **Tier 1 total: ≈ $80.95** (base ≈ $28 + one Nano 3).
 
