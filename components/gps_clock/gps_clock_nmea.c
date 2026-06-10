@@ -55,10 +55,13 @@ typedef struct {
     bool   overflow;                /**< Dropped: line exceeded the cap; resync.    */
 
     /* Same-second merge scratch: an RMC and a GGA for one second are stitched
-     * together before being published as a single fix. */
-    int64_t pend_second;            /**< UTC second the pending halves belong to.   */
-    bool    have_rmc;               /**< RMC seen for pend_second.                   */
-    bool    have_gga;               /**< GGA seen for pend_second.                   */
+     * together before being published as a single fix. The two sentences are
+     * matched by their NMEA time-of-day field (centiseconds-of-day), NOT by an
+     * absolute second — GGA carries no date, and the two can arrive in either
+     * order, so the time-of-day is the only common key both halves share. */
+    int64_t rmc_second;             /**< Integer UTC-second the last RMC opened.    */
+    bool    have_rmc;               /**< A current RMC half is buffered.            */
+    bool    have_gga;               /**< A current GGA half is buffered.            */
 
     /* RMC-derived. */
     bool    rmc_active;             /**< status == 'A'.                             */
@@ -67,12 +70,14 @@ typedef struct {
     bool    rmc_has_vel;
     uint32_t rmc_frac_ns;
     int64_t rmc_utc_us;             /**< Absolute UTC of the RMC fix.               */
+    int32_t rmc_tod_cs;             /**< RMC time-of-day, centiseconds (merge key). */
 
     /* GGA-derived. */
     int     gga_quality;            /**< 0 = no fix.                                */
     float   gga_alt_m;              /**< MSL altitude, metres (NAN if absent).      */
     double  gga_lat, gga_lon;
     bool    gga_has_pos;
+    int32_t gga_tod_cs;             /**< GGA time-of-day, centiseconds (merge key). */
 
     int64_t fix_seq;                /**< Bumped once per published merged fix.      */
 } nmea_state_t;
@@ -204,6 +209,21 @@ static double nmea_tod(const char *t)
 }
 
 /**
+ * @brief "hhmmss.ss" → time-of-day in centiseconds (0..8639999), or -1 on garbage.
+ *
+ * The shared merge key between GGA and RMC for the same epoch. Centiseconds are
+ * exact for the two-decimal NMEA time field, so equality compares cleanly.
+ */
+static int32_t nmea_tod_cs(const char *t)
+{
+    double tod = nmea_tod(t);
+    if (!isfinite(tod)) {
+        return -1;
+    }
+    return (int32_t)lround(tod * 100.0);
+}
+
+/**
  * @brief Days from civil date (Howard Hinnant's algorithm) → days since 1970-01-01.
  *
  * Valid for any Gregorian date; no libc, no locale. Used to turn RMC's ddmmyy +
@@ -236,12 +256,16 @@ static void nmea_try_publish(nmea_state_t *st, gps_nmea_signals_t *out)
         return;     // RMC carries the date; without it we have no absolute UTC
     }
 
-    // Position: prefer GGA's (it pairs with the altitude), else RMC's.
-    double lat = st->gga_has_pos ? st->gga_lat : st->rmc_lat;
-    double lon = st->gga_has_pos ? st->gga_lon : st->rmc_lon;
+    // Does the buffered GGA belong to THIS RMC? Match on the shared time-of-day so
+    // either arrival order works and a stale GGA from a previous second is ignored.
+    bool gga_matches = st->have_gga && (st->gga_tod_cs == st->rmc_tod_cs);
 
-    // Validity: RMC must be 'A' and (if we have GGA) quality must be a real fix.
-    bool quality_ok = st->have_gga ? (st->gga_quality >= 1) : true;
+    // Position: prefer the matched GGA's (it pairs with the altitude), else RMC's.
+    double lat = (gga_matches && st->gga_has_pos) ? st->gga_lat : st->rmc_lat;
+    double lon = (gga_matches && st->gga_has_pos) ? st->gga_lon : st->rmc_lon;
+
+    // Validity: RMC must be 'A' and (if a GGA matched) its quality must be a fix.
+    bool quality_ok = gga_matches ? (st->gga_quality >= 1) : true;
     bool coords_ok  = isfinite(lat) && isfinite(lon)
                       && lat >= -90.0 && lat <= 90.0
                       && lon >= -180.0 && lon <= 180.0
@@ -260,7 +284,7 @@ static void nmea_try_publish(nmea_state_t *st, gps_nmea_signals_t *out)
     out->rmc_frac_ns       = st->rmc_frac_ns;
     out->lat_deg           = lat;
     out->lon_deg           = lon;
-    out->altitude_m        = st->have_gga ? st->gga_alt_m : NAN;
+    out->altitude_m        = gga_matches ? st->gga_alt_m : NAN;
     out->ground_speed_kt   = st->rmc_speed_kt;
     out->track_deg         = st->rmc_track_deg;
     out->has_velocity      = st->rmc_has_vel;
@@ -305,16 +329,14 @@ static void nmea_handle_rmc(nmea_state_t *st, char *fields[], int nf, gps_nmea_s
     st->rmc_has_vel  = (fields[7][0] != '\0') && (fields[8][0] != '\0');
     st->rmc_frac_ns  = (uint32_t)lround(frac * 1e9);
     st->rmc_utc_us   = utc_sec * 1000000LL + (int64_t)lround(frac * 1e6);
+    st->rmc_tod_cs   = nmea_tod_cs(fields[1]);   // merge key shared with GGA
 
-    // If this RMC opens a new second, the previous pending GGA (if any) belonged to
-    // a different second and is stale — drop it.
-    if (st->rmc_second != utc_sec) {
-        st->pend_second = utc_sec;
-        st->have_gga    = false;
-    }
     st->rmc_second = utc_sec;
     st->have_rmc   = true;
 
+    // Publish now; nmea_try_publish() matches a buffered GGA by time-of-day, so a
+    // GGA that arrived first (common) is correctly merged, and one from a stale
+    // second is ignored without us having to second-guess arrival order here.
     nmea_try_publish(st, out);
 }
 
@@ -331,6 +353,7 @@ static void nmea_handle_gga(nmea_state_t *st, char *fields[], int nf, gps_nmea_s
     st->gga_lon     = nmea_coord(fields[4], fields[5], 3);
     st->gga_has_pos = isfinite(st->gga_lat) && isfinite(st->gga_lon);
     st->gga_alt_m   = (fields[9][0] != '\0') ? (float)atof(fields[9]) : NAN;
+    st->gga_tod_cs  = nmea_tod_cs(fields[1]);    // merge key shared with RMC
     st->have_gga    = true;
 
     // GGA has no date, so it cannot open a second on its own; it only enriches the
@@ -372,8 +395,9 @@ void gps_nmea_reset(gps_nmea_signals_t *sig)
 {
     memset(&s_nmea_state, 0, sizeof(s_nmea_state));
     s_nmea_state.gga_alt_m   = NAN;
-    s_nmea_state.pend_second = INT64_MIN;
     s_nmea_state.rmc_second  = INT64_MIN;
+    s_nmea_state.rmc_tod_cs  = -1;
+    s_nmea_state.gga_tod_cs  = -1;
     if (sig != NULL) {
         memset(sig, 0, sizeof(*sig));
         sig->altitude_m = NAN;

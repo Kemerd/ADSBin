@@ -42,6 +42,7 @@
 
 #include "adsbin_types.h"   // adsbin_now_us(), ADSBIN_CORE_DECODE
 #include "ownship.h"        // ownship_update / ownship_clear_if_source / OWNSHIP_SOURCE_GPS
+#include "gps_ubx.h"        // gps_ubx_configure() — optional boot config over TX
 
 /* The task priority lives in main's wiring header; mirror the value here without
  * taking a build dependency on `main` (a Core-1 housekeeping task, below sinks). */
@@ -80,6 +81,13 @@ void      gps_pps_tick(gps_pps_signals_t *sig, const gps_nmea_signals_t *nmea);
 #define GPS_FIX_GOOD_TICKS         3      /**< Consecutive good fixes ⇒ promote NMEA_FIX.  */
 #define GPS_FIX_MISS_TICKS         5      /**< Consecutive missed fixes ⇒ demote.          */
 
+/* DISCIPLINED/HOLDOVER (Layer 3). The PPS layer reports present/converged; the
+ * ladder decides the rung. Holdover decays once its uncertainty exceeds a ceiling. */
+#define GPS_PPS_MISS_TICKS         2      /**< Missed edges ⇒ DISCIPLINED→HOLDOVER.        */
+#define GPS_HOLDOVER_CEIL_NS       50000u /**< Holdover uncertainty ceiling ⇒ →NMEA_FIX.   */
+#define GPS_HOLDOVER_GROWTH_NS     2000u  /**< Uncertainty added per holdover tick (model).*/
+#define GPS_DISCIPLINED_UNC_NS     100u   /**< Reported 1σ when freshly disciplined.       */
+
 #define GPS_UART_RX_BUF            512    /**< UART RX ring (NMEA bursts ≤ ~80 B/sentence). */
 #define GPS_DRAIN_CHUNK            128    /**< Bytes pulled per tick from the UART driver.  */
 
@@ -106,6 +114,8 @@ static uint32_t s_last_byte_count;  /**< Byte count at the previous tick.       
 static int      s_fix_good;         /**< Consecutive good-fix ticks.                */
 static int      s_fix_miss;         /**< Consecutive missed-fix ticks.              */
 static int64_t  s_last_fix_seq;     /**< Last NMEA fix_seq we acted on.             */
+static int      s_pps_miss;         /**< Consecutive PPS-missed ticks (→holdover).  */
+static uint32_t s_holdover_unc_ns;  /**< Current holdover uncertainty estimate, ns. */
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Seqlock publication. One writer (the supervisor), many wait-free readers.
@@ -252,15 +262,27 @@ static void gps_clock_republish(void)
             snap.has_ownship_fix = true;
             break;
 
-        case CLOCK_QUALITY_HOLDOVER:
         case CLOCK_QUALITY_DISCIPLINED:
-            // PPS-grade UTC (Layer 3 fills the precise map; here we surface the
-            // NMEA UTC as the coarse estimate — the inline UTC map is the precise
-            // path). Uncertainty is set by the PPS layer in Task #7.
-            snap.utc_estimate_us = s_nmea.utc_us;
-            snap.uncertainty_ns  = (s_quality == CLOCK_QUALITY_DISCIPLINED) ? 100u : 50000u;
+        case CLOCK_QUALITY_HOLDOVER: {
+            // PPS-grade UTC. Project the disciplined map forward to "now": from the
+            // last good edge's (now_us, utc_ns) anchor plus the estimated drift.
+            // This is the precise estimate; it degrades gracefully through holdover
+            // because the anchor/drift are frozen at the last lock and only the
+            // reported uncertainty grows.
+            int64_t now_us = adsbin_now_us();
+            int64_t dt_ns  = (now_us - s_pps.last_edge_now_us) * 1000LL;
+            // 64-bit-safe: dt_ns·drift_ppb stays well under int64 max (see pps tick).
+            int64_t drift  = (dt_ns * (int64_t)s_pps.drift_ppb) / 1000000000LL;
+            int64_t utc_ns = s_pps.last_edge_utc_ns + dt_ns + drift;
+            snap.utc_estimate_us = (s_pps.last_edge_utc_ns != 0)
+                                       ? (utc_ns / 1000LL)   // disciplined map
+                                       : s_nmea.utc_us;      // fall back to NMEA UTC
+            snap.uncertainty_ns  = (s_quality == CLOCK_QUALITY_DISCIPLINED)
+                                       ? GPS_DISCIPLINED_UNC_NS
+                                       : s_holdover_unc_ns;
             snap.has_ownship_fix = true;
             break;
+        }
     }
 
     gps_clock_publish(&snap);
@@ -365,22 +387,84 @@ static void gps_ladder_step(uint32_t byte_delta)
     const bool have_fix = (s_fix_good >= GPS_FIX_GOOD_TICKS);
     const bool lost_fix = (s_fix_miss >= GPS_FIX_MISS_TICKS);
 
-    /* ── Rung selection (Task #3 scope: FREE_RUNNING ⇄ NMEA_FIX) ─────────────
-     * Task #7 inserts the DISCIPLINED/HOLDOVER rungs above NMEA_FIX here, keyed on
-     * the Layer-3 PPS signals (s_pps.present / .converged / phase error). For now
-     * a present module with a fix sits at NMEA_FIX; without one, FREE_RUNNING. */
+    /* ── PPS edge tracking (drives the DISCIPLINED/HOLDOVER rungs) ───────────
+     * The Layer-3 producer reports present (a usable edge this tick) and converged
+     * (drift settled + second-label corroborated). We debounce a run of misses. */
+    if (s_pps.present) {
+        s_pps_miss = 0;
+    } else if (s_pps_miss < GPS_PPS_MISS_TICKS) {
+        s_pps_miss++;
+    }
+    const bool pps_lost = (s_pps_miss >= GPS_PPS_MISS_TICKS);
+
+    /* ── Rung selection. The ladder above NMEA_FIX is:
+     *      NMEA_FIX ──(PPS converged)──► DISCIPLINED
+     *      DISCIPLINED ──(PPS lost)────► HOLDOVER ──(unc>ceiling)──► NMEA_FIX
+     *      HOLDOVER ──(PPS reconverged)► DISCIPLINED
+     *    Below that, the FREE_RUNNING⇄NMEA_FIX behaviour from Task #3. */
     if (s_quality >= CLOCK_QUALITY_NMEA_FIX) {
-        // We currently hold UTC. Keep refreshing the published snapshot so the UTC
-        // estimate tracks the latest fix; drop to FREE_RUNNING on sustained loss.
+        // Sustained NMEA loss collapses the whole upper ladder to FREE_RUNNING
+        // (no UTC, no ownship) regardless of PPS — PPS time is meaningless without
+        // a fix to name the second.
         if (lost_fix) {
+            s_pps_miss = GPS_PPS_MISS_TICKS;
+            s_holdover_unc_ns = 0;
             gps_set_quality(CLOCK_QUALITY_FREE_RUNNING);
-        } else {
-            gps_push_ownship();        // refresh position from the newest fix
-            gps_clock_republish();     // refresh the UTC estimate
+            return;
+        }
+
+        // Refresh position from the newest fix on every cycle we hold a fix.
+        gps_push_ownship();
+
+        switch (s_quality) {
+            case CLOCK_QUALITY_NMEA_FIX:
+                // Promote to DISCIPLINED once the PPS layer reports convergence.
+                if (s_pps.converged) {
+                    s_holdover_unc_ns = GPS_DISCIPLINED_UNC_NS;
+                    gps_set_quality(CLOCK_QUALITY_DISCIPLINED);
+                } else {
+                    gps_clock_republish();
+                }
+                break;
+
+            case CLOCK_QUALITY_DISCIPLINED:
+                // Demote to HOLDOVER on a debounced run of missed edges; seed the
+                // holdover uncertainty from the last disciplined value.
+                if (pps_lost) {
+                    s_holdover_unc_ns = GPS_DISCIPLINED_UNC_NS;
+                    gps_set_quality(CLOCK_QUALITY_HOLDOVER);
+                } else {
+                    gps_clock_republish();   // still locked — refresh UTC estimate
+                }
+                break;
+
+            case CLOCK_QUALITY_HOLDOVER:
+                if (s_pps.converged) {
+                    // PPS returned and re-locked → back to DISCIPLINED.
+                    s_holdover_unc_ns = GPS_DISCIPLINED_UNC_NS;
+                    gps_set_quality(CLOCK_QUALITY_DISCIPLINED);
+                } else {
+                    // Grow the uncertainty each tick; once it exceeds the ceiling the
+                    // extrapolated time is no better than serial UTC → drop to NMEA_FIX.
+                    if (s_holdover_unc_ns < UINT32_MAX - GPS_HOLDOVER_GROWTH_NS) {
+                        s_holdover_unc_ns += GPS_HOLDOVER_GROWTH_NS;
+                    }
+                    if (s_holdover_unc_ns >= GPS_HOLDOVER_CEIL_NS) {
+                        gps_set_quality(CLOCK_QUALITY_NMEA_FIX);
+                    } else {
+                        gps_clock_republish();
+                    }
+                }
+                break;
+
+            default:
+                gps_clock_republish();
+                break;
         }
     } else {
         // FREE_RUNNING: promote the moment we have a debounced run of good fixes.
         if (have_fix) {
+            s_pps_miss = 0;
             gps_set_quality(CLOCK_QUALITY_NMEA_FIX);
         }
     }
@@ -512,6 +596,13 @@ esp_err_t gps_clock_start(void)
         return err;
     }
     s_uart_installed = true;
+
+    // Optional boot config over the TX wire: put the M10 into 1 Hz + timepulse +
+    // GGA/RMC-only NMEA. Best-effort — if the wire is absent or the write fails the
+    // module keeps its factory defaults and the NMEA path still works.
+    if (s_cfg.uart_tx_gpio >= 0) {
+        (void)gps_ubx_configure(s_cfg.uart_num);
+    }
 
     // Bring up the PPS capture layer if wired. Failure is non-fatal — the ladder
     // simply never reaches DISCIPLINED, falling back to NMEA timing.
