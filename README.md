@@ -255,6 +255,14 @@ return away from the RTL-SDR USB-HS lines so digital noise doesn't desense the G
 The clock auto-degrades through five quality levels (PPS-disciplined → holdover → NMEA fix →
 free-running → off) and promotes/demotes itself as the signal comes and goes — no configuration.
 
+**External antenna (optional).** The MAX-M10S ships with an on-board patch antenna and also exposes a
+**u.FL / IPEX** socket (same connector, two names). For a fixed install, run an
+[IPEX → SMA adapter](https://www.aliexpress.us/item/3256809083730864.html) from that socket out to the
+enclosure wall and screw on the [external GPS antenna](https://www.aliexpress.us/item/2251832872907030.html)
+— a clear sky view gives a faster, more reliable fix than the patch buried inside the case. No firmware
+change; the module doesn't care which antenna feeds it. Keep the antenna lead clear of the RTL-SDR
+USB-HS lines so digital noise doesn't desense the GNSS front-end.
+
 ---
 
 ## Toolchain setup
