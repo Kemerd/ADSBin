@@ -323,6 +323,47 @@ esp_err_t ownship_clear(bool persist)
     return ESP_OK;
 }
 
+esp_err_t ownship_clear_if_source(ownship_source_t only_if)
+{
+    // The whole point of this primitive is atomicity: the source comparison and
+    // the conditional clear MUST live in the same critical section, or a manual
+    // operator slipping a MANUAL fix in between would be silently wiped by a GPS
+    // task retracting what it *thought* was still its own reference. We therefore
+    // take the lock once, decide under it, and (only if it matches) publish the
+    // cleared snapshot inline rather than calling ownship_publish_locked() — which
+    // would re-enter the same non-recursive portMUX and deadlock.
+    bool changed = false;
+
+    taskENTER_CRITICAL(&s_lock);
+    // Act only when the live reference still belongs to the caller's source. A
+    // source mismatch (someone else owns it now) or an already-invalid reference
+    // both fall through untouched — making repeated calls a cheap no-op.
+    if (s_ref.source == only_if && s_ref.valid) {
+        // Revert to the same "no usable reference" shape ownship_clear() installs:
+        // invalid, no source, coordinates zeroed and altitude NAN so nothing
+        // downstream mistakes a leftover value for a live fix.
+        s_ref.valid      = false;
+        s_ref.lat_deg    = 0.0;
+        s_ref.lon_deg    = 0.0;
+        s_ref.altitude_m = NAN;
+        s_ref.source     = OWNSHIP_SOURCE_NONE;
+        s_ref.updated_us = adsbin_now_us();
+        changed = true;
+    }
+    taskEXIT_CRITICAL(&s_lock);
+
+    // Log outside the critical section (logging can block); only on a real change
+    // so an idempotent every-cycle caller does not spam the console.
+    if (changed) {
+        ESP_LOGI(TAG, "Cleared live reference (was source %d)", (int)only_if);
+    }
+
+    // Never persists — this only ever retracts a live (GPS/NMEA) fix, and those
+    // are explicitly non-persistent (see the header contract). A non-matching
+    // source is a successful no-op, hence ESP_OK unconditionally.
+    return ESP_OK;
+}
+
 /* ───────────────────────────────────────────────────────────────────────────
  *  Consumer API  (non-blocking, any core)
  * ─────────────────────────────────────────────────────────────────────────── */

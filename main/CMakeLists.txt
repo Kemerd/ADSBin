@@ -14,6 +14,7 @@ idf_component_register(
         common          # shared ABI: adsbin_types.h, adsbin_err.h, core-id macros
         config          # config_init / config_get (NVS-backed settings)
         ownship         # ownship_init / ownship_get (reference position)
+        gps_clock       # OPTIONAL MAX-M10S GPS: ownship position + clock ladder
         usb_rtlsdr      # RTL-SDR USB-HS host driver; owns the IQ ring(s)
         demod1090       # 1090ES demodulator (Core 0)
         demod978        # 978 UAT demodulator (Core 0, weather path)

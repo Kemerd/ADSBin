@@ -138,6 +138,31 @@ esp_err_t ownship_update(const ownship_ref_t *ref);
  */
 esp_err_t ownship_clear(bool persist);
 
+/**
+ * @brief Conditionally invalidate the reference ONLY if it came from @p only_if.
+ *
+ * @details
+ *   A race-free "clear my own live fix" primitive for a live producer (e.g. the
+ *   GPS clock supervisor) that must retract its reference when its signal drops —
+ *   WITHOUT ever stomping a reference some OTHER source installed in the meantime.
+ *
+ *   The compare ("is the current source @p only_if ?") and the clear happen inside
+ *   ONE critical section, so this is immune to the read-then-clear race that a
+ *   caller-side `if (ownship_get().source == X) ownship_clear()` would suffer:
+ *   between the get and the clear, a manual operator could install a MANUAL fix
+ *   that the naive sequence would then wrongly wipe. It also sidesteps the fact
+ *   that ownship_update(valid=false) normalises @c source to NONE — which would
+ *   make a subsequent source check fail to recognise its own prior push.
+ *
+ *   Never persists (live-source contract). If the current source is NOT @p only_if
+ *   (or the reference is already invalid) this is a no-op and still returns ESP_OK,
+ *   so callers may invoke it idempotently every cycle.
+ *
+ * @param only_if  Clear the reference only when its current source equals this.
+ * @return ESP_OK always (a non-matching source is a successful no-op).
+ */
+esp_err_t ownship_clear_if_source(ownship_source_t only_if);
+
 /* ───────────────────────────────────────────────────────────────────────────
  *  Consumer API  (modes_decode, traffic)  — non-blocking, any core
  * ─────────────────────────────────────────────────────────────────────────── */

@@ -39,4 +39,62 @@ menu "ADSBin"
             How many devices may associate at once. Keep small: the link exists
             to feed one or two tablets, not to be a general hotspot.
 
+    # ─────────────────────────────────────────────────────────────────────────
+    #  GPS (u-blox MAX-M10S) — OPTIONAL live ownship position + clock discipline
+    #
+    #  The whole GPS feature is gated on ADSBIN_GPS_UART_RX_GPIO: leave it at -1
+    #  (the default) and an un-wired board compiles and runs EXACTLY as today —
+    #  no GPS task, no UART installed, GDL90 ownship stays silent. Pins follow the
+    #  same "-1 disables" idiom as ADSBIN_STATUS_LED_GPIO. Defaults target free,
+    #  non-strapping GPIOs on the Waveshare ESP32-P4-WIFI6 (clear of the UART0
+    #  console, the C6 SDIO block GPIO14-19+54, and I2C GPIO7/8); verify against
+    #  your board's header before wiring and change them here if your pinout
+    #  differs — no code change is needed, only these defaults.
+    # ─────────────────────────────────────────────────────────────────────────
+    config ADSBIN_GPS_UART_RX_GPIO
+        int "GPS UART RX GPIO  (P4 RX <- module TX; -1 disables GPS entirely)"
+        default 20
+        help
+            P4 GPIO wired to the MAX-M10S TX pin (NMEA in). This is the PRIMARY
+            enable gate for the whole GPS feature: set it to -1 and the firmware
+            never installs the GPS UART, never parses NMEA, and never publishes an
+            ownship fix — the box behaves bit-for-bit as if GPS did not exist.
+            This is the ONLY wire strictly required for a live ownship position.
+
+    config ADSBIN_GPS_UART_TX_GPIO
+        int "GPS UART TX GPIO  (P4 TX -> module RX, UBX config; -1 = no config wire)"
+        default 21
+        help
+            P4 GPIO wired to the MAX-M10S RX pin. Used once at boot to send a
+            UBX-CFG-VALSET burst (enable the 1PPS timepulse, set a 1 Hz nav rate,
+            trim NMEA to GGA+RMC). Set to -1 to skip the config burst entirely; the
+            module then runs at its 9600 baud / 1 Hz factory defaults and ownship
+            still works — only the optional timepulse tuning is skipped.
+
+    config ADSBIN_GPS_PPS_GPIO
+        int "GPS PPS GPIO  (P4 <- module TIMEPULSE; -1 disables PPS discipline)"
+        default 22
+        help
+            P4 GPIO wired to the MAX-M10S TIMEPULSE (1PPS) pin. Drives the
+            hardware-captured clock-discipline layer (GPTimer + ETM + PCNT, zero
+            load on the Core-0 DSP path). Set to -1 to disable PPS: the clock ladder
+            then tops out at NMEA-fix timing, with no other effect. Must be an
+            ETM-capable GPIO.
+
+    config ADSBIN_GPS_UART_NUM
+        int "GPS UART controller number"
+        default 1
+        range 1 5
+        help
+            Which P4 UART controller serves the GPS. MUST NOT be the console UART
+            (UART0 carries the GDL90/debug output and the +INJECT reader). Defaults
+            to UART1, which is verified free in this firmware.
+
+    config ADSBIN_GPS_BAUD
+        int "GPS UART baud rate"
+        default 9600
+        help
+            Initial NMEA baud for the GPS UART. 9600 is the MAX-M10S factory
+            default and is used to configure the port before any UBX retune.
+
 endmenu

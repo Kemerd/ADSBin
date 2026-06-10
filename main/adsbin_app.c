@@ -63,6 +63,7 @@
 // Component public contracts (the frozen source of truth for every call below).
 #include "adsbin_config.h"  // config_init / config_get
 #include "ownship.h"        // ownship_init / ownship_get
+#include "gps_clock.h"      // OPTIONAL MAX-M10S GPS: ownship position + clock ladder
 #include "usb_rtlsdr.h"     // RTL-SDR USB-HS host driver
 #include "demod1090.h"      // 1090ES demodulator (Core 0)
 #include "demod978.h"       // 978 UAT demodulator (Core 0, weather path)
@@ -781,6 +782,25 @@ const adsbin_pipeline_t *adsbin_app_pipeline(void)
 }
 
 /**
+ * @brief Build the gps_clock_cfg_t from the menuconfig GPS pin selection.
+ *
+ * Mirrors status_cfg_from_kconfig(): the GPS wiring is board-specific, so it stays
+ * operator-selectable via Kconfig. A negative RX pin (the default) means "no GPS" —
+ * gps_clock_init()/start() then no-op and the firmware behaves as if GPS did not
+ * exist. Defined here (above adsbin_app_init) because adsbin_app_init() calls it.
+ */
+static gps_clock_cfg_t gps_cfg_from_kconfig(void)
+{
+    gps_clock_cfg_t cfg = {0};
+    cfg.uart_num     = CONFIG_ADSBIN_GPS_UART_NUM;
+    cfg.uart_rx_gpio = CONFIG_ADSBIN_GPS_UART_RX_GPIO;   // < 0 => GPS disabled
+    cfg.uart_tx_gpio = CONFIG_ADSBIN_GPS_UART_TX_GPIO;   // < 0 => no UBX config wire
+    cfg.pps_gpio     = CONFIG_ADSBIN_GPS_PPS_GPIO;       // < 0 => no PPS discipline
+    cfg.baud         = (uint32_t)CONFIG_ADSBIN_GPS_BAUD;
+    return cfg;
+}
+
+/**
  * @brief One-shot bring-up: config + ownship, then construct the shared IPC.
  *
  * Order matters: config_init() opens NVS and loads settings; ownship_init()
@@ -812,6 +832,20 @@ esp_err_t adsbin_app_init(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "ownship_init failed: %s", esp_err_to_name(err));
         return err;
+    }
+
+    // GPS clock (OPTIONAL). MUST init after ownship (it pushes/clears ownship). With
+    // the RX pin at its Kconfig default of -1 this is fully inert — no UART, no task,
+    // GDL90 ownship silent — so an un-wired board behaves exactly as before. The
+    // task itself is spawned later in adsbin_app_start(); init only publishes the
+    // initial NONE snapshot and records the wiring. A failure here is non-fatal.
+    {
+        const gps_clock_cfg_t gcfg = gps_cfg_from_kconfig();
+        esp_err_t gerr = gps_clock_init(&gcfg);
+        if (gerr != ESP_OK) {
+            ESP_LOGW(TAG, "gps_clock_init failed (%s) - GPS feature disabled",
+                     esp_err_to_name(gerr));
+        }
     }
 
     // Construct the two queues main owns. Both carry small POD structs by value,
@@ -1048,10 +1082,12 @@ esp_err_t adsbin_app_start(void)
         };
         err = sink_gdl90_create(&gcfg, &s_sink_gdl90);
         if (err == ESP_OK) {
-            // Seed the GDL90 ownship so the optional Ownship Report is populated.
-            ownship_ref_t own;
-            const ownship_ref_t *ref = ownship_snapshot(&own);
-            sink_gdl90_set_ownship(s_sink_gdl90, ref);
+            // Do NOT seed a per-sink ownship: the sink's cached ownship takes
+            // precedence over the live publisher value, so seeding it would freeze
+            // the Ownship Report and starve out live GPS fixes. Instead the sink
+            // relies SOLELY on the publisher-supplied snapshot (sinks reads fresh
+            // ownship_get() each cycle), which lets manual AND live-GPS references
+            // flow through identically. This is the single-ownship-authority rule.
             sinks_register(s_sink_gdl90);
         } else {
             ESP_LOGW(TAG, "sink_gdl90_create failed: %s", esp_err_to_name(err));
@@ -1100,11 +1136,10 @@ esp_err_t adsbin_app_start(void)
                 };
                 werr = sink_gdl90_create(&wcfg, &s_sink_gdl90_wifi);
                 if (werr == ESP_OK) {
-                    // Seed the ownship so the WiFi sink's Ownship Report matches
-                    // the wired one.
-                    ownship_ref_t own;
-                    const ownship_ref_t *ref = ownship_snapshot(&own);
-                    sink_gdl90_set_ownship(s_sink_gdl90_wifi, ref);
+                    // Same single-ownship-authority rule as the wired sink: no
+                    // per-sink seed, so the WiFi sink also tracks the live ownship
+                    // (manual or GPS) via the publisher snapshot — keeping wired and
+                    // WiFi GDL90 ownership in lockstep with the central source.
                     sinks_register(s_sink_gdl90_wifi);
                 } else {
                     ESP_LOGW(TAG, "sink_gdl90_create (wifi) failed: %s",
@@ -1140,6 +1175,21 @@ esp_err_t adsbin_app_start(void)
         if (usb_rtlsdr_get_status(&ust) == ESP_OK) {
             status_set_health(ust.device_present ? STATUS_HEALTH_OK
                                                  : STATUS_HEALTH_NO_DONGLE);
+        }
+    }
+
+    /* ── 6b. GPS (OPTIONAL, best-effort) ────────────────────────────────────
+     * Start the MAX-M10S GPS clock service. Mirrors the WiFi block's contract:
+     * EVERY failure here is non-fatal — GPS is a bonus, never a precondition for
+     * decoding. When the GPS RX pin is -1 (the default) gps_clock_start() is a
+     * no-op and the box runs exactly as a GPS-less board. A wired module promotes
+     * the ownship through the central ownship service, which the GDL90 sinks pick
+     * up via the publisher snapshot (see the no-seed note in the sink blocks). */
+    {
+        esp_err_t gerr = gps_clock_start();
+        if (gerr != ESP_OK) {
+            ESP_LOGW(TAG, "gps_clock_start failed (%s) - GPS disabled, "
+                          "decode/ownship/sinks unaffected", esp_err_to_name(gerr));
         }
     }
 

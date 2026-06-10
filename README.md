@@ -228,6 +228,31 @@ switching regulators, and USB lines; keep coax short (1090/978 MHz is lossy); us
 the P4, and place a bulk capacitor near each dongle's VBUS to handle inrush.
 Full RF/placement notes: [IMPLEMENTATION_PLAN.md §8](IMPLEMENTATION_PLAN.md).
 
+### GPS (u-blox MAX-M10S) — optional live ownship
+
+A GPS module gives the box a **live ownship position** (the blue "you are here" airplane in
+ForeFlight) and a **GPS-disciplined clock**. It's entirely optional: with no module wired the
+firmware runs exactly as before and no ownship is sent. Wire the module's 5 pins to the P4 header:
+
+| MAX-M10S pin | P4 pin | Kconfig symbol | Required? |
+|---|---|---|---|
+| **VCC** | 3.3 V | — | ✅ |
+| **GND** | GND | — | ✅ |
+| **TX** | **GPIO20** | `ADSBIN_GPS_UART_RX_GPIO` | ✅ — only wire needed for ownship |
+| **RX** | **GPIO21** | `ADSBIN_GPS_UART_TX_GPIO` | optional — UBX config burst |
+| **PPS** | **GPIO22** | `ADSBIN_GPS_PPS_GPIO` | optional — precise 1PPS clock layer |
+
+The module's **TX** goes to the P4's **RX** and vice-versa (UART is crossed). GPIO20/21/22 are free,
+non-strapping pins clear of the UART0 console, the C6 SDIO block (GPIO14–19, reset GPIO54), and I2C
+(GPIO7/8). **Verify they're broken out on your board's 2×20 header** before wiring; if your board
+exposes a different free trio, just change the three Kconfig defaults — no code change. Set any pin to
+`-1` in `menuconfig → ADSBin` to disable that wire; `ADSBIN_GPS_UART_RX_GPIO = -1` disables GPS
+entirely. The module is 3.3 V native — do **not** feed 5 V to its RX pin. Keep the GPS power/ground
+return away from the RTL-SDR USB-HS lines so digital noise doesn't desense the GNSS front-end.
+
+The clock auto-degrades through five quality levels (PPS-disciplined → holdover → NMEA fix →
+free-running → off) and promotes/demotes itself as the signal comes and goes — no configuration.
+
 ---
 
 ## Toolchain setup
@@ -338,6 +363,11 @@ Build-time options (`idf.py menuconfig → ADSBin`):
 - `ADSBIN_STATUS_LED_GPIO` — heartbeat LED GPIO. Default `-1` (disabled); board-specific. The console
   heartbeat is independent of this pin.
 - `ADSBIN_STATUS_LED_ACTIVE_LOW` — set for active-low LEDs.
+- `ADSBIN_GPS_UART_RX_GPIO` — P4 RX ← GPS TX. Default `20`. **Set to `-1` to disable GPS entirely.**
+- `ADSBIN_GPS_UART_TX_GPIO` — P4 TX → GPS RX (UBX config wire). Default `21`; `-1` skips the config burst.
+- `ADSBIN_GPS_PPS_GPIO` — P4 ← GPS 1PPS. Default `22`; `-1` disables the precise clock-discipline layer.
+- `ADSBIN_GPS_UART_NUM` / `ADSBIN_GPS_BAUD` — GPS UART controller (default `1`) and baud (default `9600`).
+  See the [GPS wiring section](#gps-u-blox-max-m10s--optional-live-ownship) for the pin map.
 
 ---
 

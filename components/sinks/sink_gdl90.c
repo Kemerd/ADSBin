@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>   /* isfinite / lroundf for GPS ownship altitude (metres->feet) */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -165,7 +166,17 @@ static esp_err_t sink_gdl90_publish(void *vctx, const traffic_snapshot_t *snap,
         otr.icao          = 0;                 /* own ICAO unknown on a receiver */
         otr.lat_deg       = use_own.lat_deg;
         otr.lon_deg       = use_own.lon_deg;
-        otr.alt_press_ft  = INT32_MIN;         /* no baro alt for a manual ref   */
+        // Altitude: a MANUAL ref carries none (INT32_MIN => the encoder packs the
+        // GDL90 "invalid" altitude code). A live GPS fix DOES carry geometric MSL
+        // altitude, so feed it here (metres -> feet). It lands in the report's
+        // altitude field which a tablet reads as the ownship's altitude; geometric-
+        // vs-pressure nuance is acceptable for a receive-only box (see plan: 0x0B
+        // geometric-altitude supplement intentionally skipped).
+        if (use_own.source == OWNSHIP_SOURCE_GPS && isfinite(use_own.altitude_m)) {
+            otr.alt_press_ft = (int32_t)lroundf(use_own.altitude_m * 3.28084f);
+        } else {
+            otr.alt_press_ft = INT32_MIN;      /* no altitude for a manual ref   */
+        }
         otr.airborne      = false;             /* a ground reference position     */
         otr.nic           = 0;
         otr.nacp          = 0;
