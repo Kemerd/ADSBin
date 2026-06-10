@@ -169,8 +169,10 @@ filtering). *GPS firmware support is not yet implemented — listed so you can b
 | Part | Cost | Link |
 |---|---|---|
 | GPS / NMEA module | **~$15** | [AliExpress](https://www.aliexpress.us/item/3256810616275036.html) |
+| External GPS antenna *(optional)* — for a fixed mount / better sky view than the on-module patch. | **$2.94** | [AliExpress](https://www.aliexpress.us/item/2251832872907030.html) |
+| IPEX → SMA adapter *(required by the external antenna)* — 2-pack. | **$2.71 / 2** | [AliExpress](https://www.aliexpress.us/item/3256809083730864.html) |
 
-**Tier 3 total: ≈ $143** (Tier 2 bundle ≈ $128 + GPS ≈ $15).
+**Tier 3 total: ≈ $143** (Tier 2 bundle ≈ $128 + GPS ≈ $15). Add **≈ $6** for the optional external GPS antenna + IPEX→SMA adapter.
 
 > A single 1090-only dongle is expected to be passively coolable. With two dongles + WiFi the box
 > works harder; the firmware samples and logs peak die temperature for thermal validation before the
