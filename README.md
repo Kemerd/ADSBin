@@ -1,6 +1,15 @@
 # ADSBin
 
-Receive-only ADS-B (1090ES) traffic receiver for the ESP32-P4 for **under $100.** 
+**A software-defined ADS-B receiver built from scratch on the dual-core RISC-V ESP32-P4.** USB
+High-Speed SDR ingest, real-time Mode-S / CPR decode, and GDL90 emission over WiFi to ForeFlight or
+hardwired to a panel display — the full *receive → decode → serve* chain on a **$23 microcontroller**,
+for a complete build **under $100**. One firmware image, no app subscriptions, no license gates.
+
+> **The whole signal chain lives in firmware.** A commodity RTL-SDR delivers 2.4 Msps of raw 8-bit
+> I/Q over USB 2.0 High-Speed; the P4 demodulates 1090ES on a hard-real-time core (magnitude LUT →
+> preamble correlation → PPM bit-slice), runs Mode-S CRC and global/local CPR position solving on the
+> second core, ages a per-aircraft traffic table, and re-emits standard GDL90. No PC, no cloud, no
+> vendor app — just an MCU doing DSP that usually wants a laptop.
 
 | Tier | What you get | Total |
 |---|---|---|
@@ -24,9 +33,23 @@ broadcast, demodulates and decodes Mode-S / ADS-B (DF17/DF18), resolves target p
 maintains an aging traffic table, and emits GDL90 — the traffic format EFBs and panel displays
 consume.
 
-The hardware is an ESP32-P4 (dual-core RISC-V, USB 2.0 High-Speed host) driving a single RTL2832U +
-R820T2 dongle. The High-Speed host is a hard requirement: 1090ES capture runs at 2.4 Msps of 8-bit
-I/Q (~4.8 MB/s), which exceeds the USB Full-Speed bandwidth available on smaller ESP32 parts.
+What makes it interesting as an engineering exercise: **none of this normally runs on a
+microcontroller.** ADS-B decode is typically a laptop-class workload (dump1090 on a Raspberry Pi or
+PC). ADSBin moves the entire pipeline onto a $23 dual-core RISC-V part by treating the radio path as
+hard real-time:
+
+- **USB 2.0 High-Speed SDR host** — the P4 acts as USB host to a commodity RTL2832U + R820T2 dongle
+  and streams **2.4 Msps of 8-bit I/Q (~4.8 MB/s)** in over bulk-IN. High-Speed is a hard
+  requirement; that rate exceeds the Full-Speed bandwidth on smaller ESP32 parts, which is why the P4
+  is the floor.
+- **Real-time DSP, core-pinned.** Sample ingest and the 1090ES demodulator (magnitude LUT → 8 µs
+  preamble correlation → PPM bit-slice) own Core 0 and are never preempted; Mode-S CRC, DF17/18
+  parse, and global/local CPR position solving run on Core 1 behind lock-free queues.
+- **Two ways out.** GDL90 goes to ForeFlight / Garmin Pilot over **WiFi** (on-board ESP32-C6 SoftAP +
+  UDP broadcast) *or* hardwired to a panel display — the same transport-agnostic encoder feeds both.
+
+The hardware is an ESP32-P4 (dual-core RISC-V, USB 2.0 High-Speed host) driving one or two RTL2832U +
+R820T2 dongles; the second, when present, is auto-assigned to 978 MHz UAT for free FIS-B weather.
 
 ## Form factor and power
 
