@@ -1029,6 +1029,16 @@ static void bulk_in_cb(usb_transfer_t *xfer)
 {
     usb_rtlsdr_dev_t *d = (usb_rtlsdr_dev_t *)xfer->context;
 
+    /* DIAG: log the first few completions so we can see the URB is actually
+     * completing and with what status/byte count (rate-limited via a static). */
+    static uint32_t s_cb_log = 0;
+    if (s_cb_log < 6) {
+        s_cb_log++;
+        ESP_LOGW(TAG, "DIAG bulk_in_cb[%d]: status=%d actual=%d inflight=%u",
+                 d->index, (int)xfer->status, (int)xfer->actual_num_bytes,
+                 (unsigned)d->urbs_inflight);
+    }
+
     /* If we are tearing down (global) or this device stopped streaming, stop
      * re-arming. task_run is process-global; want_stream is per-device. */
     if (!s_ctx.task_run || !d->want_stream) {
@@ -1155,6 +1165,9 @@ static void bulk_in_cb(usb_transfer_t *xfer)
 /** @brief Allocate the device's bulk-IN URB pool (call once it is open). */
 static esp_err_t alloc_urbs(usb_rtlsdr_dev_t *d)
 {
+    ESP_LOGW(TAG, "DIAG alloc_urbs[%d]: bulk_ep=0x%02x bulk_mps=%u urb_size=%u num_urbs=%u",
+             d->index, (unsigned)d->bulk_ep, (unsigned)d->bulk_mps,
+             (unsigned)RTLSDR_URB_SIZE, (unsigned)RTLSDR_NUM_URBS);
     for (uint32_t i = 0; i < RTLSDR_NUM_URBS; i++) {
         usb_transfer_t *x = NULL;
         esp_err_t err = usb_host_transfer_alloc(RTLSDR_URB_SIZE, 0, &x);
@@ -1169,6 +1182,11 @@ static esp_err_t alloc_urbs(usb_rtlsdr_dev_t *d)
         x->num_bytes        = RTLSDR_URB_SIZE;
         x->timeout_ms       = 0;            /* bulk-IN: no per-transfer timeout. */
         d->urb[i]           = x;
+        if (i == 0) {
+            ESP_LOGW(TAG, "DIAG urb[0]: data_buffer=%p num_bytes=%u dev_hdl=%p ep=0x%02x",
+                     (void *)x->data_buffer, (unsigned)x->num_bytes,
+                     (void *)x->device_handle, (unsigned)x->bEndpointAddress);
+        }
     }
     return ESP_OK;
 }
@@ -1187,8 +1205,15 @@ static void free_urbs(usb_rtlsdr_dev_t *d)
 /** @brief Submit every URB to start the device's continuous bulk-IN stream. */
 static esp_err_t submit_urbs(usb_rtlsdr_dev_t *d)
 {
+    ESP_LOGW(TAG, "DIAG submit_urbs[%d]: state=%d dev=%p ep=0x%02x mps=%u",
+             d->index, (int)d->state, (void *)d->dev,
+             (unsigned)d->bulk_ep, (unsigned)d->bulk_mps);
     d->urbs_inflight = 0;
-    for (uint32_t i = 0; i < RTLSDR_NUM_URBS; i++) {
+    /* DIAG: the HCD double-buffers (NUM_BUFFERS=2) and rejects a second concurrent
+     * submit while the pipe is mid command-processing. Submit a SMALL initial
+     * batch and let bulk_in_cb re-arm each on completion to keep the pipe fed. */
+    const uint32_t initial_submit = 1u;
+    for (uint32_t i = 0; i < initial_submit; i++) {
         /* The bulk-IN pipe can still be settling immediately after the heavy
          * control-transfer bring-up (the host stack reports ESP_ERR_INVALID_STATE
          * when the port/pipe is momentarily in a recovery/transition state rather
@@ -1196,22 +1221,35 @@ static esp_err_t submit_urbs(usb_rtlsdr_dev_t *d)
          * the ENABLED state before we give up — this is a cold path, once per
          * stream start. */
         esp_err_t err = ESP_ERR_INVALID_STATE;
+        int attempts = 0;
         int64_t deadline = adsbin_now_us() + 500 * 1000;   /* up to 500 ms */
         while (adsbin_now_us() < deadline) {
             err = usb_host_transfer_submit(d->urb[i]);
+            attempts++;
             if (err != ESP_ERR_INVALID_STATE) {
                 break;   /* submitted, or a different (real) error. */
             }
+            /* Pump the CLIENT loop first (that is where the pipe-command callback
+             * that clears pipe_cmd_processing runs), then the lib loop. A plain
+             * yield between also lets the host task make progress. */
+            usb_host_client_handle_events(s_ctx.client, pdMS_TO_TICKS(2));
             uint32_t lib_flags = 0;
-            usb_host_lib_handle_events(pdMS_TO_TICKS(5), &lib_flags);
-            usb_host_client_handle_events(s_ctx.client, pdMS_TO_TICKS(5));
+            usb_host_lib_handle_events(pdMS_TO_TICKS(2), &lib_flags);
+            vTaskDelay(1);
         }
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "URB %u submit failed: %s", i, esp_err_to_name(err));
+            ESP_LOGE(TAG, "DIAG URB %u submit failed after %d attempts: %s (buf=%p nbytes=%u)",
+                     i, attempts, esp_err_to_name(err),
+                     (void *)d->urb[i]->data_buffer, (unsigned)d->urb[i]->num_bytes);
             return err;
+        }
+        if (i == 0) {
+            ESP_LOGW(TAG, "DIAG URB 0 submitted OK after %d attempts", attempts);
         }
         d->urbs_inflight++;
     }
+    ESP_LOGW(TAG, "DIAG submit_urbs[%d]: ALL %u submitted, inflight=%u",
+             d->index, (unsigned)RTLSDR_NUM_URBS, (unsigned)d->urbs_inflight);
     return ESP_OK;
 }
 
