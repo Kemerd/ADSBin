@@ -1271,6 +1271,7 @@ esp_err_t adsbin_app_start(void)
 
     ESP_LOGI(TAG, "pipeline up: usb->demod(core0) -> decode/traffic/sinks(core1)%s",
              s_978_built ? " + 978 UAT/weather" : "");
+
     return ESP_OK;
 }
 

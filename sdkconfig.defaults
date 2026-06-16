@@ -130,3 +130,15 @@ CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=y
 # intentionally run near-saturated real-time DSP, so disable the idle-task WDT on
 # Core 1 as well. The WDT is non-panic (warning only) but the noise is unwanted.
 # CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1 is not set
+
+# GPS disabled (no MAX-M10S module wired yet). The Kconfig defaults set real GPIOs
+# (RX=20/TX=21/PPS=22), which makes gps_clock_start() try to bring up the UART +
+# PPS-capture hardware at boot. With NO module physically present that bring-up can
+# block/hang init before the decode/traffic tasks are ever created — so the box
+# streams RF but never decodes (TRAFFIC stuck at 0). Setting the GPS RX GPIO to -1
+# is the documented master-disable: gps_clock_start() becomes a clean no-op and the
+# box runs exactly as a GPS-less board. Re-enable (and set the real pins) when a
+# module is actually wired.
+CONFIG_ADSBIN_GPS_UART_RX_GPIO=-1
+CONFIG_ADSBIN_GPS_UART_TX_GPIO=-1
+CONFIG_ADSBIN_GPS_PPS_GPIO=-1
