@@ -549,11 +549,7 @@ static esp_err_t rtl_demod_write(usb_rtlsdr_dev_t *d, uint16_t paged_addr, uint1
 static esp_err_t rtl_i2c_repeater(usb_rtlsdr_dev_t *d, bool on)
 {
     uint16_t v = on ? RTL_DEMOD_IIC_REPEAT_ON : RTL_DEMOD_IIC_REPEAT_OFF;
-    esp_err_t e = rtl_demod_write(d, RTL_DEMOD_IIC_REPEAT, v, 1);
-    if (e != ESP_OK) {
-        ESP_LOGW(TAG, "DIAG i2c_repeater(%d) FAILED: %s", (int)on, esp_err_to_name(e));
-    }
-    return e;
+    return rtl_demod_write(d, RTL_DEMOD_IIC_REPEAT, v, 1);
 }
 
 /**
@@ -884,26 +880,26 @@ static esp_err_t rtl_init_baseband(usb_rtlsdr_dev_t *d)
     /* Max-packet for endpoint A = HS bulk 512. */
     err |= rtl_write_reg(d, RTL_USB_EPA_MAXPKT, RTL_BLK_USB, RTLSDR_BULK_MPS_HS, 2);
 
-    /* Reset the endpoint A FIFO (write the reset bit, then clear it). */
+    /* Reset the endpoint A FIFO. */
     err |= rtl_write_reg(d, RTL_USB_EPA_CTL, RTL_BLK_USB, 0x1002, 2);
-    err |= rtl_write_reg(d, RTL_USB_EPA_CTL, RTL_BLK_USB, 0x0000, 2);
 
-    /* Demod control: power both ADCs, release digital reset. The I2C-repeater is
-     * toggled separately around tuner writes. */
-    const uint16_t demod_ctl_val = (RTL_DEMOD_CTL_ADC_I | RTL_DEMOD_CTL_ADC_Q | 0x20);
-    err |= rtl_write_reg(d, RTL_SYS_DEMOD_CTL, RTL_BLK_SYS, demod_ctl_val, 1);
+    /* ── POWER ON THE DEMODULATOR (must precede any demod-block access) ──────────
+     * This is the step whose absence kept the SDR silent: the demod core was never
+     * powered, so every demod-block register write (e.g. the I2C-repeater enable in
+     * r820t_init) STALLed and tuner bring-up failed. The exact values are
+     * librtlsdr's rtlsdr_init_baseband power-on:
+     *   DEMOD_CTL_1 = 0x22   (secondary demod control)
+     *   DEMOD_CTL   = 0xe8   (powers the demod + ADCs + clock; NOT the 0x38 we had)
+     */
+    err |= rtl_write_reg(d, RTL_SYS_DEMOD_CTL_1, RTL_BLK_SYS, 0x22, 1);
+    err |= rtl_write_reg(d, RTL_SYS_DEMOD_CTL,   RTL_BLK_SYS, 0xe8, 1);
 
-    /* Read the demod-control register straight back as a cheap liveness check:
-     * a silicon RTL2832U returns the bits we just wrote (the ADC-power + clock
-     * field is plain R/W). A mismatch means the control bus is not really
-     * answering, which we surface as a fault rather than streaming garbage. */
-    uint16_t readback = 0;
-    if (rtl_read_reg(d, RTL_SYS_DEMOD_CTL, RTL_BLK_SYS, &readback, 1) == ESP_OK) {
-        if ((readback & demod_ctl_val) != demod_ctl_val) {
-            ESP_LOGW(TAG, "demod ctl readback 0x%02x != 0x%02x",
-                     readback, demod_ctl_val);
-        }
-    }
+    /* Soft-reset the demod (page 1 reg 0x01: set bit-3 then clear) so the freshly
+     * powered demod block starts from a clean state — librtlsdr does 0x14 then
+     * 0x10 here. After this the demod block accepts writes (each demod write now
+     * carries the mandatory dummy-read flush; see rtl_demod_write). */
+    err |= rtl_demod_write(d, RTL_DEMOD_SOFT_RST, 0x14, 1);
+    err |= rtl_demod_write(d, RTL_DEMOD_SOFT_RST, 0x10, 1);
 
     /* GPIO defaults: drive the bias-tee line low (off) until set_bias_tee asks
      * for it. Configure GPIO0 as an output. */

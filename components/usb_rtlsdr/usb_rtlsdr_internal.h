@@ -148,7 +148,11 @@ extern "C" {
  *  writes 0x05..0x1F. We keep a shadow of the writable registers because the
  *  chip has no per-register read-modify-write — you must remember prior bits.
  * ═══════════════════════════════════════════════════════════════════════════ */
-#define R820T_I2C_ADDR            0x1Au    /**< Fixed 7-bit I2C slave address.   */
+/* R820T2 I2C address as the RTL2832U I2C window expects it: the 8-bit form
+ * (7-bit 0x1A << 1 = 0x34). librtlsdr uses 0x34 here. We were sending the bare
+ * 7-bit 0x1A, so the RTL2832U addressed the wrong slave and STALLed every tuner
+ * write — r820t_init failed and the SDR never tuned/streamed. */
+#define R820T_I2C_ADDR            0x34u    /**< 8-bit I2C slave addr (0x1A << 1).*/
 #define R820T_NUM_REGS            32       /**< 0x00..0x1F total register file.  */
 #define R820T_WRITE_START         5        /**< First host-writable register.    */
 
