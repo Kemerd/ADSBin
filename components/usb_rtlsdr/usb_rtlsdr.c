@@ -1189,7 +1189,23 @@ static esp_err_t submit_urbs(usb_rtlsdr_dev_t *d)
 {
     d->urbs_inflight = 0;
     for (uint32_t i = 0; i < RTLSDR_NUM_URBS; i++) {
-        esp_err_t err = usb_host_transfer_submit(d->urb[i]);
+        /* The bulk-IN pipe can still be settling immediately after the heavy
+         * control-transfer bring-up (the host stack reports ESP_ERR_INVALID_STATE
+         * when the port/pipe is momentarily in a recovery/transition state rather
+         * than ENABLED). Pump the event loops and retry briefly so the pipe reaches
+         * the ENABLED state before we give up — this is a cold path, once per
+         * stream start. */
+        esp_err_t err = ESP_ERR_INVALID_STATE;
+        int64_t deadline = adsbin_now_us() + 500 * 1000;   /* up to 500 ms */
+        while (adsbin_now_us() < deadline) {
+            err = usb_host_transfer_submit(d->urb[i]);
+            if (err != ESP_ERR_INVALID_STATE) {
+                break;   /* submitted, or a different (real) error. */
+            }
+            uint32_t lib_flags = 0;
+            usb_host_lib_handle_events(pdMS_TO_TICKS(5), &lib_flags);
+            usb_host_client_handle_events(s_ctx.client, pdMS_TO_TICKS(5));
+        }
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "URB %u submit failed: %s", i, esp_err_to_name(err));
             return err;
