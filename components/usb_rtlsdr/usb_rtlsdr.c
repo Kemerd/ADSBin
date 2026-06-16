@@ -877,8 +877,11 @@ static esp_err_t rtl_init_baseband(usb_rtlsdr_dev_t *d)
     /* USB system control: enable the bulk FIFO path. */
     err |= rtl_write_reg(d, RTL_USB_SYSCTL, RTL_BLK_USB, 0x09, 1);
 
-    /* Max-packet for endpoint A = HS bulk 512. */
-    err |= rtl_write_reg(d, RTL_USB_EPA_MAXPKT, RTL_BLK_USB, RTLSDR_BULK_MPS_HS, 2);
+    /* Max-packet for endpoint A. librtlsdr writes the literal value 0x0002 to this
+     * register (USB_EPA_MAXPKT) — NOT 0x0200/512. Writing 512 here put the endpoint
+     * in the wrong packet mode and the device returned tiny 2-byte transfers
+     * instead of full bulk URBs. Use librtlsdr's exact value. */
+    err |= rtl_write_reg(d, RTL_USB_EPA_MAXPKT, RTL_BLK_USB, 0x0002, 2);
 
     /* Reset the endpoint A FIFO. */
     err |= rtl_write_reg(d, RTL_USB_EPA_CTL, RTL_BLK_USB, 0x1002, 2);
@@ -900,6 +903,22 @@ static esp_err_t rtl_init_baseband(usb_rtlsdr_dev_t *d)
      * carries the mandatory dummy-read flush; see rtl_demod_write). */
     err |= rtl_demod_write(d, RTL_DEMOD_SOFT_RST, 0x14, 1);
     err |= rtl_demod_write(d, RTL_DEMOD_SOFT_RST, 0x10, 1);
+
+    /* ── ENABLE THE RAW-IQ DATA PATH (the step that makes the demod actually emit
+     *    samples to the USB FIFO) ──────────────────────────────────────────────
+     * These mirror librtlsdr's rtlsdr_init_baseband SDR-mode setup. Without them
+     * the demod is powered but routes NOTHING to the bulk endpoint, so the bulk-IN
+     * URB is submitted and never completes (inflight stuck, BLK=0). Page/reg/value
+     * are paged_addr = (page << 8) | reg:
+     *   page0 0x19 = 0x05  enable SDR mode, disable DAGC
+     *   page0 0x06 = 0x80  opt_adc_iq = 0, default ADC_I/ADC_Q datapath
+     *   page1 0xb1 = 0x1b  Zero-IF mode (en_bbin) + DC cancel + IQ est/comp
+     *   page0 0x0d = 0x83  disable the 4.096 MHz clock output on TP_CK0
+     */
+    err |= rtl_demod_write(d, 0x0019u, 0x05, 1);   /* page0 reg 0x19 */
+    err |= rtl_demod_write(d, 0x0006u, 0x80, 1);   /* page0 reg 0x06 */
+    err |= rtl_demod_write(d, 0x01b1u, 0x1b, 1);   /* page1 reg 0xb1 */
+    err |= rtl_demod_write(d, 0x000du, 0x83, 1);   /* page0 reg 0x0d */
 
     /* GPIO defaults: drive the bias-tee line low (off) until set_bias_tee asks
      * for it. Configure GPIO0 as an output. */
@@ -1028,16 +1047,6 @@ static bool push_iq_block(usb_rtlsdr_dev_t *d, const uint8_t *src, uint32_t n_by
 static void bulk_in_cb(usb_transfer_t *xfer)
 {
     usb_rtlsdr_dev_t *d = (usb_rtlsdr_dev_t *)xfer->context;
-
-    /* DIAG: log the first few completions so we can see the URB is actually
-     * completing and with what status/byte count (rate-limited via a static). */
-    static uint32_t s_cb_log = 0;
-    if (s_cb_log < 6) {
-        s_cb_log++;
-        ESP_LOGW(TAG, "DIAG bulk_in_cb[%d]: status=%d actual=%d inflight=%u",
-                 d->index, (int)xfer->status, (int)xfer->actual_num_bytes,
-                 (unsigned)d->urbs_inflight);
-    }
 
     /* If we are tearing down (global) or this device stopped streaming, stop
      * re-arming. task_run is process-global; want_stream is per-device. */
@@ -1570,6 +1579,15 @@ static esp_err_t start_streaming_locked(usb_rtlsdr_dev_t *d)
     if (err == ESP_OK) err = rtl_demod_write(d, RTL_DEMOD_SOFT_RST, RTL_DEMOD_SOFT_RST_OFF, 1);
     if (err != ESP_OK) { ESP_LOGE(TAG, "stream[%d] FAIL @demod_rst: %s", d->index, esp_err_to_name(err)); return err; }
 
+    /* 4b) RESET THE BULK ENDPOINT FIFO right before streaming — librtlsdr's
+     *     rtlsdr_reset_buffer(). Without this the bulk-IN endpoint STALLs on the
+     *     very first transfer (status 4, 0 bytes) and no IQ ever arrives (BLK=0).
+     *     Write the EP-A reset bit (0x1002) then clear it (0x0000) so the FIFO
+     *     starts empty and the endpoint is ready to source raw IQ. */
+    err = rtl_write_reg(d, RTL_USB_EPA_CTL, RTL_BLK_USB, 0x1002, 2);
+    if (err == ESP_OK) err = rtl_write_reg(d, RTL_USB_EPA_CTL, RTL_BLK_USB, 0x0000, 2);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "stream[%d] FAIL @epa_reset: %s", d->index, esp_err_to_name(err)); return err; }
+
     /* 5) Allocate (if needed) and submit the bulk URBs. */
     if (d->urb[0] == NULL) {
         err = alloc_urbs(d);
@@ -1997,12 +2015,21 @@ static void usb_task(void *arg)
     int64_t last_overflow_evt = 0;
     uint64_t last_drops_seen  = 0;
 
+    uint32_t s_hb = 0;
     while (s_ctx.task_run) {
 
         /* Pump the host library + client event loops (bounded waits). */
         uint32_t flags = 0;
         usb_host_lib_handle_events(pdMS_TO_TICKS(RTLSDR_EVENT_WAIT_MS), &flags);
         usb_host_client_handle_events(s_ctx.client, pdMS_TO_TICKS(RTLSDR_EVENT_WAIT_MS));
+
+        /* DIAG heartbeat: prove the task keeps pumping after streaming starts, and
+         * surface each device's in-flight URB count so a wedged pipe is visible. */
+        if ((++s_hb % 50u) == 0u) {
+            ESP_LOGW(TAG, "DIAG usbtask hb: dev0 state=%d inflight=%u | dev1 state=%d inflight=%u",
+                     (int)s_ctx.dev[0].state, (unsigned)s_ctx.dev[0].urbs_inflight,
+                     (int)s_ctx.dev[1].state, (unsigned)s_ctx.dev[1].urbs_inflight);
+        }
 
         /* Consume any hot-path notification (overflow/stall nudge). Non-blocking.*/
         ulTaskNotifyTake(pdTRUE, 0);
