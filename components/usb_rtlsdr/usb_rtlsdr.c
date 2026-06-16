@@ -1334,7 +1334,31 @@ static void client_event_cb(const usb_host_client_event_msg_t *msg, void *arg)
  */
 static int role_index_for_serial(const char *serial)
 {
-    /* Already mapped? Return its existing index (stable across replug). */
+    /* EMPTY-SERIAL CASE — the common one for cheap RTL-SDR sticks, which usually
+     * ship with a blank (or identical) EEPROM serial. Serial-matching CANNOT
+     * disambiguate two blank-serial dongles: the first adopts as seen_serial[0]
+     * = "", then the second strncmp-matches that same empty entry and collapses
+     * back onto index 0 — so BOTH dongles were assigned role 1090 and the 978 slot
+     * never existed (the weather pipeline could never build).
+     *
+     * For a blank serial, assign by ADOPTION ORDER instead: take the next unused
+     * map slot. This is exactly the "first-seen order" the contract promises and
+     * makes two identical blank sticks land on distinct indices (0 then 1 => 1090
+     * then 978). We still bump seen_count so the next blank stick gets the
+     * following index. (Replug stability for blank-serial sticks falls back to
+     * port-enumeration order, which is the best any serial-blind scheme can do.) */
+    if (serial == NULL || serial[0] == '\0') {
+        if (s_ctx.seen_count < (int)RTLSDR_MAX_DEVICES) {
+            int idx = s_ctx.seen_count;
+            s_ctx.seen_serial[idx][0] = '\0';   /* record a blank entry */
+            s_ctx.seen_count++;
+            return idx;
+        }
+        return -1;   /* map full */
+    }
+
+    /* NON-EMPTY SERIAL — already mapped? Return its existing index (stable across
+     * replug: a known stick regains its original role). */
     for (int i = 0; i < s_ctx.seen_count; i++) {
         if (strncmp(s_ctx.seen_serial[i], serial, sizeof(s_ctx.seen_serial[0]) - 1) == 0) {
             return i;

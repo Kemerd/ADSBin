@@ -33,6 +33,7 @@
 #include "esp_log.h"
 #include "adsbin_types.h"
 #include "adsbin_err.h"
+#include "demod1090.h"      /* live DSP counters for the RF diagnostic line */
 
 /* ───────────────────────────────────────────────────────────────────────────
  *  Sizing. One target line tops out well under this; we render into a per-sink
@@ -55,6 +56,17 @@ typedef struct {
     bool             verbose;       /**< Also dump per-message MSG lines.        */
     bool             clear_screen;  /**< Emit ANSI clear+home before each block. */
     char             line[DEBUG_LINE_MAX]; /**< Render scratch (publisher task).  */
+
+    /*
+     * Previous-cycle DSP counter snapshot, kept so the RF diagnostic line can
+     * report PER-SECOND RATES (deltas) rather than ever-growing cumulative
+     * totals. The publisher ticks at a fixed ~1 Hz cadence, so each delta is
+     * effectively "events in the last second" — the gauge a field tester reads
+     * to see the antenna catching RF the instant a 1090 signal is in range.
+     */
+    uint64_t prev_preambles;        /**< preambles_detected at last publish.     */
+    uint64_t prev_frames;           /**< frames_emitted at last publish.         */
+    bool     have_prev;             /**< False until the first snapshot is taken. */
 } sink_debug_ctx_t;
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -224,6 +236,46 @@ static esp_err_t sink_debug_publish(void *vctx, const traffic_snapshot_t *snap,
                         (unsigned)snap->count, (long long)snap->taken_us);
     if (hlen > 0) {
         sink_transport_write(ctx->transport, (const uint8_t *)ctx->line, (size_t)hlen);
+    }
+
+    /* ── Live RF diagnostic line ─────────────────────────────────────────────
+     * The single most useful field-test gauge: it tells you whether the antenna
+     * is actually catching 1090 RF, BEFORE any aircraft fully decodes. We snap
+     * the cumulative DSP counters and report PER-SECOND DELTAS:
+     *
+     *   RF PRE=<n>/s FRM=<n>/s SIG=<0..65535>
+     *
+     *   PRE  — preambles detected this second. >0 means the antenna IS hearing
+     *          Mode-S energy (the 8 µs sync). PRE=0 forever => no RF reaching the
+     *          tuner: check the antenna/connector, not the software.
+     *   FRM  — candidate frames that passed bit-slicing this second.
+     *   SIG  — magnitude of the most recent candidate's signal level (relative).
+     *
+     * Deltas (not totals) because the publisher ticks ~1 Hz, so each value reads
+     * as "events in the last second" — a live needle, not an odometer.
+     */
+    demod1090_stats_t st;
+    demod1090_get_stats(&st);
+
+    uint64_t d_pre = 0, d_frm = 0;
+    if (ctx->have_prev) {
+        // Plain unsigned subtraction; counters are monotonic so this never wraps
+        // negative under normal operation (a counter reset just yields one large
+        // delta, which is harmless for a diagnostic line).
+        d_pre = st.preambles_detected - ctx->prev_preambles;
+        d_frm = st.frames_emitted     - ctx->prev_frames;
+    }
+    ctx->prev_preambles = st.preambles_detected;
+    ctx->prev_frames    = st.frames_emitted;
+    ctx->have_prev      = true;
+
+    int rflen = snprintf(ctx->line, DEBUG_LINE_MAX,
+                         "RF PRE=%llu/s FRM=%llu/s SIG=%u\n",
+                         (unsigned long long)d_pre,
+                         (unsigned long long)d_frm,
+                         (unsigned)st.last_signal_level);
+    if (rflen > 0) {
+        sink_transport_write(ctx->transport, (const uint8_t *)ctx->line, (size_t)rflen);
     }
 
     // One line per live target, in snapshot order.
