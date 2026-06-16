@@ -110,3 +110,10 @@ CONFIG_USB_HOST_HUBS_SUPPORTED=y
 # supported topology is one hub. Per-port reset/debounce timings stay at their
 # Kconfig defaults — only revisit them if a specific stick fails to enumerate.
 CONFIG_USB_HOST_HUB_MULTI_LEVEL=y
+
+# Place USB Host DMA buffers in PSRAM. The bulk-IN URBs for raw IQ are large
+# (see RTLSDR_URB_SIZE x RTLSDR_NUM_URBS per dongle); with TWO dongles they do not
+# fit in the P4's ~640 KB internal RAM and alloc_urbs() fails with ESP_ERR_NO_MEM,
+# so streaming never starts (BLK=0). The P4 has 32 MB PSRAM and its USB DWC DMA can
+# reach it, so route the host stack's DMA-capable allocations there.
+CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=y

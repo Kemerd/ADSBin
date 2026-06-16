@@ -207,12 +207,17 @@ extern "C" {
  * scheduling hiccup without an overflow. */
 #define RTLSDR_DEFAULT_RING_BLOCKS   16u
 
-/* USB bulk transfer (URB) sizing. We keep several large transfers in flight so
- * the host controller is never starved between completions. Each URB carries a
- * multiple of the 512-byte HS bulk max-packet so short-packet handling is rare.
- * 256 KiB per URB at 4.8 MB/s drains in ~53 ms; with this many in flight the
- * pipe stays saturated even if a completion is briefly delayed. */
-#define RTLSDR_URB_SIZE              (256u * 1024u)
+/* USB bulk transfer (URB) sizing. We keep several transfers in flight so the host
+ * controller is never starved between completions. Each URB is a multiple of the
+ * 512-byte HS bulk max-packet so short-packet handling is rare.
+ *
+ * SIZED FOR THE P4'S MEMORY: the part has only ~768 KB internal RAM but up to
+ * 32 MB PSRAM. The old 256 KiB x 8 = 2 MiB PER DONGLE (4 MiB for two) could never
+ * fit internally and alloc_urbs() failed with ESP_ERR_NO_MEM => no streaming. We
+ * now use 32 KiB x 8 = 256 KiB per dongle (512 KiB for two), and the host stack's
+ * DMA buffers live in PSRAM (CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM). 32 KiB
+ * at 4.8 MB/s drains in ~6.8 ms; eight in flight keeps the pipe saturated. */
+#define RTLSDR_URB_SIZE              (32u * 1024u)
 #define RTLSDR_NUM_URBS              8u
 
 /* Maximum number of RTL-SDR dongles this driver owns at once. Slot 0 serves the
