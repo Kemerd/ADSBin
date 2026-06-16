@@ -1202,8 +1202,18 @@ static esp_err_t submit_urbs(usb_rtlsdr_dev_t *d)
      * (ESP_ERR_INVALID_STATE). So we submit ONE URB to start the stream and let
      * bulk_in_cb re-arm it on every completion to keep the bulk pipe continuously
      * fed. One in-flight URB plus the HCD's own double-buffer is enough to
-     * saturate the bulk-IN endpoint at 4.8 MB/s. */
-    const uint32_t initial_submit = 1u;
+     * saturate the bulk-IN endpoint at 4.8 MB/s.
+     *
+     * ROBUSTNESS: keep SEVERAL URBs in flight, not just one. With a single URB any
+     * transient (a STALL, a momentary error, a missed re-arm) leaves ZERO transfers
+     * queued and the stream dies permanently (BLK drops to 0 and never recovers).
+     * Submitting a small pool means one URB hiccuping doesn't starve the pipe — the
+     * others keep delivering while bulk_in_cb re-arms the failed one (or recovery
+     * runs). We submit them ONE AT A TIME through the settle-retry below (the HCD
+     * rejects back-to-back concurrent submits with ESP_ERR_INVALID_STATE, but the
+     * pump-and-retry spaces them out enough that each is accepted in turn). */
+    const uint32_t initial_submit =
+        (RTLSDR_NUM_URBS < 4u) ? RTLSDR_NUM_URBS : 4u;
     for (uint32_t i = 0; i < initial_submit; i++) {
         /* The bulk-IN pipe can still be settling immediately after the heavy
          * control-transfer bring-up (the host stack reports ESP_ERR_INVALID_STATE
