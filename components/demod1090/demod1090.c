@@ -82,6 +82,23 @@ static demod1090_ctx_t s_ctx;
 /* Bounded so stop() is responsive; long enough that we rarely spin idle.       */
 #define DEMOD_RING_WAIT_MS  20
 
+/* ── Optional hot-path cycle profiler (OFF by default) ───────────────────────
+ * Define DEMOD1090_PROFILE=1 (e.g. via a build flag) to log, once per second, the
+ * average CPU cycles spent in block_to_magnitude() vs process_magnitude() per IQ
+ * block. This is the measurement tool to decide whether the magnitude transform
+ * is worth hand-vectorizing with the P4's PIE 128-bit SIMD: if process_magnitude
+ * dwarfs block_to_magnitude (expected after the coarse pre-gate), SIMD on the
+ * magnitude buys little and the effort belongs elsewhere. Reading the RISC-V
+ * cycle CSR is a couple of instructions, so the probe is near-free even when on;
+ * compiled out entirely when off. Never enable in a shipping build. */
+#ifndef DEMOD1090_PROFILE
+#define DEMOD1090_PROFILE 0
+#endif
+
+#if DEMOD1090_PROFILE
+#include "esp_cpu.h"   /* esp_cpu_get_cycle_count() */
+#endif
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Stats helpers — every counter touch goes through the mutex so get_stats and
  *  reset_stats see a coherent picture. The hot loop only ever *increments*, so
@@ -418,13 +435,53 @@ static void process_magnitude(const uint16_t *m, uint32_t n,
     /* (Longer candidates that overrun the tail are truncated by slice_bits.)    */
     const uint32_t scan_end = n - short_span;
 
+    /* ── COARSE PRE-GATE (performance) ───────────────────────────────────────
+     * detect_preamble() is invoked at EVERY sample index, and each call does ~9
+     * fixed-point index computes + 9 magnitude loads + several compares. On quiet
+     * air the overwhelming majority of positions are noise and can be rejected by
+     * a SINGLE cheap comparison before paying for the full correlation.
+     *
+     * The gate must be STRICTLY WEAKER than detect_preamble's own checks so it can
+     * never reject a position the real detector would accept (zero recall loss).
+     *
+     * detect_preamble requires every pulse (including the first, p0) to exceed the
+     * strongest valley, and the valleys are >= 0 — so a real preamble's first
+     * pulse magnitude is well above the block's noise floor. p0 is sampled a
+     * quarter-bit into PULSE0 (t=0), which at our ~2.4 samples/µs lands within one
+     * sample of `start`. To stay provably permissive regardless of the exact
+     * rounding, the gate inspects the SMALL NEIGHBOURHOOD around the start sample
+     * (start..start+2) and keeps the position if ANY of those equals/exceeds the
+     * floor. That window strictly contains wherever p0 actually samples, so the
+     * gate can never discard a position detect_preamble would have accepted.
+     *
+     * The floor is a low fraction of the block's mean magnitude (mean/4): a genuine
+     * pulse towers over the mean, so the gate only ever drops obviously-quiet air.
+     */
+    uint64_t mag_sum = 0;
+    for (uint32_t k = 0; k < n; ++k) {
+        mag_sum += m[k];
+    }
+    const uint16_t mag_mean  = (uint16_t)(mag_sum / (n ? n : 1u));
+    const uint16_t gate_floor = (uint16_t)(mag_mean >> 2);   /* mean/4 */
+
     uint32_t j = 0;
     while (j < scan_end) {
 
         uint8_t  score = 0;
         uint16_t level = 0;
 
-        /* Cheap preamble gate. On a miss, step one sample and keep hunting.    */
+        /* Coarse pre-gate: a real preamble's first pulse sits within start..start+2.
+         * If that whole neighbourhood is down in the noise, no preamble can begin
+         * here — skip the expensive correlation. This single (≤3-load) compare
+         * eliminates the vast majority of full detect_preamble() calls on quiet air.
+         * The window strictly covers p0's sample point, so it is provably permissive.
+         */
+        if (m[j] <= gate_floor && m[j + 1] <= gate_floor && m[j + 2] <= gate_floor) {
+            ++j;
+            continue;
+        }
+
+        /* Full preamble correlation. On a miss, step one sample and keep hunting.*/
         if (!detect_preamble(m, n, j, &score, &level)) {
             ++j;
             continue;
@@ -533,10 +590,16 @@ static void demod_task(void *arg)
         s_ctx.have_seq = true;
 
         /* Convert to magnitude. On alloc failure we still must return the item.*/
+#if DEMOD1090_PROFILE
+        uint32_t prof_c0 = esp_cpu_get_cycle_count();
+#endif
         uint32_t n_samples = 0;
         if (samples && n_bytes >= 2) {
             n_samples = block_to_magnitude(samples, n_bytes);
         }
+#if DEMOD1090_PROFILE
+        uint32_t prof_c1 = esp_cpu_get_cycle_count();
+#endif
 
         /* Return the ring item NOW — we have copied everything we need into the*/
         /* scratch magnitude buffer and never retain the borrowed samples.      */
@@ -550,9 +613,27 @@ static void demod_task(void *arg)
         stats_unlock();
 
         /* Run the detector over the magnitude envelope (lock-free hot path).   */
+#if DEMOD1090_PROFILE
+        uint32_t prof_c2 = esp_cpu_get_cycle_count();
+#endif
         if (n_samples) {
             process_magnitude(s_ctx.mag, n_samples, t_cap, s_ctx.sample_rate_hz);
         }
+#if DEMOD1090_PROFILE
+        uint32_t prof_c3 = esp_cpu_get_cycle_count();
+        /* Accumulate and report once per second so the log is readable. The
+         * cycle CSR is per-core and monotonic; unsigned subtraction handles wrap. */
+        static uint64_t s_mag_cyc = 0, s_scan_cyc = 0, s_blocks = 0;
+        s_mag_cyc  += (uint32_t)(prof_c1 - prof_c0);
+        s_scan_cyc += (uint32_t)(prof_c3 - prof_c2);
+        if (++s_blocks >= 73) {   /* ~1 s of blocks at 2.4 Msps / 32 KiB URBs */
+            ESP_LOGI(TAG, "PROFILE/blk: magnitude=%llu cyc  preamble-scan=%llu cyc  (n=%llu)",
+                     (unsigned long long)(s_mag_cyc / s_blocks),
+                     (unsigned long long)(s_scan_cyc / s_blocks),
+                     (unsigned long long)s_blocks);
+            s_mag_cyc = s_scan_cyc = s_blocks = 0;
+        }
+#endif
     }
 
     /* Clean exit: signal the joiner and self-delete.                          */
