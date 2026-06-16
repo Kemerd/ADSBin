@@ -1857,21 +1857,33 @@ static void task_do_recovery(void)
             if (d->dev && d->bulk_ep && d->want_stream &&
                 d->state == USB_RTLSDR_STATE_STREAMING) {
                 lock();
-                /* Drain anything still in flight, clear a halt if present, then
-                 * re-arm. cancel_urbs halts+flushes; submit_urbs re-submits. */
+                /* Drain anything still in flight + clear a host-side halt. */
                 cancel_urbs(d);
                 if (d->dev && d->bulk_ep) {
                     usb_host_endpoint_clear(d->dev, d->bulk_ep);
                 }
-                esp_err_t rerr = submit_urbs(d);
+
+                /* CRITICAL: re-arming the HOST pipe alone does not restart a wedged
+                 * RTL2832U streaming engine — the dongle's bulk FIFO is stuck, so
+                 * the freshly re-submitted URBs just go silent again (stall→restream
+                 * loop with BLK stuck at 0). Kick the DONGLE'S side too: reset the
+                 * EP-A FIFO (the same 0x1002→0x0000 pulse stream start uses) and
+                 * pulse the demod soft-reset so the chip starts sourcing IQ afresh.
+                 * Failures here are surfaced so we escalate to a full re-enumerate. */
+                esp_err_t rerr = rtl_write_reg(d, RTL_USB_EPA_CTL, RTL_BLK_USB, 0x1002, 2);
+                if (rerr == ESP_OK) rerr = rtl_write_reg(d, RTL_USB_EPA_CTL, RTL_BLK_USB, 0x0000, 2);
+                if (rerr == ESP_OK) rerr = rtl_demod_write(d, RTL_DEMOD_SOFT_RST, RTL_DEMOD_SOFT_RST_ON, 1);
+                if (rerr == ESP_OK) rerr = rtl_demod_write(d, RTL_DEMOD_SOFT_RST, RTL_DEMOD_SOFT_RST_OFF, 1);
+                if (rerr == ESP_OK) rerr = submit_urbs(d);
                 unlock();
                 if (rerr != ESP_OK) {
-                    /* Re-arm failed — escalate to a full teardown/re-enumerate. */
+                    /* Light restream couldn't revive it — escalate to a full
+                     * teardown/re-enumerate (close the device; a NEW_DEV re-adopts). */
                     ESP_LOGW(TAG, "restream[%d] failed (%s) - escalating to recover",
                              d->index, esp_err_to_name(rerr));
                     d->do_recover = true;
                 } else {
-                    ESP_LOGI(TAG, "restream[%d]: bulk pipe re-armed in place", d->index);
+                    ESP_LOGI(TAG, "restream[%d]: dongle FIFO + bulk pipe restarted", d->index);
                 }
             }
         }
@@ -2064,6 +2076,24 @@ static void usb_task(void *arg)
         task_do_recovery();
         task_try_open_pending();
         task_apply_config();
+
+        /* TEMP: heap leak probe. Log free heap every ~10 s so we can see whether a
+         * slow leak (which would explain the "fine for ~35 min then the stream
+         * wedges" pattern as DMA allocs start failing) is shrinking memory over
+         * time. Watch internal (DMA-capable) AND total free. Remove after diagnosis. */
+        {
+            static int64_t last_heap_log = 0;
+            int64_t hnow = adsbin_now_us();
+            if (hnow - last_heap_log > 10000000) {   /* 10 s */
+                last_heap_log = hnow;
+                ESP_LOGW(TAG, "HEAP: internal=%u (min %u) | total=%u (min %u) | largest-internal-block=%u",
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                         (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_DEFAULT),
+                         (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT),
+                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+            }
+        }
 
         /* Debounced OVERFLOW event from the hot path's drop counter. Aggregate
          * drops across all in-use devices so a burst on either dongle collapses
