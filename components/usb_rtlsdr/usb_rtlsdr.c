@@ -224,6 +224,52 @@ static void ctrl_xfer_cb(usb_transfer_t *xfer)
  * @param wLength    Data-stage length in bytes (0 for no data stage).
  * @return ESP_OK, or an esp_err_t / ESP_FAIL on a non-OK transfer status.
  */
+/*
+ * Send a standard CLEAR_FEATURE(ENDPOINT_HALT) to the default control endpoint
+ * (EP0) to recover it from a STALL. Submits the raw setup packet on the device's
+ * shared control transfer and pumps to completion WITHOUT going through the
+ * STALL-recovery wrapper (no recursion). bmRequestType = OUT|STANDARD|ENDPOINT,
+ * bRequest = CLEAR_FEATURE(1), wValue = ENDPOINT_HALT(0), wIndex = EP0(0).
+ */
+static esp_err_t ctrl_unstall_ep0(usb_rtlsdr_dev_t *d)
+{
+    if (!d->dev || !d->ctrl_xfer) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    usb_transfer_t *x = d->ctrl_xfer;
+
+    usb_setup_packet_t *setup = (usb_setup_packet_t *)x->data_buffer;
+    setup->bmRequestType = USB_BM_REQUEST_TYPE_DIR_OUT |
+                           USB_BM_REQUEST_TYPE_TYPE_STANDARD |
+                           USB_BM_REQUEST_TYPE_RECIP_ENDPOINT;
+    setup->bRequest = 0x01;   /* CLEAR_FEATURE                 */
+    setup->wValue   = 0x0000; /* ENDPOINT_HALT feature selector */
+    setup->wIndex   = 0x0000; /* endpoint 0 (default control)   */
+    setup->wLength  = 0;
+
+    x->device_handle    = d->dev;
+    x->bEndpointAddress = 0;
+    x->num_bytes        = sizeof(usb_setup_packet_t);
+    x->timeout_ms       = RTLSDR_CTRL_TIMEOUT_MS;
+    x->callback         = ctrl_xfer_cb;
+    x->context          = d;
+
+    d->ctrl_complete = false;
+    if (usb_host_transfer_submit_control(s_ctx.client, x) != ESP_OK) {
+        return ESP_FAIL;
+    }
+    int64_t deadline = adsbin_now_us() + (int64_t)RTLSDR_CTRL_TIMEOUT_MS * 1000;
+    while (!d->ctrl_complete) {
+        uint32_t lib_flags = 0;
+        usb_host_lib_handle_events(pdMS_TO_TICKS(2), &lib_flags);
+        usb_host_client_handle_events(s_ctx.client, pdMS_TO_TICKS(8));
+        if (adsbin_now_us() > deadline) {
+            return ESP_ERR_TIMEOUT;
+        }
+    }
+    return (x->status == USB_TRANSFER_STATUS_COMPLETED) ? ESP_OK : ESP_FAIL;
+}
+
 static esp_err_t ctrl_xfer(usb_rtlsdr_dev_t *d, uint8_t bmReqType, uint8_t bRequest,
                            uint16_t wValue, uint16_t wIndex,
                            void *data, uint16_t wLength)
@@ -331,9 +377,12 @@ static esp_err_t ctrl_xfer(usb_rtlsdr_dev_t *d, uint8_t bmReqType, uint8_t bRequ
          * STALL is what these RTL sticks emit on the first vendor request behind a
          * hub; clearing-and-retrying is the correct recovery. */
         if (x->status == USB_TRANSFER_STATUS_STALL) {
-            esp_err_t clr = usb_host_endpoint_clear(d->dev, 0);
+            /* Recover EP0 with a standard CLEAR_FEATURE(ENDPOINT_HALT). The next
+             * retry (ctrl_xfer_retry) then re-issues the original request on a
+             * freshly-unstalled pipe. */
+            esp_err_t clr = ctrl_unstall_ep0(d);
             if (clr != ESP_OK) {
-                ESP_LOGW(TAG, "EP0 clear-halt failed: %s", esp_err_to_name(clr));
+                ESP_LOGW(TAG, "EP0 unstall failed: %s", esp_err_to_name(clr));
             }
         } else {
             ESP_LOGW(TAG, "ctrl status %d req=0x%02x", (int)x->status, (unsigned)bRequest);
@@ -395,6 +444,17 @@ static esp_err_t ctrl_xfer_retry(usb_rtlsdr_dev_t *d, uint8_t bmReqType, uint8_t
     return err;
 }
 
+/* RTL2832U vendor-request WRITE-ENABLE bit, carried in the LOW byte of wIndex.
+ *
+ * THE BUG THAT KEPT THE SDR SILENT: the RTL2832U register interface uses wIndex =
+ * (block << 8) for a READ, but (block << 8) | 0x10 for a WRITE — the 0x10 is the
+ * write-enable strobe. Our writes were sending the bare block with no 0x10, so the
+ * device STALLed every register WRITE while READs (which need no strobe) succeeded.
+ * Because the whole baseband/tuner bring-up is writes, nothing ever configured and
+ * the SDR never streamed (BLK=0) — masked all along because our only successful
+ * decode path was +INJECT, which bypasses the radio entirely. */
+#define RTL_REG_WRITE_FLAG   0x10u
+
 /** @brief Write @p len bytes (1 or 2) to RTL2832U register @p addr in @p block.*/
 static esp_err_t rtl_write_reg(usb_rtlsdr_dev_t *d, uint16_t addr, uint16_t block, uint16_t val, uint8_t len)
 {
@@ -406,7 +466,9 @@ static esp_err_t rtl_write_reg(usb_rtlsdr_dev_t *d, uint16_t addr, uint16_t bloc
         buf[0] = (uint8_t)((val >> 8) & 0xFF);
         buf[1] = (uint8_t)(val & 0xFF);
     }
-    return ctrl_xfer_retry(d, RTL_CTRL_OUT, RTL_VENDOR_REQUEST, addr, block, buf, len);
+    /* Set the write-enable strobe in wIndex (block | 0x10) — required for OUT. */
+    return ctrl_xfer_retry(d, RTL_CTRL_OUT, RTL_VENDOR_REQUEST, addr,
+                           (uint16_t)(block | RTL_REG_WRITE_FLAG), buf, len);
 }
 
 /** @brief Read @p len bytes (1 or 2) from RTL2832U register @p addr/@p block. */
@@ -476,10 +538,18 @@ static esp_err_t r820t_write(usb_rtlsdr_dev_t *d, uint8_t reg, uint8_t val)
     }
 
     /* Payload = register index then value; the I2C window addresses the slave.
-     * wValue carries the tuner I2C slave address; wIndex selects the I2C block. */
+     * wValue carries the tuner I2C slave address; wIndex selects the I2C block.
+     * Like every RTL2832U register WRITE, the I2C-window write needs the 0x10
+     * write-enable strobe in the low byte of wIndex (reads omit it). Without it
+     * the device STALLs the tuner write and r820t_init() fails — the same root
+     * cause as the baseband-block writes, just on the tuner path. We go through
+     * ctrl_xfer_retry (not rtl_write_reg) because the wValue here is the I2C slave
+     * address, not a register address. */
     uint8_t payload[2] = { reg, val };
-    return ctrl_xfer(d, RTL_CTRL_OUT, RTL_VENDOR_REQUEST,
-                     (uint16_t)R820T_I2C_ADDR, RTL_BLK_I2C, payload, sizeof(payload));
+    return ctrl_xfer_retry(d, RTL_CTRL_OUT, RTL_VENDOR_REQUEST,
+                           (uint16_t)R820T_I2C_ADDR,
+                           (uint16_t)(RTL_BLK_I2C | RTL_REG_WRITE_FLAG),
+                           payload, sizeof(payload));
 }
 
 /**
@@ -1288,10 +1358,11 @@ static esp_err_t open_device(usb_rtlsdr_dev_t *d, uint8_t addr)
      * (512 HS vs 64 FS). If the device negotiated FULL speed behind the hub but we
      * configure it as HIGH speed, the bulk FIFO setup is wrong. Log it so we can
      * see what was actually negotiated. */
-    ESP_LOGI(TAG, "adopt slot[%d]: addr=%u PORT=%u SPEED=%s vid:pid=%04x:%04x",
+    ESP_LOGI(TAG, "adopt slot[%d]: addr=%u PORT=%u SPEED=%s CFG=%u vid:pid=%04x:%04x",
              d->index, (unsigned)addr, (unsigned)d->port_num,
              (dev_speed == USB_SPEED_HIGH) ? "HIGH" :
              (dev_speed == USB_SPEED_FULL) ? "FULL" : "LOW",
+             (unsigned)uinfo.bConfigurationValue,
              (unsigned)dd->idVendor, (unsigned)dd->idProduct);
 
     /*
@@ -1313,6 +1384,21 @@ static esp_err_t open_device(usb_rtlsdr_dev_t *d, uint8_t addr)
     err = find_and_claim_bulk(d);
     if (err != ESP_OK) {
         return err;
+    }
+
+    /* Post-enumeration settle. Behind a slow Single-TT external hub the device's
+     * vendor control interface is not ready the instant enumeration completes —
+     * issuing the first vendor write too early gets STALLed, which then cascades
+     * (baseband never configures => BLK=0). Give the device a moment, pumping the
+     * host event loops so the bus keeps making progress, before the first vendor
+     * transfer. Cold path, runs once per open. */
+    {
+        int64_t settle_until = adsbin_now_us() + 100 * 1000;   /* 100 ms */
+        while (adsbin_now_us() < settle_until) {
+            uint32_t lib_flags = 0;
+            usb_host_lib_handle_events(pdMS_TO_TICKS(5), &lib_flags);
+            usb_host_client_handle_events(s_ctx.client, pdMS_TO_TICKS(5));
+        }
     }
 
     /* Probe the tuner over I2C to confirm it is an R820T/R820T2. */
