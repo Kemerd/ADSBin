@@ -91,6 +91,26 @@ static adsbin_rf_role_t s_role_override = ADSBIN_ROLE_NONE;
  * this is the wait it uses (never blocks the hot path). */
 #define RTLSDR_RING_NOWAIT     0
 
+/*
+ * Physical-port → band role binding.
+ *
+ * The two NESDR Nano sticks both report a BLANK USB serial, so identity cannot
+ * tell them apart. Instead we bind each role to the stable parent hub-PORT number
+ * (usb_device_info_t.parent.port_num), which is fixed by which physical socket a
+ * stick is soldered into. Measured on this hardware (1→4 USB expansion board off
+ * the P4 HS host): facing the USB-C port, the LEFT socket enumerates as PORT 3
+ * and the RIGHT as PORT 4. So:
+ *
+ *   PORT 3 (LEFT)  -> 1090 traffic
+ *   PORT 4 (RIGHT) -> 978  UAT weather
+ *
+ * If a dongle's port_num matches neither (unknown hub layout / port read failed),
+ * we fall back to the legacy serial/adoption-order assignment so the box still
+ * works on a different board. See README "Auto-role assignment".
+ */
+#define RTLSDR_PORT_1090   3u   /**< LEFT socket  (facing USB-C) => 1090 traffic. */
+#define RTLSDR_PORT_978    4u   /**< RIGHT socket (facing USB-C) => 978 weather.  */
+
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Small locking + event helpers.
  *
@@ -1158,6 +1178,21 @@ static esp_err_t open_device(usb_rtlsdr_dev_t *d, uint8_t addr)
     d->info.pid = dd->idProduct;
     d->info.has_bias_tee = true;     /* GPIO0 bias-tee is wired on our HW.    */
 
+    /* Read the device's parent hub PORT number — a stable physical identifier
+     * (which socket the stick is plugged into), unlike the volatile bus address.
+     * This lets us bind the 1090/978 role to a fixed solder point regardless of
+     * enumeration order or blank EEPROM serials. Logged so the operator can map
+     * each physical port to its role. */
+    usb_device_info_t uinfo;
+    if (usb_host_device_info(d->dev, &uinfo) == ESP_OK) {
+        d->port_num = uinfo.parent.port_num;
+    } else {
+        d->port_num = 0;   /* unknown (e.g. root-attached); 0 is the sentinel. */
+    }
+    ESP_LOGI(TAG, "adopt slot[%d]: addr=%u PORT=%u vid:pid=%04x:%04x",
+             d->index, (unsigned)addr, (unsigned)d->port_num,
+             (unsigned)dd->idVendor, (unsigned)dd->idProduct);
+
     /* Identity strings (best-effort; not load-bearing). */
     read_string_desc(d, dd->iProduct,      d->info.product_name, sizeof(d->info.product_name));
     read_string_desc(d, dd->iSerialNumber, d->info.serial,       sizeof(d->info.serial));
@@ -1227,20 +1262,20 @@ static esp_err_t start_streaming_locked(usb_rtlsdr_dev_t *d)
 
     /* 1) Bring the RTL2832U baseband up in raw-IQ mode. */
     err = rtl_init_baseband(d);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) { ESP_LOGE(TAG, "stream[%d] FAIL @baseband: %s", d->index, esp_err_to_name(err)); return err; }
 
     /* 2) Initialise + tune the R820T2 (under the I2C repeater). */
     err = rtl_i2c_repeater(d, true);
     if (err == ESP_OK) err = r820t_init(d);
     rtl_i2c_repeater(d, false);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) { ESP_LOGE(TAG, "stream[%d] FAIL @r820t_init: %s", d->index, esp_err_to_name(err)); return err; }
 
     /* 3) Sample rate, then frequency, then gain, then bias-tee. */
     err = rtl_set_sample_rate(d, d->sample_rate_sps);
     if (err == ESP_OK) err = configure_frequency_locked(d);
     if (err == ESP_OK) err = configure_gain_locked(d);
     if (err == ESP_OK) err = configure_bias_tee_locked(d);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) { ESP_LOGE(TAG, "stream[%d] FAIL @tune/gain: %s", d->index, esp_err_to_name(err)); return err; }
 
     /* 4) Reset the demod sample pipe so we start on a clean boundary. */
     err = rtl_demod_write(d, RTL_DEMOD_SOFT_RST, RTL_DEMOD_SOFT_RST_ON, 1);
@@ -1440,17 +1475,27 @@ static void task_try_open_pending(void)
     }
 
     /* ── ROLE ASSIGNMENT ─────────────────────────────────────────────────────
-     * Resolve the role slot by stable first-seen serial order. We capture whether
-     * this is the FIRST adopted device (seen_count == 0) BEFORE the lookup, since
-     * the override only forces the very first dongle's role. */
+     * PRIMARY: bind the band to the stable physical hub PORT, so the correctly-
+     * tuned antenna always stays on the right band no matter which stick powers up
+     * first (the two blank-serial Nanos are otherwise indistinguishable). */
     bool first_device = (s_ctx.seen_count == 0);
-    int role_idx = role_index_for_serial(d->info.serial);
-    if (role_idx < 0) {
-        role_idx = d->index;   /* map full (shouldn't happen) — fall back to slot.*/
-    }
+    adsbin_rf_role_t role;
+    bool role_by_port = true;
 
-    /* Default role: index 0 => 1090, index 1 => 978 UAT. */
-    adsbin_rf_role_t role = (role_idx == 0) ? ADSBIN_ROLE_1090 : ADSBIN_ROLE_978_UAT;
+    if (d->port_num == RTLSDR_PORT_1090) {
+        role = ADSBIN_ROLE_1090;
+    } else if (d->port_num == RTLSDR_PORT_978) {
+        role = ADSBIN_ROLE_978_UAT;
+    } else {
+        /* FALLBACK: unknown port (different hub / port read failed) — keep the box
+         * working via the legacy stable-serial / adoption-order assignment. */
+        role_by_port = false;
+        int role_idx = role_index_for_serial(d->info.serial);
+        if (role_idx < 0) {
+            role_idx = d->index;   /* map full (shouldn't happen) — fall back to slot. */
+        }
+        role = (role_idx == 0) ? ADSBIN_ROLE_1090 : ADSBIN_ROLE_978_UAT;
+    }
 
     /* Override hook: a lone dongle can be forced to 978 (or pinned to 1090). The
      * override only applies to the FIRST adopted device so a second stick still
@@ -1459,6 +1504,10 @@ static void task_try_open_pending(void)
         role = s_role_override;
     }
     d->role = role;
+
+    ESP_LOGI(TAG, "role slot[%d] = %s (by %s, PORT=%u)",
+             d->index, (role == ADSBIN_ROLE_978_UAT) ? "978-UAT" : "1090",
+             role_by_port ? "port" : "serial/order", (unsigned)d->port_num);
 
     /* Seed the slot's stream config from its role's band. Gain/ppm/bias defaults
      * were already seeded into every slot at init; the band is what differs. */

@@ -225,10 +225,15 @@ ESP32-P4 ── HS host ── [1→4 USB expansion board] ──┤
 ### Auto-role assignment (zero config)
 
 - **One dongle plugged (either port): always 1090 traffic.**
-- **Two dongles plugged: the first is 1090 traffic, the second is 978 UAT weather** (FIS-B).
-- Roles are bound to the **physical hub-port position** (so the correctly-tuned antenna stays on the
-  right band), with the dongle's USB serial recorded as a stable label. Live hotplug is supported —
-  add or pull the weather dongle while running and traffic never interrupts.
+- **Two dongles plugged: roles are bound to the physical hub-port position**, so the correctly-tuned
+  antenna always stays on the right band regardless of which dongle powers up first.
+
+> **Port convention — facing the USB-C port, the LEFT socket is 1090 (traffic) and the RIGHT socket
+> is 978 (weather).** Solder/assemble each receiver to its fixed socket and the band assignment is
+> deterministic every boot. (NESDR Nano sticks ship with a blank USB serial, so the serial cannot
+> tell two of them apart — the stable physical port number is what binds the role.)
+
+Live hotplug is supported — add or pull the weather dongle while running and traffic never interrupts.
 
 > **Antennas are band-specific.** A 1090 antenna (~68 mm) is not a 978 antenna (~77 mm); the dual-band
 > [Discovery 5 dBi bundle](https://www.nooelec.com/store/ads-b-discovery-antenna-bundle-5dbi.html)

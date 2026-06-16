@@ -66,6 +66,7 @@ typedef struct {
      */
     uint64_t prev_preambles;        /**< preambles_detected at last publish.     */
     uint64_t prev_frames;           /**< frames_emitted at last publish.         */
+    uint64_t prev_blocks;           /**< iq_blocks_consumed at last publish.     */
     bool     have_prev;             /**< False until the first snapshot is taken. */
 } sink_debug_ctx_t;
 
@@ -257,20 +258,28 @@ static esp_err_t sink_debug_publish(void *vctx, const traffic_snapshot_t *snap,
     demod1090_stats_t st;
     demod1090_get_stats(&st);
 
-    uint64_t d_pre = 0, d_frm = 0;
+    uint64_t d_pre = 0, d_frm = 0, d_blk = 0;
     if (ctx->have_prev) {
         // Plain unsigned subtraction; counters are monotonic so this never wraps
         // negative under normal operation (a counter reset just yields one large
         // delta, which is harmless for a diagnostic line).
         d_pre = st.preambles_detected - ctx->prev_preambles;
         d_frm = st.frames_emitted     - ctx->prev_frames;
+        d_blk = st.iq_blocks_consumed - ctx->prev_blocks;
     }
     ctx->prev_preambles = st.preambles_detected;
     ctx->prev_frames    = st.frames_emitted;
+    ctx->prev_blocks    = st.iq_blocks_consumed;
     ctx->have_prev      = true;
 
+    // BLK=/s is the "is the SDR actually delivering RF samples" needle: it counts
+    // IQ blocks pulled off the USB stream each second. BLK>0 => the radio is live
+    // and streaming (RF path works); BLK=0 => no samples arriving at all (USB/
+    // tuner not streaming). PRE/FRM/SIG then qualify whether those samples contain
+    // decodable 1090 energy.
     int rflen = snprintf(ctx->line, DEBUG_LINE_MAX,
-                         "RF PRE=%llu/s FRM=%llu/s SIG=%u\n",
+                         "RF BLK=%llu/s PRE=%llu/s FRM=%llu/s SIG=%u\n",
+                         (unsigned long long)d_blk,
                          (unsigned long long)d_pre,
                          (unsigned long long)d_frm,
                          (unsigned)st.last_signal_level);

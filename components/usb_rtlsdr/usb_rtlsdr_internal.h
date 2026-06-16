@@ -267,6 +267,9 @@ typedef struct {
     /* ---- USB host handles for THIS device ---- */
     usb_device_handle_t      dev;        /**< Open device (NULL if none).        */
     uint8_t                  dev_addr;   /**< Bus address of the open device.    */
+    uint8_t                  port_num;   /**< Parent hub PORT number (stable per
+                                          *   physical socket — used to bind the
+                                          *   1090/978 role to a fixed port).    */
     uint8_t                  bulk_ep;    /**< Bulk-IN endpoint address.          */
     uint16_t                 bulk_mps;   /**< Bulk-IN max packet size.           */
 
