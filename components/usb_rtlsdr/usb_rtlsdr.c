@@ -260,9 +260,39 @@ static esp_err_t ctrl_xfer(usb_rtlsdr_dev_t *d, uint8_t bmReqType, uint8_t bRequ
     /* Arm the completion flag the callback will raise. */
     d->ctrl_complete = false;
 
-    esp_err_t err = usb_host_transfer_submit_control(s_ctx.client, x);
+    /*
+     * SUBMIT with bounded retry on ESP_ERR_NOT_FINISHED.
+     *
+     * The ESP-IDF USB host SERIALIZES all control transfers to a device's EP0
+     * (and, on a shared root port, the control path is shared across devices). A
+     * submit issued while another control transfer is still in flight returns
+     * ESP_ERR_NOT_FINISHED — it was NOT queued. The original code treated that as
+     * a hard failure and returned, so the very first baseband write aborted and
+     * the SDR never streamed (the cause of BLK=0 with two dongles).
+     *
+     * The documented-correct handling: pump the CLIENT event loop (only the
+     * client — never usb_host_lib_handle_events() re-entrantly, which corrupts the
+     * HCD's transfer parsing and asserts in hcd_dwc.c) so the in-flight control
+     * transfer completes and frees EP0, then re-submit. We re-submit ONLY because
+     * the prior attempt was rejected (never queued), so there is no risk of
+     * double-queuing our own transfer. Bounded by the same timeout window.
+     */
+    esp_err_t err = ESP_ERR_NOT_FINISHED;
+    int64_t submit_deadline = adsbin_now_us() + (int64_t)RTLSDR_CTRL_TIMEOUT_MS * 1000;
+    for (;;) {
+        err = usb_host_transfer_submit_control(s_ctx.client, x);
+        if (err != ESP_ERR_NOT_FINISHED) {
+            break;   /* accepted (ESP_OK) or a hard, non-busy error. */
+        }
+        if (adsbin_now_us() > submit_deadline) {
+            break;   /* EP0 never freed within the bound — give up. */
+        }
+        /* EP0 busy with a serialized transfer: pump the client loop so its
+         * completion callback runs and frees the pipe, then retry the submit. */
+        usb_host_client_handle_events(s_ctx.client, pdMS_TO_TICKS(2));
+    }
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "ctrl submit failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "ctrl submit failed: %s (req=0x%02x)", esp_err_to_name(err), (unsigned)bRequest);
         return err;
     }
 
@@ -1280,17 +1310,18 @@ static esp_err_t start_streaming_locked(usb_rtlsdr_dev_t *d)
     /* 4) Reset the demod sample pipe so we start on a clean boundary. */
     err = rtl_demod_write(d, RTL_DEMOD_SOFT_RST, RTL_DEMOD_SOFT_RST_ON, 1);
     if (err == ESP_OK) err = rtl_demod_write(d, RTL_DEMOD_SOFT_RST, RTL_DEMOD_SOFT_RST_OFF, 1);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) { ESP_LOGE(TAG, "stream[%d] FAIL @demod_rst: %s", d->index, esp_err_to_name(err)); return err; }
 
     /* 5) Allocate (if needed) and submit the bulk URBs. */
     if (d->urb[0] == NULL) {
         err = alloc_urbs(d);
-        if (err != ESP_OK) { free_urbs(d); return err; }
+        if (err != ESP_OK) { ESP_LOGE(TAG, "stream[%d] FAIL @alloc_urbs: %s", d->index, esp_err_to_name(err)); free_urbs(d); return err; }
     }
     d->block_seq = 0;
     d->want_stream = true;
     err = submit_urbs(d);
     if (err != ESP_OK) {
+        ESP_LOGE(TAG, "stream[%d] FAIL @submit_urbs: %s", d->index, esp_err_to_name(err));
         d->want_stream = false;
         return err;
     }
