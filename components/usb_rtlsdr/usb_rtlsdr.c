@@ -2038,6 +2038,17 @@ static void usb_task(void *arg)
     int64_t last_overflow_evt = 0;
     uint64_t last_drops_seen  = 0;
 
+    /* ── Stream-progress watchdog state ──────────────────────────────────────
+     * A SILENT bulk stall (the URB stays "in flight" but its completion interrupt
+     * stops firing — no STALL, no error callback, nothing) cannot be caught by the
+     * completion-callback recovery hooks, because the callback never runs. The only
+     * way to detect it is to watch forward progress: each delivered IQ block bumps
+     * d->block_seq. If a device is STREAMING yet its block_seq hasn't moved for a
+     * couple of seconds, the pipe is wedged — force a light restream to re-arm it.
+     * Per-device last-seen seq + the timestamp we last saw it advance. */
+    uint32_t wd_last_seq[RTLSDR_MAX_DEVICES] = {0};
+    int64_t  wd_last_progress_us[RTLSDR_MAX_DEVICES] = {0};
+
     while (s_ctx.task_run) {
 
         /* Pump the host library + client event loops (bounded waits). */
@@ -2069,6 +2080,36 @@ static void usb_task(void *arg)
             last_drops_seen   = drops;
             /* The aggregate event is not slot-specific; report slot 0. */
             emit_event(0, USB_RTLSDR_EVENT_OVERFLOW);
+        }
+
+        /* ── Stream-progress watchdog ────────────────────────────────────────
+         * Catch a SILENT bulk stall (URB stuck in flight, completion IRQ stopped)
+         * that the callback-based recovery can never see. For each device that is
+         * meant to be streaming, if its delivered-block sequence has not advanced
+         * for STALL_TIMEOUT, force a light restream to re-arm the pipe in place. */
+        const int64_t STREAM_STALL_TIMEOUT_US = 2000000;   /* 2 s of no progress */
+        for (int i = 0; i < (int)RTLSDR_MAX_DEVICES; i++) {
+            usb_rtlsdr_dev_t *d = &s_ctx.dev[i];
+            bool streaming = (d->state == USB_RTLSDR_STATE_STREAMING) && d->want_stream;
+            if (!streaming) {
+                /* Not streaming — reset the watchdog baseline so a (re)start isn't
+                 * instantly flagged as stalled. */
+                wd_last_seq[i] = d->block_seq;
+                wd_last_progress_us[i] = now;
+                continue;
+            }
+            if (d->block_seq != wd_last_seq[i]) {
+                /* Forward progress — note it and move the deadline. */
+                wd_last_seq[i] = d->block_seq;
+                wd_last_progress_us[i] = now;
+            } else if ((now - wd_last_progress_us[i]) > STREAM_STALL_TIMEOUT_US) {
+                /* No blocks delivered for 2 s while streaming => silent stall.
+                 * Kick a light restream and reset the deadline so we don't spam
+                 * restreams faster than they can take effect. */
+                ESP_LOGW(TAG, "stream[%d] silently stalled (no IQ for 2s) - restreaming", d->index);
+                d->do_restream = true;
+                wd_last_progress_us[i] = now;
+            }
         }
 
         /* Yield a tick so the Core-0 IDLE task runs and the task watchdog is fed.
