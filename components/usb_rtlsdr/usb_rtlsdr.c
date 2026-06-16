@@ -376,6 +376,8 @@ static esp_err_t ctrl_xfer(usb_rtlsdr_dev_t *d, uint8_t bmReqType, uint8_t bRequ
          * (address 0) here so the caller's retry can succeed on a fresh pipe. The
          * STALL is what these RTL sticks emit on the first vendor request behind a
          * hub; clearing-and-retrying is the correct recovery. */
+        ESP_LOGW(TAG, "DIAG2 ctrl status=%d req=0x%02x wValue=0x%04x wIndex=0x%04x",
+                 (int)x->status, (unsigned)bRequest, (unsigned)wValue, (unsigned)wIndex);
         if (x->status == USB_TRANSFER_STATUS_STALL) {
             /* Recover EP0 with a standard CLEAR_FEATURE(ENDPOINT_HALT). The next
              * retry (ctrl_xfer_retry) then re-issues the original request on a
@@ -384,8 +386,6 @@ static esp_err_t ctrl_xfer(usb_rtlsdr_dev_t *d, uint8_t bmReqType, uint8_t bRequ
             if (clr != ESP_OK) {
                 ESP_LOGW(TAG, "EP0 unstall failed: %s", esp_err_to_name(clr));
             }
-        } else {
-            ESP_LOGW(TAG, "ctrl status %d req=0x%02x", (int)x->status, (unsigned)bRequest);
         }
         return ESP_FAIL;
     }
@@ -496,12 +496,44 @@ static esp_err_t rtl_demod_write(usb_rtlsdr_dev_t *d, uint16_t paged_addr, uint1
 {
     uint8_t page   = (uint8_t)(paged_addr >> RTL_DEMOD_PAGE_SHIFT);
     uint8_t offset = (uint8_t)(paged_addr & RTL_DEMOD_OFF_MASK);
-    /* DEMOD block selector in wIndex high byte, page in the low byte. */
-    uint16_t windex = (uint16_t)(RTL_BLK_DEMOD | page);
-    /* Demod register addresses are byte offsets within the page; the datasheet
-     * shifts the offset up by 8 for the on-wire address word. */
-    uint16_t waddr  = (uint16_t)(offset << 8) | 0x20u;
-    return rtl_write_reg(d, waddr, windex, val, len);
+
+    /* Demod-block WRITE wire format (matches librtlsdr rtlsdr_demod_write_reg
+     * exactly): wValue = (offset << 8) | 0x20, wIndex = 0x10 | page. The 0x10 is
+     * the write-enable strobe; the 0x20 in the low byte of wValue is the demod
+     * address framing. The value goes MSB-first for the 2-byte case. */
+    uint16_t waddr  = (uint16_t)((offset << 8) | 0x20u);
+    uint16_t windex = (uint16_t)(RTL_REG_WRITE_FLAG | page);
+
+    uint8_t buf[2];
+    if (len == 1) {
+        buf[0] = (uint8_t)(val & 0xFF);
+    } else {
+        buf[0] = (uint8_t)((val >> 8) & 0xFF);
+        buf[1] = (uint8_t)(val & 0xFF);
+    }
+    esp_err_t e = ctrl_xfer_retry(d, RTL_CTRL_OUT, RTL_VENDOR_REQUEST, waddr, windex, buf, len);
+
+    /*
+     * MANDATORY DEMOD FLUSH — the fix that finally let the SDR stream.
+     *
+     * The RTL2832U runs an internal 8051 that services the demod register block.
+     * After EVERY demod-block write you MUST issue a dummy READ of demod page 0x0A
+     * register 0x01; this is a hardware flush/sync. Omitting it leaves the demod
+     * controller wedged so the NEXT control transfer STALLs (status 4) — which is
+     * precisely why our I2C-repeater enable (the first demod write) appeared to
+     * STALL while plain USB/SYS-block writes were fine. librtlsdr does this dummy
+     * read after every demod write for the same reason.
+     *
+     * Read wire format: wValue = (0x01 << 8) | 0x20 = 0x0120, wIndex = page 0x0A,
+     * len 1 (no write strobe — it is an IN transfer). The value is discarded; we
+     * only care about the bus transaction completing the flush. We do not fail the
+     * write on a flush-read hiccup — the write itself is what matters.
+     */
+    uint8_t flush[1] = {0};
+    (void)ctrl_xfer_retry(d, RTL_CTRL_IN, RTL_VENDOR_REQUEST,
+                          (uint16_t)((0x01u << 8) | 0x20u), (uint16_t)0x0Au, flush, 1);
+
+    return e;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -517,7 +549,11 @@ static esp_err_t rtl_demod_write(usb_rtlsdr_dev_t *d, uint16_t paged_addr, uint1
 static esp_err_t rtl_i2c_repeater(usb_rtlsdr_dev_t *d, bool on)
 {
     uint16_t v = on ? RTL_DEMOD_IIC_REPEAT_ON : RTL_DEMOD_IIC_REPEAT_OFF;
-    return rtl_demod_write(d, RTL_DEMOD_IIC_REPEAT, v, 1);
+    esp_err_t e = rtl_demod_write(d, RTL_DEMOD_IIC_REPEAT, v, 1);
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "DIAG i2c_repeater(%d) FAILED: %s", (int)on, esp_err_to_name(e));
+    }
+    return e;
 }
 
 /**
@@ -778,7 +814,11 @@ static esp_err_t r820t_init(usb_rtlsdr_dev_t *d)
 
     /* Push every writable register (0x05..0x1F) in ascending order. */
     for (uint8_t r = R820T_WRITE_START; r < R820T_NUM_REGS; r++) {
-        err |= r820t_write(d, r, d->r82_shadow[r]);
+        esp_err_t werr = r820t_write(d, r, d->r82_shadow[r]);
+        if (werr != ESP_OK) {
+            ESP_LOGW(TAG, "DIAG r820t_write reg=0x%02x FAILED: %s", r, esp_err_to_name(werr));
+        }
+        err |= werr;
     }
 
     return (err == ESP_OK) ? ESP_OK : ESP_FAIL;
