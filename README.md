@@ -127,6 +127,71 @@ Supporting components: `config` (NVS-backed settings), `ownship` (optional refer
 `status` (LEDs + internal die-temperature watchdog), `common` (the shared type contract every
 component compiles against). Full design rationale: [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md).
 
+> **Core split with two dongles.** With a single dongle the whole RX+DSP path lives on Core 0. Add
+> the weather dongle and the **978 UAT demodulator moves to Core 1** — one demod per core. Two
+> full-rate demods (~4.8 MB/s of raw I/Q each) on one core saturate it completely; splitting them
+> keeps both cores under 100% so interrupts, the C6 Wi-Fi RPC, and decode/serve all still run.
+
+---
+
+## How the RTL-SDR actually comes up on the ESP32-P4
+
+There is no `librtlsdr` here — the P4 *is* the USB host, and the RTL2832U + R820T2 are driven from a
+clean-room driver (`components/usb_rtlsdr`) over raw USB control transfers. Getting a commodity dongle
+to stream raw I/Q from a microcontroller host turns out to need a precise sequence that the desktop
+world hides inside a library. This section documents what the chip actually wants, because every step
+below was a real wall we hit — and it's the kind of thing you only find by reading a logic trace.
+
+**The dongle is a dumb radio. The host configures everything.** An RTL-SDR has no idea what frequency
+to tune or what rate to sample — the firmware programs it on every start over vendor control transfers
+to the RTL2832U, which in turn reaches the R820T2 tuner across an on-chip I²C window.
+
+The bring-up order that works (and why each step matters):
+
+1. **Register WRITES carry a `0x10` write-enable strobe in `wIndex`; READS do not.** The RTL2832U
+   register interface uses `wIndex = (block << 8)` for a read but `(block << 8) | 0x10` for a write.
+   Miss the strobe and the device STALLs *every* write while reads succeed — so the chip looks alive
+   (you can read its ID) but nothing you configure ever takes.
+
+2. **Power the demodulator before touching its register block.** Write `DEMOD_CTL_1 = 0x22` then
+   `DEMOD_CTL = 0xe8` (system block), then pulse the demod soft-reset. Until the demod core is powered
+   and out of reset, every demod-block access STALLs.
+
+3. **Every demod-block write must be followed by a dummy read of page `0x0A`, register `0x01`.** The
+   RTL2832U runs an internal 8051 to service the demod block; that dummy read is a mandatory
+   hardware flush/sync. Skip it and the *next* control transfer STALLs. (`librtlsdr` does this read
+   after every demod write for the same reason — it's easy to miss because it looks pointless.)
+
+4. **The R820T2's I²C address is the 8-bit form `0x34`** (7-bit `0x1A` shifted left), not `0x1A`.
+   Address it wrong and the RTL2832U dutifully STALLs every tuner write.
+
+5. **Enable the raw-I/Q data path explicitly.** A powered, tuned chip still routes *nothing* to the
+   USB FIFO until you enable SDR mode and the zero-IF / IQ datapath (demod page 0 reg `0x19`, page 0
+   reg `0x06`, page 1 reg `0xb1`, page 0 reg `0x0d`). Without these the bulk endpoint has no data and
+   the IN transfer simply never completes.
+
+6. **Reset the bulk endpoint FIFO right before streaming** (`USB_EPA_CTL` ← `0x1002` then `0x0000`),
+   and program `USB_EPA_MAXPKT` with the literal `0x0002` the chip expects — not the decimal max-packet
+   size. Get the FIFO/MPS wrong and the endpoint returns useless 2-byte dribbles instead of full bulk
+   transfers.
+
+On the **host** side, the P4's USB stack has its own requirements:
+
+- **Bulk DMA buffers can live in PSRAM** (`CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM`). Two dongles'
+  worth of in-flight I/Q won't fit the P4's ~640 KB of internal SRAM; the 32 MB PSRAM does, and the
+  DWC USB DMA can reach it.
+- **The HCD double-buffers each pipe (depth 2).** Submit *one* bulk URB to start the stream and re-arm
+  it in the completion callback; trying to queue many at once just trips `ESP_ERR_INVALID_STATE`.
+- **Blank-serial dongles are told apart by physical hub port.** The cheap sticks ship with an empty
+  EEPROM serial, so the band role (1090 vs 978) is bound to the parent hub *port number*, not the
+  serial — solder each receiver to a fixed socket and the assignment is deterministic forever.
+- **Bring the Wi-Fi SoftAP up *before* the SDRs start streaming.** The C6 Wi-Fi co-processor is reached
+  by RPC over the same SDIO/CPU the RX path hammers; start the AP while the bus is quiet, then unleash
+  the radios, or the RPC hangs and the access point never appears.
+
+The payoff: a $23 microcontroller hosting two USB High-Speed software-defined radios and doing the DSP
+that usually wants a laptop — with no `librtlsdr`, no PC, and no cloud.
+
 ---
 
 ## Bill of materials
