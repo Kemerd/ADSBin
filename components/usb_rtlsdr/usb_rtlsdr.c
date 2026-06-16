@@ -360,24 +360,18 @@ static esp_err_t ctrl_xfer(usb_rtlsdr_dev_t *d, uint8_t bmReqType, uint8_t bRequ
         usb_host_lib_handle_events(pdMS_TO_TICKS(2), &lib_flags);
         usb_host_client_handle_events(s_ctx.client, pdMS_TO_TICKS(8));
         if (adsbin_now_us() > deadline) {
-            ESP_LOGW(TAG, "DIAG ctrl TIMEOUT (never completed) req=0x%02x wValue=0x%04x", (unsigned)bRequest, (unsigned)wValue);
+            ESP_LOGW(TAG, "ctrl transfer timed out (req=0x%02x)", (unsigned)bRequest);
             return ESP_ERR_TIMEOUT;
         }
     }
 
     if (x->status != USB_TRANSFER_STATUS_COMPLETED) {
         /*
-         * A control transfer that completes with STALL halts the device's EP0 — and
-         * per the USB host API, "once halted, the endpoint must be cleared using
-         * usb_host_endpoint_clear() before it can communicate again." We were never
-         * clearing it, so the FIRST vendor write (RTL_USB_SYSCTL) STALLed and every
-         * subsequent control transfer then STALLed too: baseband config never
-         * completed and the SDR never streamed (BLK=0). Clet the halt on EP0
-         * (address 0) here so the caller's retry can succeed on a fresh pipe. The
-         * STALL is what these RTL sticks emit on the first vendor request behind a
-         * hub; clearing-and-retrying is the correct recovery. */
-        ESP_LOGW(TAG, "DIAG2 ctrl status=%d req=0x%02x wValue=0x%04x wIndex=0x%04x",
-                 (int)x->status, (unsigned)bRequest, (unsigned)wValue, (unsigned)wIndex);
+         * A control transfer that completes with STALL halts the device's EP0. Per
+         * the USB spec the halt must be cleared (CLEAR_FEATURE(ENDPOINT_HALT))
+         * before the endpoint can communicate again, so we recover EP0 here and let
+         * the caller's retry (ctrl_xfer_retry) re-issue on a fresh pipe. Non-STALL
+         * statuses are surfaced as a plain failure. */
         if (x->status == USB_TRANSFER_STATUS_STALL) {
             /* Recover EP0 with a standard CLEAR_FEATURE(ENDPOINT_HALT). The next
              * retry (ctrl_xfer_retry) then re-issues the original request on a
@@ -810,11 +804,7 @@ static esp_err_t r820t_init(usb_rtlsdr_dev_t *d)
 
     /* Push every writable register (0x05..0x1F) in ascending order. */
     for (uint8_t r = R820T_WRITE_START; r < R820T_NUM_REGS; r++) {
-        esp_err_t werr = r820t_write(d, r, d->r82_shadow[r]);
-        if (werr != ESP_OK) {
-            ESP_LOGW(TAG, "DIAG r820t_write reg=0x%02x FAILED: %s", r, esp_err_to_name(werr));
-        }
-        err |= werr;
+        err |= r820t_write(d, r, d->r82_shadow[r]);
     }
 
     return (err == ESP_OK) ? ESP_OK : ESP_FAIL;
@@ -1174,9 +1164,6 @@ static void bulk_in_cb(usb_transfer_t *xfer)
 /** @brief Allocate the device's bulk-IN URB pool (call once it is open). */
 static esp_err_t alloc_urbs(usb_rtlsdr_dev_t *d)
 {
-    ESP_LOGW(TAG, "DIAG alloc_urbs[%d]: bulk_ep=0x%02x bulk_mps=%u urb_size=%u num_urbs=%u",
-             d->index, (unsigned)d->bulk_ep, (unsigned)d->bulk_mps,
-             (unsigned)RTLSDR_URB_SIZE, (unsigned)RTLSDR_NUM_URBS);
     for (uint32_t i = 0; i < RTLSDR_NUM_URBS; i++) {
         usb_transfer_t *x = NULL;
         esp_err_t err = usb_host_transfer_alloc(RTLSDR_URB_SIZE, 0, &x);
@@ -1191,11 +1178,6 @@ static esp_err_t alloc_urbs(usb_rtlsdr_dev_t *d)
         x->num_bytes        = RTLSDR_URB_SIZE;
         x->timeout_ms       = 0;            /* bulk-IN: no per-transfer timeout. */
         d->urb[i]           = x;
-        if (i == 0) {
-            ESP_LOGW(TAG, "DIAG urb[0]: data_buffer=%p num_bytes=%u dev_hdl=%p ep=0x%02x",
-                     (void *)x->data_buffer, (unsigned)x->num_bytes,
-                     (void *)x->device_handle, (unsigned)x->bEndpointAddress);
-        }
     }
     return ESP_OK;
 }
@@ -1214,13 +1196,13 @@ static void free_urbs(usb_rtlsdr_dev_t *d)
 /** @brief Submit every URB to start the device's continuous bulk-IN stream. */
 static esp_err_t submit_urbs(usb_rtlsdr_dev_t *d)
 {
-    ESP_LOGW(TAG, "DIAG submit_urbs[%d]: state=%d dev=%p ep=0x%02x mps=%u",
-             d->index, (int)d->state, (void *)d->dev,
-             (unsigned)d->bulk_ep, (unsigned)d->bulk_mps);
     d->urbs_inflight = 0;
-    /* DIAG: the HCD double-buffers (NUM_BUFFERS=2) and rejects a second concurrent
-     * submit while the pipe is mid command-processing. Submit a SMALL initial
-     * batch and let bulk_in_cb re-arm each on completion to keep the pipe fed. */
+    /* The HCD double-buffers each pipe (NUM_BUFFERS=2) and rejects a second
+     * concurrent submit while the pipe is still mid command-processing
+     * (ESP_ERR_INVALID_STATE). So we submit ONE URB to start the stream and let
+     * bulk_in_cb re-arm it on every completion to keep the bulk pipe continuously
+     * fed. One in-flight URB plus the HCD's own double-buffer is enough to
+     * saturate the bulk-IN endpoint at 4.8 MB/s. */
     const uint32_t initial_submit = 1u;
     for (uint32_t i = 0; i < initial_submit; i++) {
         /* The bulk-IN pipe can still be settling immediately after the heavy
@@ -1247,18 +1229,12 @@ static esp_err_t submit_urbs(usb_rtlsdr_dev_t *d)
             vTaskDelay(1);
         }
         if (err != ESP_OK) {
-            ESP_LOGE(TAG, "DIAG URB %u submit failed after %d attempts: %s (buf=%p nbytes=%u)",
-                     i, attempts, esp_err_to_name(err),
-                     (void *)d->urb[i]->data_buffer, (unsigned)d->urb[i]->num_bytes);
+            ESP_LOGE(TAG, "URB %u submit failed after %d attempts: %s",
+                     i, attempts, esp_err_to_name(err));
             return err;
-        }
-        if (i == 0) {
-            ESP_LOGW(TAG, "DIAG URB 0 submitted OK after %d attempts", attempts);
         }
         d->urbs_inflight++;
     }
-    ESP_LOGW(TAG, "DIAG submit_urbs[%d]: ALL %u submitted, inflight=%u",
-             d->index, (unsigned)RTLSDR_NUM_URBS, (unsigned)d->urbs_inflight);
     return ESP_OK;
 }
 

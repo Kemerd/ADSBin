@@ -405,11 +405,16 @@ static void build_978_pipeline(void)
         return;
     }
 
-    // Init + start the 978 demod on Core 0 (it reads the 978 ring, emits UAT
-    // frames + uplinks). Uses the UAT defaults (978 MHz, 2.4 Msps, sync_max 4).
+    // Init + start the 978 demod. It is pinned to ADSBIN_CORE_DECODE (Core 1),
+    // NOT Core 0, to BALANCE THE DSP LOAD ACROSS BOTH RISC-V CORES. Core 0 already
+    // runs the USB RX task AND the 1090 demod (each consuming ~4.8 MB/s of raw IQ);
+    // adding the equally heavy 978 demod there saturated Core 0 so completely that
+    // interrupts starved and the box silently reset. Moving 978 to Core 1 (which
+    // runs decode/CPR/traffic/sinks) spreads the two demods one-per-core so neither
+    // core is pinned at 100%. The 978 ring is lock-free, so cross-core is safe.
     const demod978_config_t dcfg978 = {
         .sample_rate_hz  = UAT_SAMPLE_RATE_HZ,
-        .task_core_id    = ADSBIN_CORE_DSP,
+        .task_core_id    = ADSBIN_CORE_DECODE,
         .task_priority   = ADSBIN_PRIO_DEMOD978,
         .task_stack_size = 0,     // component default
         .sync_max_errors = 0,     // 0 => component default (4)
@@ -935,6 +940,32 @@ esp_err_t adsbin_app_start(void)
         usb_rtlsdr_set_role_override(drv);
     }
 
+    /* ── Bring the C6 Wi-Fi SoftAP up BEFORE the SDRs start streaming ───────────
+     * The esp-hosted RPC bring-up of the C6 SoftAP shares the SDIO transport and
+     * CPU with the USB-RX + demod path. If both RTL-SDRs are already streaming at
+     * ~4.8 MB/s when wifi_link_start_ap() issues its RPCs, the call HANGS (the C6
+     * coprocessor RPC never completes) and the "ADSBin" AP never appears — so a
+     * tablet can never connect. Doing it here, while the bus is quiet, lets the AP
+     * come up cleanly; the SDRs then start a moment later. The UDP GDL90 transport
+     * is still created later (§5b) once the pipeline + sinks exist. Best-effort:
+     * any failure is non-fatal, exactly as the original §5b block. */
+    uint32_t sink_map_early = cfg.sink_map;
+    if (sink_map_early == ADSBIN_SINK_NONE) {
+        sink_map_early = ADSBIN_SINK_DEBUG | ADSBIN_SINK_GDL90 | ADSBIN_SINK_WIFI;
+    }
+    if (sink_map_early & ADSBIN_SINK_WIFI) {
+        const wifi_link_ap_cfg_t apcfg_early = {
+            .ssid        = CONFIG_ADSBIN_AP_SSID,
+            .channel     = CONFIG_ADSBIN_AP_CHANNEL,
+            .max_clients = CONFIG_ADSBIN_AP_MAX_CLIENTS,
+        };
+        esp_err_t werr = wifi_link_start_ap(&apcfg_early);
+        if (werr != ESP_OK) {
+            ESP_LOGW(TAG, "early wifi_link_start_ap failed (%s) - WiFi disabled, "
+                          "wired path unaffected", esp_err_to_name(werr));
+        }
+    }
+
     // Register the lifecycle callback that drives LIVE hotplug of the 978/weather
     // pipeline: a weather dongle plugged/pulled while running stands the path up or
     // tears it down without ever interrupting 1090 traffic.
@@ -1110,6 +1141,10 @@ esp_err_t adsbin_app_start(void)
             .channel     = CONFIG_ADSBIN_AP_CHANNEL,
             .max_clients = CONFIG_ADSBIN_AP_MAX_CLIENTS,
         };
+        /* Idempotent: the AP was already brought up early (before streaming) to
+         * avoid the C6-RPC hang; this returns ESP_OK without re-initialising. We
+         * still call it so a board where the early attempt was skipped/failed gets
+         * a second chance, then build the UDP transport on top. */
         esp_err_t werr = wifi_link_start_ap(&apcfg);
         if (werr != ESP_OK) {
             // C6 link down / esp-hosted not ready: drop the whole WiFi path but
