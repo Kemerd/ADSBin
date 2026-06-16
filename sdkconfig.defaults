@@ -117,3 +117,11 @@ CONFIG_USB_HOST_HUB_MULTI_LEVEL=y
 # so streaming never starts (BLK=0). The P4 has 32 MB PSRAM and its USB DWC DMA can
 # reach it, so route the host stack's DMA-capable allocations there.
 CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=y
+
+# The 1090 + 978 demod tasks are hard-real-time DSP pinned to Core 0 and
+# INTENTIONALLY saturate it when both bands stream (~4.8 MB/s each). That starves
+# the Core-0 IDLE task, which trips the (non-panic) task watchdog with harmless
+# but noisy "IDLE0 did not reset" warnings. Stop the WDT from watching Core 0's
+# idle task — its saturation is by design. Core 1 (housekeeping/decode) is left
+# checked so a genuine Core-1 hang is still caught.
+# CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0 is not set

@@ -2015,21 +2015,12 @@ static void usb_task(void *arg)
     int64_t last_overflow_evt = 0;
     uint64_t last_drops_seen  = 0;
 
-    uint32_t s_hb = 0;
     while (s_ctx.task_run) {
 
         /* Pump the host library + client event loops (bounded waits). */
         uint32_t flags = 0;
         usb_host_lib_handle_events(pdMS_TO_TICKS(RTLSDR_EVENT_WAIT_MS), &flags);
         usb_host_client_handle_events(s_ctx.client, pdMS_TO_TICKS(RTLSDR_EVENT_WAIT_MS));
-
-        /* DIAG heartbeat: prove the task keeps pumping after streaming starts, and
-         * surface each device's in-flight URB count so a wedged pipe is visible. */
-        if ((++s_hb % 50u) == 0u) {
-            ESP_LOGW(TAG, "DIAG usbtask hb: dev0 state=%d inflight=%u | dev1 state=%d inflight=%u",
-                     (int)s_ctx.dev[0].state, (unsigned)s_ctx.dev[0].urbs_inflight,
-                     (int)s_ctx.dev[1].state, (unsigned)s_ctx.dev[1].urbs_inflight);
-        }
 
         /* Consume any hot-path notification (overflow/stall nudge). Non-blocking.*/
         ulTaskNotifyTake(pdTRUE, 0);
@@ -2056,6 +2047,14 @@ static void usb_task(void *arg)
             /* The aggregate event is not slot-specific; report slot 0. */
             emit_event(0, USB_RTLSDR_EVENT_OVERFLOW);
         }
+
+        /* Yield a tick so the Core-0 IDLE task runs and the task watchdog is fed.
+         * Once real IQ flows at ~4.8 MB/s, usb_host_client_handle_events() always
+         * has work pending and returns immediately, so without this explicit yield
+         * the pump loop never blocks and IDLE0 starves (task_wdt on IDLE0). One
+         * tick is negligible against the bulk cadence but guarantees forward
+         * progress for lower-priority work. */
+        vTaskDelay(1);
     }
 
     s_ctx.task_alive = false;
