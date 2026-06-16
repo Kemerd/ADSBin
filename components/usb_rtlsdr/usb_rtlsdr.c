@@ -296,21 +296,48 @@ static esp_err_t ctrl_xfer(usb_rtlsdr_dev_t *d, uint8_t bmReqType, uint8_t bRequ
         return err;
     }
 
-    /* Pump the client event loop until the completion callback raises the flag,
-     * bounded so a wedged endpoint cannot hang the task. Each iteration is a
-     * short blocking wait inside the host stack, which is where the callback
-     * actually runs — so this drives our own completion. */
+    /* Pump the event loops until the completion callback raises the flag, bounded
+     * so a wedged endpoint cannot hang the task.
+     *
+     * CRITICAL: we run ON the usb_task, the SAME task whose outer loop normally
+     * calls usb_host_lib_handle_events(). While we spin here that outer loop is
+     * blocked — so if we pump ONLY the client loop, the LIBRARY-level event
+     * processing that actually drives transfer completion never runs, the control
+     * transfer never completes, and EP0 deadlocks (every later submit then returns
+     * ESP_ERR_NOT_FINISHED — the exact BLK=0 failure). So we must pump the lib loop
+     * here too. We do this in the COMPLETION-WAIT (each pass blocks on a real wait,
+     * giving the HCD time to make progress) — never in a tight submit-retry spin,
+     * which is what previously corrupted the HCD transfer parser. */
     int64_t deadline = adsbin_now_us() + (int64_t)(RTLSDR_CTRL_TIMEOUT_MS + 200) * 1000;
     while (!d->ctrl_complete) {
-        usb_host_client_handle_events(s_ctx.client, pdMS_TO_TICKS(10));
+        uint32_t lib_flags = 0;
+        usb_host_lib_handle_events(pdMS_TO_TICKS(2), &lib_flags);
+        usb_host_client_handle_events(s_ctx.client, pdMS_TO_TICKS(8));
         if (adsbin_now_us() > deadline) {
-            ESP_LOGW(TAG, "ctrl transfer timed out");
+            ESP_LOGW(TAG, "DIAG ctrl TIMEOUT (never completed) req=0x%02x wValue=0x%04x", (unsigned)bRequest, (unsigned)wValue);
             return ESP_ERR_TIMEOUT;
         }
     }
 
     if (x->status != USB_TRANSFER_STATUS_COMPLETED) {
-        ESP_LOGW(TAG, "ctrl status %d", (int)x->status);
+        /*
+         * A control transfer that completes with STALL halts the device's EP0 — and
+         * per the USB host API, "once halted, the endpoint must be cleared using
+         * usb_host_endpoint_clear() before it can communicate again." We were never
+         * clearing it, so the FIRST vendor write (RTL_USB_SYSCTL) STALLed and every
+         * subsequent control transfer then STALLed too: baseband config never
+         * completed and the SDR never streamed (BLK=0). Clet the halt on EP0
+         * (address 0) here so the caller's retry can succeed on a fresh pipe. The
+         * STALL is what these RTL sticks emit on the first vendor request behind a
+         * hub; clearing-and-retrying is the correct recovery. */
+        if (x->status == USB_TRANSFER_STATUS_STALL) {
+            esp_err_t clr = usb_host_endpoint_clear(d->dev, 0);
+            if (clr != ESP_OK) {
+                ESP_LOGW(TAG, "EP0 clear-halt failed: %s", esp_err_to_name(clr));
+            }
+        } else {
+            ESP_LOGW(TAG, "ctrl status %d req=0x%02x", (int)x->status, (unsigned)bRequest);
+        }
         return ESP_FAIL;
     }
 
@@ -332,6 +359,42 @@ static esp_err_t ctrl_xfer(usb_rtlsdr_dev_t *d, uint8_t bmReqType, uint8_t bRequ
  *  the RTL2832U datasheet — not librtlsdr code.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/*
+ * Per-register-access retry count.
+ *
+ * A device behind an EXTERNAL HUB occasionally NAKs a vendor control transfer
+ * during bring-up (the hub adds latency/jitter the controller doesn't always
+ * absorb on the first try). Because rtl_init_baseband() / the tuner config OR all
+ * their writes together (`err |= ...`), a SINGLE transient NAK failed the entire
+ * sequence and the SDR never streamed (BLK=0). Retrying each individual register
+ * access a few times absorbs those transient faults — every register touch goes
+ * through rtl_write_reg/rtl_read_reg, so this one spot hardens the whole bring-up.
+ * Only the cold start/stop/config paths hit this; the hot IQ path never does.
+ */
+#define RTLSDR_REG_RETRIES   4
+
+/** @brief Issue one vendor control transfer with bounded retry on transient fault.*/
+static esp_err_t ctrl_xfer_retry(usb_rtlsdr_dev_t *d, uint8_t bmReqType, uint8_t bRequest,
+                                 uint16_t wValue, uint16_t wIndex,
+                                 void *data, uint16_t wLength)
+{
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 0; attempt < RTLSDR_REG_RETRIES; attempt++) {
+        err = ctrl_xfer(d, bmReqType, bRequest, wValue, wIndex, data, wLength);
+        if (err == ESP_OK) {
+            return ESP_OK;
+        }
+        /* INVALID_STATE means the device is gone — no point retrying. Anything
+         * else (TIMEOUT / FAIL / NOT_FINISHED) is a transient hub/EP0 hiccup; give
+         * the bus a brief moment and try the whole transfer again. */
+        if (err == ESP_ERR_INVALID_STATE) {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    return err;
+}
+
 /** @brief Write @p len bytes (1 or 2) to RTL2832U register @p addr in @p block.*/
 static esp_err_t rtl_write_reg(usb_rtlsdr_dev_t *d, uint16_t addr, uint16_t block, uint16_t val, uint8_t len)
 {
@@ -343,14 +406,14 @@ static esp_err_t rtl_write_reg(usb_rtlsdr_dev_t *d, uint16_t addr, uint16_t bloc
         buf[0] = (uint8_t)((val >> 8) & 0xFF);
         buf[1] = (uint8_t)(val & 0xFF);
     }
-    return ctrl_xfer(d, RTL_CTRL_OUT, RTL_VENDOR_REQUEST, addr, block, buf, len);
+    return ctrl_xfer_retry(d, RTL_CTRL_OUT, RTL_VENDOR_REQUEST, addr, block, buf, len);
 }
 
 /** @brief Read @p len bytes (1 or 2) from RTL2832U register @p addr/@p block. */
 static esp_err_t rtl_read_reg(usb_rtlsdr_dev_t *d, uint16_t addr, uint16_t block, uint16_t *out, uint8_t len)
 {
     uint8_t buf[2] = {0, 0};
-    esp_err_t err = ctrl_xfer(d, RTL_CTRL_IN, RTL_VENDOR_REQUEST, addr, block, buf, len);
+    esp_err_t err = ctrl_xfer_retry(d, RTL_CTRL_IN, RTL_VENDOR_REQUEST, addr, block, buf, len);
     if (err != ESP_OK) {
         return err;
     }
@@ -1214,18 +1277,37 @@ static esp_err_t open_device(usb_rtlsdr_dev_t *d, uint8_t addr)
      * enumeration order or blank EEPROM serials. Logged so the operator can map
      * each physical port to its role. */
     usb_device_info_t uinfo;
+    usb_speed_t dev_speed = USB_SPEED_FULL;
     if (usb_host_device_info(d->dev, &uinfo) == ESP_OK) {
         d->port_num = uinfo.parent.port_num;
+        dev_speed   = uinfo.speed;
     } else {
         d->port_num = 0;   /* unknown (e.g. root-attached); 0 is the sentinel. */
     }
-    ESP_LOGI(TAG, "adopt slot[%d]: addr=%u PORT=%u vid:pid=%04x:%04x",
+    /* Speed matters: the RTL2832U's bulk endpoint max-packet differs by speed
+     * (512 HS vs 64 FS). If the device negotiated FULL speed behind the hub but we
+     * configure it as HIGH speed, the bulk FIFO setup is wrong. Log it so we can
+     * see what was actually negotiated. */
+    ESP_LOGI(TAG, "adopt slot[%d]: addr=%u PORT=%u SPEED=%s vid:pid=%04x:%04x",
              d->index, (unsigned)addr, (unsigned)d->port_num,
+             (dev_speed == USB_SPEED_HIGH) ? "HIGH" :
+             (dev_speed == USB_SPEED_FULL) ? "FULL" : "LOW",
              (unsigned)dd->idVendor, (unsigned)dd->idProduct);
 
-    /* Identity strings (best-effort; not load-bearing). */
-    read_string_desc(d, dd->iProduct,      d->info.product_name, sizeof(d->info.product_name));
-    read_string_desc(d, dd->iSerialNumber, d->info.serial,       sizeof(d->info.serial));
+    /*
+     * Identity STRING descriptors are intentionally NOT read here.
+     *
+     * On these cheap RTL-SDR sticks the GET_DESCRIPTOR(string) control transfer
+     * frequently NAKs/never completes right after enumeration, and because the
+     * ESP-IDF USB host does NOT honour control-transfer timeouts (the timeout_ms
+     * field is ignored — the transfer stays in flight), that single hung request
+     * WEDGES the device's EP0: every later control transfer then returns
+     * ESP_ERR_NOT_FINISHED and the tuner/baseband bring-up never runs (=> the SDR
+     * never streams, BLK=0). The strings are best-effort and not load-bearing —
+     * the serial is blank on these units anyway and the band role is now bound to
+     * the physical USB PORT, not the serial — so we simply skip them. d->info was
+     * already memset to zero above, leaving product_name/serial as empty strings.
+     */
 
     /* Claim the bulk interface + locate the bulk-IN endpoint. */
     err = find_and_claim_bulk(d);
