@@ -1122,14 +1122,17 @@ static void bulk_in_cb(usb_transfer_t *xfer)
         return;
 
     case USB_TRANSFER_STATUS_STALL:
-        /* Endpoint stalled. Count it and ask the housekeeping task to recover;
-         * do not re-arm until the stall is cleared. */
+        /* Endpoint stalled — the device is STILL PRESENT, the bulk pipe just
+         * halted. Ask the housekeeping task for a LIGHT restream (clear the halt +
+         * re-submit URBs in place) rather than a full close-and-re-enumerate: a
+         * transient stall does not produce a NEW_DEV event, so a full teardown
+         * would wait forever and the stream would die permanently. */
         lock();
         d->stats.usb_stall_count++;
         d->last_error = ADSBIN_ERR_USB_STALL;
         unlock();
         d->urbs_inflight--;
-        d->do_recover = true;
+        d->do_restream = true;
         if (s_ctx.task) {
             xTaskNotify(s_ctx.task, 0, eNoAction);
         }
@@ -1145,12 +1148,15 @@ static void bulk_in_cb(usb_transfer_t *xfer)
         break;
     }
 
-    /* Re-arm this URB to keep the bulk pipe saturated. If the resubmit fails
-     * (device gone mid-flight) retire the URB and request recovery. */
+    /* Re-arm this URB to keep the bulk pipe saturated. If the resubmit fails the
+     * device is usually still present (a transient pipe state), so ask for the
+     * LIGHT restream rather than a full teardown — this is the path that, with a
+     * single in-flight URB, used to silently kill the stream forever once the lone
+     * re-arm failed. The restream re-submits the URB pool in place. */
     esp_err_t err = usb_host_transfer_submit(xfer);
     if (err != ESP_OK) {
         d->urbs_inflight--;
-        d->do_recover = true;
+        d->do_restream = true;
         if (s_ctx.task) {
             xTaskNotify(s_ctx.task, 0, eNoAction);
         }
@@ -1204,16 +1210,13 @@ static esp_err_t submit_urbs(usb_rtlsdr_dev_t *d)
      * fed. One in-flight URB plus the HCD's own double-buffer is enough to
      * saturate the bulk-IN endpoint at 4.8 MB/s.
      *
-     * ROBUSTNESS: keep SEVERAL URBs in flight, not just one. With a single URB any
-     * transient (a STALL, a momentary error, a missed re-arm) leaves ZERO transfers
-     * queued and the stream dies permanently (BLK drops to 0 and never recovers).
-     * Submitting a small pool means one URB hiccuping doesn't starve the pipe — the
-     * others keep delivering while bulk_in_cb re-arms the failed one (or recovery
-     * runs). We submit them ONE AT A TIME through the settle-retry below (the HCD
-     * rejects back-to-back concurrent submits with ESP_ERR_INVALID_STATE, but the
-     * pump-and-retry spaces them out enough that each is accepted in turn). */
-    const uint32_t initial_submit =
-        (RTLSDR_NUM_URBS < 4u) ? RTLSDR_NUM_URBS : 4u;
+     * We submit ONE URB here to start the stream. Submitting MORE back-to-back at
+     * init starves the second dongle's bring-up (the HCD rejects concurrent submits
+     * with ESP_ERR_INVALID_STATE and the per-URB settle-retry then spins for up to
+     * its deadline EACH, stalling the whole init). One URB starts cleanly; the
+     * bulk_in_cb re-arm keeps it flowing. (Resilience against a transient stall is
+     * handled by recovery on the usb_task, not by a fat init-time URB pool.) */
+    const uint32_t initial_submit = 1u;
     for (uint32_t i = 0; i < initial_submit; i++) {
         /* The bulk-IN pipe can still be settling immediately after the heavy
          * control-transfer bring-up (the host stack reports ESP_ERR_INVALID_STATE
@@ -1602,6 +1605,7 @@ static void stop_streaming_locked(usb_rtlsdr_dev_t *d)
         return;
     }
     d->want_stream = false;
+    d->do_restream = false;   /* a stop supersedes any pending light-restream */
     cancel_urbs(d);
     d->state = (d->dev) ? USB_RTLSDR_STATE_OPEN_IDLE
                         : USB_RTLSDR_STATE_NO_DEVICE;
@@ -1840,10 +1844,43 @@ static void task_do_recovery(void)
 {
     for (int i = 0; i < (int)RTLSDR_MAX_DEVICES; i++) {
         usb_rtlsdr_dev_t *d = &s_ctx.dev[i];
+
+        /* ── LIGHT restream: device still present, bulk pipe stalled/halted ──────
+         * Clear the endpoint halt and re-submit the URB pool IN PLACE, without
+         * closing the device or waiting for a re-enumeration. This is what keeps a
+         * long-running stream alive across the transient bulk faults that, with a
+         * single in-flight URB, otherwise dropped urbs_inflight to 0 permanently
+         * (BLK stuck at 0). Only attempt it while we still hold the device and
+         * streaming is intended; otherwise fall through to the full path. */
+        if (d->do_restream) {
+            d->do_restream = false;
+            if (d->dev && d->bulk_ep && d->want_stream &&
+                d->state == USB_RTLSDR_STATE_STREAMING) {
+                lock();
+                /* Drain anything still in flight, clear a halt if present, then
+                 * re-arm. cancel_urbs halts+flushes; submit_urbs re-submits. */
+                cancel_urbs(d);
+                if (d->dev && d->bulk_ep) {
+                    usb_host_endpoint_clear(d->dev, d->bulk_ep);
+                }
+                esp_err_t rerr = submit_urbs(d);
+                unlock();
+                if (rerr != ESP_OK) {
+                    /* Re-arm failed — escalate to a full teardown/re-enumerate. */
+                    ESP_LOGW(TAG, "restream[%d] failed (%s) - escalating to recover",
+                             d->index, esp_err_to_name(rerr));
+                    d->do_recover = true;
+                } else {
+                    ESP_LOGI(TAG, "restream[%d]: bulk pipe re-armed in place", d->index);
+                }
+            }
+        }
+
         if (!d->do_recover) {
             continue;
         }
-        d->do_recover = false;
+        d->do_recover  = false;
+        d->do_restream = false;   /* full teardown supersedes a light restream */
 
         /* Capture "were we (meant to be) streaming?" BEFORE we mutate state —
          * both the live STREAMING state and the latched want_stream count, so a

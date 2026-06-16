@@ -303,7 +303,15 @@ typedef struct {
     /* ---- per-device lifecycle ---- */
     volatile usb_rtlsdr_state_t state;   /**< Liveness state machine.            */
     volatile bool    want_stream;        /**< Streaming requested for THIS dev.  */
-    volatile bool    do_recover;         /**< Recovery requested by callback.    */
+    volatile bool    do_recover;         /**< FULL recovery (device gone): close +
+                                          *   wait for re-enumeration.            */
+    volatile bool    do_restream;        /**< LIGHT recovery (device still present,
+                                          *   bulk pipe just stalled/halted): clear
+                                          *   the halt and re-submit URBs in place,
+                                          *   WITHOUT closing the device. Fixes the
+                                          *   long-run stream stall where a transient
+                                          *   bulk fault dropped urbs_inflight to 0
+                                          *   and nothing ever restarted it.       */
 
     /* ---- deferred runtime-tune requests (set by Core-1 set_*; applied by the
      *      single usb_task so ALL USB I/O stays on one task). Each bit asks the
