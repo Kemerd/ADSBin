@@ -120,12 +120,17 @@ static const char *TAG = "status";
 
 /*
  * Bounds for the internal temperature sensor's measurement range. The ESP32-P4
- * sensor is configured for a range bracket; this generous window keeps the best
- * accuracy band over the temperatures a fanless box realistically reaches while
- * still capturing a cold-boot in winter.
+ * sensor calibrates ONE range bracket at install time, and the driver rejects a
+ * span it can't fit a single bracket to: the old -10..110 window (120° wide)
+ * tripped temperature_sensor_choose_best_range() -> "Out of testing range" and
+ * disabled the watchdog every boot.
+ *
+ * 0..100 fits a supported bracket and still covers everything a fanless box
+ * realistically reaches; we lose only sub-zero readings, which the warn/crit
+ * thermal logic never cares about anyway.
  */
-#define STATUS_TSENS_RANGE_MIN_C         (-10)
-#define STATUS_TSENS_RANGE_MAX_C         (110)
+#define STATUS_TSENS_RANGE_MIN_C         (0)
+#define STATUS_TSENS_RANGE_MAX_C         (100)
 
 /* ───────────────────────────────────────────────────────────────────────────
  *  Per-LED render state

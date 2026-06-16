@@ -60,7 +60,20 @@ static const char *TAG = "gps_pps";
  *  Capture + discipline tuning
  * ─────────────────────────────────────────────────────────────────────────── */
 
-#define PPS_TIMER_RES_HZ      80000000ULL   /**< 80 MHz => 12.5 ns/tick.          */
+/*
+ * GPTimer capture resolution.
+ *
+ * The GPTimer divides its source clock by (source_hz / resolution_hz), and the
+ * ESP32-P4 timer HAL asserts that divider lies in [2, 65536]
+ * (timer_ll_set_clock_prescale). On the P4, GPTIMER_CLK_SRC_DEFAULT runs at
+ * 80 MHz, so a requested 80 MHz resolution yields divider == 1 and PANICS the
+ * chip at gptimer_new_timer() — taking the whole box into a reboot loop.
+ *
+ * 40 MHz keeps the divider at its legal minimum of 2 while still giving 25 ns/
+ * tick capture quantization — far below the u-blox MAX-M10S ~10 ns PPS sawtooth,
+ * so PPS phase precision is unaffected.
+ */
+#define PPS_TIMER_RES_HZ      40000000ULL   /**< 40 MHz => 25 ns/tick (divider 2). */
 
 /* Interval acceptance window around 1.000000 s, in capture ticks. Wider while
  * acquiring (the clock is still coarse), tight once locked. */
