@@ -73,6 +73,38 @@ the `main` debug console (see the parallel-build plan).
 
 ---
 
+## 4. `+STATUS` console command (manufacturing QC unit-status query)
+
+Lets the QC bench (`tools/bench/qc_gui.py`) ask a freshly-built unit for a single
+self-status line — SDR dongle liveness, die temperature, coarse health, and GPS
+ladder rung — so an operator can confirm a unit works at a glance on the line.
+
+- **Request** (host → device), one per line:
+  ```
+  +STATUS
+  ```
+- **Response** (device → host), exactly one line:
+  ```
+  === ADSBIN STATUS DONGLES=<n> PRESENT=<0|1> STREAMING=<0|1> TEMP=<c> PEAK=<c> HEALTH=<word> GPS=<word> GPSFIX=<0|1> ===
+  ```
+
+### Token rules
+- The line is keyed by the literal prefix `=== ADSBIN STATUS `. All tokens are
+  **always present** (fixed field set), space-separated `KEY=VALUE`.
+- Value formats:
+  - `DONGLES`  : integer count of adopted RTL-SDR dongles (`usb_rtlsdr_active_count`).
+  - `PRESENT`  : `1` if a dongle is enumerated, else `0`.
+  - `STREAMING`: `1` if the dongle is delivering IQ, else `0`.
+  - `TEMP`     : live die temperature, °C, one decimal. `nan` ⇒ no sample yet.
+  - `PEAK`     : worst-case die temperature since boot, °C. `nan` ⇒ never sampled.
+  - `HEALTH`   : one of `OK` / `NO_DONGLE` / `OVERTEMP`.
+  - `GPS`      : ladder rung — `NONE` / `FREE_RUNNING` / `NMEA_FIX` / `HOLDOVER` /
+                 `DISCIPLINED` (matches `clock_quality_t`).
+  - `GPSFIX`   : `1` if a valid GPS ownship fix is live, else `0`.
+- A non-finite `TEMP`/`PEAK` (`nan`/`inf`) means "no data"; the host shows `--`.
+
+---
+
 ## 3. GDL90 framing constants (must match `gdl90_encoder.h`)
 
 | Constant | Value | Meaning |

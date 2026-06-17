@@ -43,6 +43,7 @@
 #include <stdint.h>
 #include <inttypes.h>   // PRIX32 / PRIu32 for portable 32-bit log formatting
 #include <string.h>
+#include <math.h>       // NAN / isnan() for the +STATUS temperature tokens
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -655,11 +656,116 @@ static bool role_handle_line(const char *line)
 }
 
 /**
+ * @brief Map a clock_quality_t rung to its short wire token.
+ *
+ * Kept tiny and local so the +STATUS line emits a stable, parser-friendly word
+ * for each GPS ladder rung rather than a bare integer the host would have to map.
+ */
+static const char *gps_quality_token(clock_quality_t q)
+{
+    switch (q) {
+    case CLOCK_QUALITY_DISCIPLINED: return "DISCIPLINED";
+    case CLOCK_QUALITY_HOLDOVER:    return "HOLDOVER";
+    case CLOCK_QUALITY_NMEA_FIX:    return "NMEA_FIX";
+    case CLOCK_QUALITY_FREE_RUNNING:return "FREE_RUNNING";
+    case CLOCK_QUALITY_NONE:
+    default:                        return "NONE";
+    }
+}
+
+/**
+ * @brief Map a status_health_t to its short wire token.
+ *
+ * The health enum is internal to the status component (no public getter), so we
+ * derive the wire value from the same observable inputs the LED logic uses: the
+ * dongle liveness and the over-temp condition. This keeps the +STATUS HEALTH
+ * token honest without adding a new status-component accessor.
+ */
+static const char *health_token(bool device_present, bool overtemp)
+{
+    if (overtemp)        return "OVERTEMP";
+    if (!device_present) return "NO_DONGLE";
+    return "OK";
+}
+
+/**
+ * @brief Handle the "+STATUS" console verb — emit one frozen unit-status line.
+ *
+ * @details
+ *   The QC bench (tools/bench/qc_gui.py) sends "+STATUS" and reads back a single
+ *   "=== ADSBIN STATUS ... ===" line so a manufacturing operator can see, at a
+ *   glance, whether a freshly-built unit is healthy: SDR dongle presence/stream,
+ *   die temperature (live + peak, for the §7 no-fan decision), coarse health, and
+ *   GPS ladder rung / fix. Every field is read through an EXISTING public accessor
+ *   — no new component state — so this verb is a pure observer and never perturbs
+ *   the decode path. The grammar is frozen in WIRE_CONTRACT.md §4.
+ *
+ * @param line  The received console line.
+ * @return true if the line was a +STATUS command (handled); false otherwise.
+ */
+static bool status_handle_line(const char *line)
+{
+    // Exact-prefix match; tolerate a trailing argument-free token only.
+    if (strncmp(line, "+STATUS", 7) != 0) {
+        return false;
+    }
+
+    /* ── SDR dongle liveness ─────────────────────────────────────────────────
+     * device_present / streaming come straight from the driver's liveness
+     * snapshot; active_count tells the operator how many sticks were adopted. */
+    usb_rtlsdr_status_t ust = (usb_rtlsdr_status_t){0};
+    (void)usb_rtlsdr_get_status(&ust);
+    int dongles = usb_rtlsdr_active_count();
+
+    /* ── Die temperature (live + peak) ───────────────────────────────────────
+     * status_get_temperature() returns INVALID_STATE before the first sample; we
+     * flag that as NAN-on-the-wire so the host shows "--" rather than a fake 0. */
+    float temp_c = NAN;
+    (void)status_get_temperature(&temp_c);     // leaves temp_c = NAN if no sample
+    float peak_c = status_get_peak_temperature();
+
+    // Over-temp is inferred from the live reading vs the status component's
+    // critical threshold. That threshold is private to status.c, so we mirror its
+    // documented default (95 °C) here for the QC readout; the component's own
+    // hysteretic watchdog remains the authority that actually latches OVERTEMP.
+    const float STATUS_QC_CRIT_C = 95.0f;
+    bool overtemp = (!isnan(temp_c) && temp_c >= STATUS_QC_CRIT_C);
+
+    /* ── GPS ladder snapshot ─────────────────────────────────────────────────
+     * Wait-free seqlock read; quality NONE on a board with no GPS wired. */
+    gps_clock_t gps = (gps_clock_t){0};
+    (void)gps_clock_get(&gps);
+
+    /* ── Render the one frozen line (WIRE_CONTRACT.md §4) ─────────────────────
+     * TEMP/PEAK emit "nan" (printf's NAN spelling) when unsampled; the host
+     * parser treats a non-finite value as "no data". All other tokens are always
+     * present so the host can rely on a fixed field set. */
+    char buf[200];
+    int n = snprintf(buf, sizeof(buf),
+                     "=== ADSBIN STATUS "
+                     "DONGLES=%d PRESENT=%d STREAMING=%d "
+                     "TEMP=%.1f PEAK=%.1f HEALTH=%s "
+                     "GPS=%s GPSFIX=%d ===\n",
+                     dongles,
+                     (int)ust.device_present,
+                     (int)ust.streaming,
+                     (double)temp_c,
+                     (double)peak_c,
+                     health_token(ust.device_present, overtemp),
+                     gps_quality_token(gps.quality),
+                     (int)gps.has_ownship_fix);
+    if (n > 0) {
+        inject_reply(buf);
+    }
+    return true;
+}
+
+/**
  * @brief Parse and execute one fully-received console line.
  *
- * Recognises "+INJECT <hex>" and "+ROLE <auto|1090|978>"; anything else is
- * ignored silently (the line may simply be ESP-IDF console traffic). On a valid
- * frame it builds a ::modes_frame_t and pushes it to the decode path.
+ * Recognises "+INJECT <hex>", "+ROLE <auto|1090|978>" and "+STATUS"; anything
+ * else is ignored silently (the line may simply be ESP-IDF console traffic). On a
+ * valid frame it builds a ::modes_frame_t and pushes it to the decode path.
  *
  * @param line  NUL-terminated line with the trailing CR/LF already stripped.
  */
@@ -667,6 +773,11 @@ static void inject_handle_line(char *line)
 {
     // The +ROLE verb (single-dongle role override for staged weather testing).
     if (role_handle_line(line)) {
+        return;
+    }
+
+    // The +STATUS verb (manufacturing QC unit-status query). Pure observer.
+    if (status_handle_line(line)) {
         return;
     }
 
