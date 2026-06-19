@@ -120,16 +120,23 @@ static const char *TAG = "status";
 
 /*
  * Bounds for the internal temperature sensor's measurement range. The ESP32-P4
- * sensor calibrates ONE range bracket at install time, and the driver rejects a
- * span it can't fit a single bracket to: the old -10..110 window (120° wide)
- * tripped temperature_sensor_choose_best_range() -> "Out of testing range" and
- * disabled the watchdog every boot.
+ * sensor calibrates ONE range bracket at install time, and the driver requires
+ * the requested [min,max] to fit ENTIRELY INSIDE a single predefined bracket
+ * (temperature_sensor.c: range_min >= bracket.min && range_max <= bracket.max).
  *
- * 0..100 fits a supported bracket and still covers everything a fanless box
- * realistically reaches; we lose only sub-zero readings, which the warn/crit
- * thermal logic never cares about anyway.
+ * The P4's predefined brackets (esp_hal_ana_conv/esp32p4/temperature_sensor_periph.c)
+ * are, by [min,max]: [50,125] [20,100] [-10,80] [-30,50] [-40,20]. A span must sit
+ * within ONE of these — it is NOT enough to merely overlap the union. The old
+ * 0..100 window straddled the [-10,80] and [20,100] brackets (0 < 20 and 100 > 80),
+ * so it fit NEITHER and tripped temperature_sensor_choose_best_range() ->
+ * "Out of testing range", disabling the watchdog every boot.
+ *
+ * 20..100 fits the [20,100] bracket exactly. A fanless ESP32-P4 box idles well
+ * above 20 °C and we only ever care about the WARN/CRIT (80/95 °C) end, so the
+ * 20 °C floor costs us nothing the thermal logic uses, while 100 °C comfortably
+ * covers the hottest the die realistically reaches.
  */
-#define STATUS_TSENS_RANGE_MIN_C         (0)
+#define STATUS_TSENS_RANGE_MIN_C         (20)
 #define STATUS_TSENS_RANGE_MAX_C         (100)
 
 /* ───────────────────────────────────────────────────────────────────────────

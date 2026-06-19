@@ -52,6 +52,7 @@ from typing import Dict, List, Optional
 
 import tkinter as tk
 from tkinter import font as tkfont
+from tkinter import ttk
 
 # Reuse the existing, tested bench modules — no protocol logic is duplicated here.
 import cdc_link
@@ -129,6 +130,22 @@ class GuiState:
     checks: List[CheckResult] = field(default_factory=list)
     live: LiveSnapshot = field(default_factory=LiveSnapshot)
 
+    # ── Port-picker support ──────────────────────────────────────────────────
+    # The dropdown needs to know every serial port the OS sees (so the operator
+    # can pick one when auto-detect is ambiguous), which one looks like an ADSBin
+    # unit, and which port (if any) is currently forced.
+    ports: List["PortChoice"] = field(default_factory=list)
+    forced_port: Optional[str] = None   # the operator's manual selection, or None
+    auto_ambiguous: bool = False        # >1 (or 0) ADSBin candidates => can't auto-pick
+
+
+@dataclass
+class PortChoice:
+    """One serial port offered in the manual picker dropdown."""
+    device: str             # OS port name, e.g. "COM6".
+    label: str              # Human label shown in the dropdown.
+    is_adsbin: bool         # True if its VID:PID matches a known ADSBin device.
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  Worker thread — owns ALL serial I/O. Communicates with the UI only by pushing
@@ -147,9 +164,11 @@ class QcWorker(threading.Thread):
                  port: Optional[str] = None) -> None:
         super().__init__(name="qc-worker", daemon=True)
         self._out = out_queue
-        self._forced_port = port            # explicit --port, or None to auto-detect
+        self._lock = threading.Lock()       # guards _forced_port across threads
+        self._forced_port = port            # explicit --port / manual pick / None
         self._stop = threading.Event()
         self._rerun = threading.Event()     # operator pressed "Run again"
+        self._reconnect = threading.Event() # operator picked a different port
         self._state = GuiState()
 
     # ── public control (called from the UI thread) ─────────────────────────────
@@ -158,9 +177,28 @@ class QcWorker(threading.Thread):
         """Ask the worker to re-run the QC sweep on its next loop."""
         self._rerun.set()
 
+    def set_port(self, device: Optional[str]) -> None:
+        """
+        Force the worker to use a specific serial port (or None for auto-detect).
+
+        Called from the UI thread when the operator picks a port from the dropdown
+        and hits Connect. We stash it under the lock and flag a reconnect so the
+        worker drops any current link and re-opens on the chosen port immediately,
+        rather than waiting out its current session.
+        """
+        with self._lock:
+            self._forced_port = device
+            self._reconnect.set()
+
     def stop(self) -> None:
         """Signal the worker to exit at the next opportunity."""
         self._stop.set()
+        self._reconnect.set()   # wake any wait() so teardown is prompt
+
+    def _wanted_port(self) -> Optional[str]:
+        """Thread-safe read of the currently forced port."""
+        with self._lock:
+            return self._forced_port
 
     # ── snapshot publishing ────────────────────────────────────────────────────
 
@@ -184,6 +222,9 @@ class QcWorker(threading.Thread):
                 status=self._state.live.status,
                 status_supported=self._state.live.status_supported,
             ),
+            ports=[PortChoice(p.device, p.label, p.is_adsbin) for p in self._state.ports],
+            forced_port=self._state.forced_port,
+            auto_ambiguous=self._state.auto_ambiguous,
         )
         self._out.put(snap)
 
@@ -239,22 +280,74 @@ class QcWorker(threading.Thread):
             self._set(connected=False, phase="searching",
                       message="Device disconnected — waiting for a unit…")
 
+    def _refresh_ports(self) -> List[cdc_link.PortInfo]:
+        """
+        Re-enumerate serial ports and publish the dropdown list + auto verdict.
+
+        Keeps the manual picker's choices live (a unit plugged in mid-session
+        appears without a restart) and tells the UI whether auto-detect can pick
+        a single ADSBin device or needs the operator to choose.
+        """
+        infos = cdc_link.list_ports()
+
+        # Build the dropdown choices. A friendly label puts the ADSBin tag and the
+        # OS description next to the port name so COM6 vs COM3 is obvious.
+        choices: List[PortChoice] = []
+        for p in infos:
+            tag = "  [ADSBin]" if p.is_adsbin else ""
+            desc = f" — {p.description}" if p.description else ""
+            choices.append(PortChoice(p.device, f"{p.device}{desc}{tag}", p.is_adsbin))
+
+        # Auto-detect is "ambiguous" (needs a manual pick) when there isn't exactly
+        # one ADSBin-flagged candidate — i.e. zero, or several (your COM6 unit plus
+        # another USB-serial device showing an ESP-ish VID).
+        candidates = [c for c in choices if c.is_adsbin]
+        self._state.ports = choices
+        self._state.auto_ambiguous = len(candidates) != 1
+        self._state.forced_port = self._wanted_port()
+        return infos
+
     def _wait_for_port(self) -> Optional[str]:
-        """Block until an ADSBin port appears (or stop), returning its name."""
+        """
+        Block until a usable port is available (or stop), returning its name.
+
+        Resolution order each tick:
+          1. A manually-forced port (from the dropdown) — used the moment it exists.
+          2. Otherwise auto-detect, but ONLY when exactly one ADSBin device is
+             present. When it's ambiguous we keep listing ports and ask the operator
+             to pick one, instead of spinning forever on a guess we can't make.
+        """
         self._set(phase="searching", message="Searching for an ADSBin unit on USB…")
         while not self._stop.is_set():
-            # An explicit port short-circuits detection but still waits for it to
-            # actually exist, so "Run before plugging in" behaves sanely.
-            if self._forced_port:
-                names = [p.device for p in cdc_link.list_ports()]
-                if self._forced_port in names:
-                    return self._forced_port
-            else:
+            self._reconnect.clear()
+            infos = self._refresh_ports()
+            names = [p.device for p in infos]
+            forced = self._wanted_port()
+
+            # 1) Manual pick wins — wait for it to actually enumerate, then use it.
+            if forced:
+                if forced in names:
+                    return forced
+                self._set(phase="searching",
+                          message=f"Waiting for {forced} to appear…")
+            # 2) Auto-detect only when unambiguous.
+            elif not self._state.auto_ambiguous:
                 auto = cdc_link.auto_detect_port()
                 if auto:
                     return auto
-            if self._stop.wait(0.8):
-                return None
+            else:
+                # Ambiguous: tell the operator to choose from the dropdown.
+                n = sum(1 for c in self._state.ports if c.is_adsbin)
+                if n == 0:
+                    msg = "No ADSBin unit auto-detected — plug one in, or pick a port below."
+                else:
+                    msg = (f"{n} candidate ports found — auto-detect can't choose. "
+                           "Pick your unit's port below and hit Connect.")
+                self._set(phase="searching", message=msg)
+
+            # Wake early if the operator picks a port; otherwise re-poll at ~1 Hz.
+            if self._reconnect.wait(0.8):
+                continue
         return None
 
     def _run_session(self, link: cdc_link.CdcLink) -> None:
@@ -272,6 +365,12 @@ class QcWorker(threading.Thread):
         # ── LIVE MONITOR ─────────────────────────────────────────────────────
         self._set(phase="monitor")
         while not self._stop.is_set():
+            # Operator picked a DIFFERENT port mid-session — drop this link and let
+            # run() re-resolve so the new selection takes effect immediately.
+            if self._reconnect.is_set() and self._wanted_port() != self._state.port:
+                self._set(message="Switching ports…")
+                return
+
             # Operator asked for a fresh sweep — re-run it in place.
             if self._rerun.is_set():
                 self._rerun.clear()
@@ -283,8 +382,10 @@ class QcWorker(threading.Thread):
                     self._set(message=f"QC error: {e}")
                 self._set(phase="monitor")
 
-            # One monitor refresh; if it raises, the device is gone — bail out so
-            # run() returns to searching.
+            # Keep the dropdown list fresh while connected so a replug elsewhere
+            # still shows up, then do one monitor refresh; if it raises, the device
+            # is gone — bail out so run() returns to searching.
+            self._refresh_ports()
             try:
                 self._refresh_monitor(link)
             except Exception:
@@ -486,6 +587,70 @@ class QcApp:
         c.configure(padx=pad, pady=pad)
         return c
 
+    def _build_port_bar(self, parent: tk.Widget) -> None:
+        """
+        Build the manual port-picker toolbar (dropdown + Connect + Auto).
+
+        The dropdown is populated live from the worker's port list each render, so
+        a unit plugged in after launch appears without a restart. Mapping the
+        human label back to the OS device name happens via ``self._port_map``.
+        """
+        bar = tk.Frame(parent, bg=COL_BG)
+        bar.pack(fill="x", pady=(14, 0))
+
+        tk.Label(bar, text="Port", font=self._f_small,
+                 bg=COL_BG, fg=COL_SUBTLE).pack(side="left", padx=(0, 8))
+
+        # Style the native combobox to read on the dark surface. ttk theming is
+        # finicky; we set the field/list colours explicitly so it isn't a glaring
+        # white box against the dark UI.
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")   # 'clam' honours field colours; default may not
+        except tk.TclError:
+            pass
+        style.configure("QC.TCombobox",
+                        fieldbackground=COL_CARD_HI, background=COL_CARD_HI,
+                        foreground=COL_TEXT, arrowcolor=COL_TEXT,
+                        bordercolor=COL_CARD_HI, lightcolor=COL_CARD_HI,
+                        darkcolor=COL_CARD_HI, relief="flat")
+
+        self._port_var = tk.StringVar(value="")
+        self._port_combo = ttk.Combobox(
+            bar, textvariable=self._port_var, state="readonly",
+            style="QC.TCombobox", font=self._f_small, width=40)
+        self._port_combo.pack(side="left", fill="x", expand=True)
+        # Selecting an item connects immediately — one fewer click on the line.
+        self._port_combo.bind("<<ComboboxSelected>>", lambda e: self._on_connect())
+
+        # Maps the friendly dropdown label -> OS device name (e.g. "COM6").
+        self._port_map: Dict[str, str] = {}
+
+        # Connect (use the chosen port) and Auto (back to VID:PID auto-detect).
+        self._connect_btn = tk.Button(
+            bar, text="Connect", font=self._f_small, bg=COL_BLUE, fg="white",
+            activebackground="#0060df", activeforeground="white", relief="flat",
+            bd=0, padx=14, pady=6, cursor="hand2", command=self._on_connect)
+        self._connect_btn.pack(side="left", padx=(8, 0))
+
+        self._auto_btn = tk.Button(
+            bar, text="Auto", font=self._f_small, bg=COL_CARD_HI, fg=COL_TEXT,
+            activebackground=COL_CARD, activeforeground=COL_TEXT, relief="flat",
+            bd=0, padx=14, pady=6, cursor="hand2", command=self._on_auto)
+        self._auto_btn.pack(side="left", padx=(8, 0))
+
+    def _on_connect(self) -> None:
+        """Operator chose a port from the dropdown — force the worker onto it."""
+        label = self._port_var.get()
+        device = self._port_map.get(label, label.split()[0] if label else None)
+        if device:
+            self._worker.set_port(device)
+
+    def _on_auto(self) -> None:
+        """Operator hit Auto — hand port selection back to VID:PID auto-detect."""
+        self._worker.set_port(None)
+        self._port_var.set("")
+
     def _build_ui(self) -> None:
         root = self._root
         outer = tk.Frame(root, bg=COL_BG, padx=22, pady=22)
@@ -499,6 +664,13 @@ class QcApp:
         self._conn = tk.Label(header, text="● searching", font=self._f_small,
                               bg=COL_BG, fg=COL_AMBER)
         self._conn.pack(side="right", pady=(8, 0))
+
+        # ── Port picker bar: manual fallback when auto-detect can't choose. ────
+        # A native ttk.Combobox dropdown lists every serial port; the operator
+        # selects their unit and hits Connect. "Auto" hands control back to
+        # VID:PID auto-detection. The whole bar is one row so it reads as a single
+        # toolbar above the verdict.
+        self._build_port_bar(outer)
 
         # ── Hero verdict card: the giant PASS / FAIL the operator reads first. ─
         hero = self._card(outer, pad=24)
@@ -574,7 +746,8 @@ class QcApp:
             activeforeground="white", relief="flat", bd=0,
             padx=18, pady=10, cursor="hand2", command=self._on_rerun)
         self._rerun_btn.pack(side="right")
-        tk.Label(footer, text="Plug a unit in to begin · re-runs automatically on reconnect",
+        tk.Label(footer,
+                 text="Plug a unit in to begin · auto-detects, or pick a port above · re-runs on reconnect",
                  font=self._f_small, bg=COL_BG, fg=COL_SUBTLE).pack(side="left", pady=(10, 0))
 
     # ── events ───────────────────────────────────────────────────────────────
@@ -603,6 +776,9 @@ class QcApp:
             self._conn.configure(text="● error", fg=COL_RED)
         else:
             self._conn.configure(text="● searching", fg=COL_AMBER)
+
+        # Keep the port dropdown in sync with what the OS sees.
+        self._render_ports(s)
 
         # Hero verdict.
         if s.verdict is True:
@@ -636,6 +812,34 @@ class QcApp:
                 row["detail"].configure(text="")
 
         self._render_live(s.live)
+
+    def _render_ports(self, s: GuiState) -> None:
+        """
+        Refresh the dropdown's choices from the snapshot's live port list.
+
+        We only rewrite the combobox values when the set actually changes (so the
+        operator's open dropdown / current selection isn't disturbed every 50 ms),
+        and we auto-fill the field with the most likely unit when nothing is chosen
+        yet — the ADSBin-flagged port if there's one, so Connect is one click away.
+        """
+        labels = [p.label for p in s.ports]
+        self._port_map = {p.label: p.device for p in s.ports}
+
+        # Only touch the widget when the list changed — avoids fighting the user.
+        if list(self._port_combo["values"]) != labels:
+            self._port_combo["values"] = labels
+
+        # If the field is empty (or its device disappeared), pre-select something
+        # sensible: the operator's forced port, else the first ADSBin candidate.
+        current_dev = self._port_map.get(self._port_var.get())
+        if current_dev is None:
+            pick = None
+            if s.forced_port:
+                pick = next((p for p in s.ports if p.device == s.forced_port), None)
+            if pick is None:
+                pick = next((p for p in s.ports if p.is_adsbin), None)
+            if pick is not None:
+                self._port_var.set(pick.label)
 
     def _render_live(self, live: LiveSnapshot) -> None:
         st = live.status

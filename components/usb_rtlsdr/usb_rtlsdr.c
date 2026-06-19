@@ -611,10 +611,12 @@ static esp_err_t r820t_read(usb_rtlsdr_dev_t *d, uint8_t reg, uint8_t *out)
 /* ═══════════════════════════════════════════════════════════════════════════
  *  R820T2 PLL / tune.
  *
- *  The R820T2 LO is a fractional-N PLL off the 28.8 MHz reference. To tune to a
- *  centre frequency F we program the LO to F + IF (the RTL2832U expects the
- *  tuner to deliver the channel at R820T_IF_FREQ_HZ). The integer/fractional
- *  divider and the VCO band are computed from the datasheet PLL equations.
+ *  The R820T2 LO is a fractional-N PLL off the 28.8 MHz reference. We run the
+ *  tuner ZERO-IF: to receive a centre frequency F we program the LO directly to
+ *  F (no +IF offset), so the channel lands at DC to match the demod's zero-IF
+ *  baseband mode — see configure_frequency_locked() for the full rationale. The
+ *  integer/fractional divider and the VCO band are computed from the datasheet
+ *  PLL equations.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
@@ -928,9 +930,21 @@ static esp_err_t rtl_init_baseband(usb_rtlsdr_dev_t *d)
  * @brief Retune the R820T2 to the device's current centre frequency.
  *
  * @details
- *   Folds the ppm trim into the requested centre, then programs the PLL for
- *   LO = centre + IF (the RTL2832U expects the channel at the standard IF).
- *   Wrapped in the I2C repeater so the tuner sees the writes.
+ *   Folds the ppm trim into the requested centre, then programs the PLL so the
+ *   tuner LO sits EXACTLY on the centre frequency — i.e. ZERO-IF (direct down-
+ *   conversion). Wrapped in the I2C repeater so the tuner sees the writes.
+ *
+ *   WHY ZERO-IF (and not the classic +3.57 MHz Realtek IF). The RTL2832U demod
+ *   is brought up in zero-IF / baseband mode in rtl_init_baseband() (page1 reg
+ *   0xb1 = 0x1b, en_bbin) and we never program the demod's digital IF down-
+ *   converter (librtlsdr's set_if_freq, page1 regs 0x19/0x1a/0x1b). So if the
+ *   tuner were tuned to centre + 3.57 MHz the wanted signal would emerge at a
+ *   +3.57 MHz offset while the demod stayed centred on DC — the energy would sit
+ *   OUTSIDE the ~±1.2 MHz captured passband and demod1090 would see only noise
+ *   (the zero-planes bug). Placing the LO on the centre frequency lands the
+ *   channel at DC, matching the demod's zero-IF mode. demod1090 detects on the
+ *   magnitude envelope sqrt(I^2+Q^2), so it needs no carrier/phase alignment —
+ *   the signal only has to be inside the passband, which zero-IF guarantees.
  */
 static esp_err_t configure_frequency_locked(usb_rtlsdr_dev_t *d)
 {
@@ -938,7 +952,8 @@ static esp_err_t configure_frequency_locked(usb_rtlsdr_dev_t *d)
      * we ask the LO for a slightly higher frequency to compensate. */
     int64_t f = (int64_t)d->center_freq_hz;
     f += (f * d->freq_correction_ppm) / 1000000;
-    uint32_t lo = (uint32_t)(f + R820T_IF_FREQ_HZ);
+    /* Zero-IF: LO == centre. No +IF offset — see the rationale above. */
+    uint32_t lo = (uint32_t)(f);
 
     esp_err_t err = rtl_i2c_repeater(d, true);
     if (err == ESP_OK) {
