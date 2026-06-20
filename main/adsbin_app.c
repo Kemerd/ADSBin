@@ -736,16 +736,36 @@ static bool status_handle_line(const char *line)
     gps_clock_t gps = (gps_clock_t){0};
     (void)gps_clock_get(&gps);
 
+    /* ── Decode-chain counters (the localization ladder) ─────────────────────
+     * These let an operator (or us, debugging in the field) see exactly WHERE the
+     * 1090 pipeline goes quiet: RF → preamble → frame → CRC → position. Read down
+     * the ladder until a token reads 0 and that is where the break is:
+     *   PRE  > 0  the antenna actually hears Mode-S sync bursts (RF + tune OK)
+     *   FRM  > 0  the slicer emitted candidate frames
+     *   COK  > 0  frames passed the Mode-S CRC-24 (real, well-tuned signal)
+     *   POS  > 0  positions were resolved (full decode working)
+     * A healthy box at an airport shows all of them climbing; PRE=0 means the RF
+     * front-end (tune / IF / antenna) is still wrong even though USB streams. */
+    demod1090_stats_t dstat = (demod1090_stats_t){0};
+    demod1090_get_stats(&dstat);
+    modes_decode_stats_t mstat = (modes_decode_stats_t){0};
+    modes_decode_get_stats(&mstat);
+    /* Sum the two CPR resolution paths into one POS token for the readout. */
+    uint32_t positions = mstat.positions_global + mstat.positions_local;
+
     /* ── Render the one frozen line (WIRE_CONTRACT.md §4) ─────────────────────
      * TEMP/PEAK emit "nan" (printf's NAN spelling) when unsampled; the host
      * parser treats a non-finite value as "no data". All other tokens are always
-     * present so the host can rely on a fixed field set. */
-    char buf[200];
+     * present so the host can rely on a fixed field set. The decode-ladder tokens
+     * (PRE/FRM/COK/CFAIL/DFDROP/POS) are appended after the legacy fields so older
+     * parsers that key on the leading tokens keep working. */
+    char buf[320];
     int n = snprintf(buf, sizeof(buf),
                      "=== ADSBIN STATUS "
                      "DONGLES=%d PRESENT=%d STREAMING=%d "
                      "TEMP=%.1f PEAK=%.1f HEALTH=%s "
-                     "GPS=%s GPSFIX=%d ===\n",
+                     "GPS=%s GPSFIX=%d "
+                     "PRE=%llu FRM=%llu COK=%u CFAIL=%u DFDROP=%u POS=%u ===\n",
                      dongles,
                      (int)ust.device_present,
                      (int)ust.streaming,
@@ -753,7 +773,13 @@ static bool status_handle_line(const char *line)
                      (double)peak_c,
                      health_token(ust.device_present, overtemp),
                      gps_quality_token(gps.quality),
-                     (int)gps.has_ownship_fix);
+                     (int)gps.has_ownship_fix,
+                     (unsigned long long)dstat.preambles_detected,
+                     (unsigned long long)dstat.frames_emitted,
+                     (unsigned)mstat.crc_ok,
+                     (unsigned)mstat.crc_fail,
+                     (unsigned)mstat.df_dropped,
+                     (unsigned)positions);
     if (n > 0) {
         inject_reply(buf);
     }

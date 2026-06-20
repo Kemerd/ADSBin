@@ -16,3 +16,4 @@ venv/
 Thumbs.db
 /.claude
 PERF_OVERHAUL_PLAN.md
+*.log

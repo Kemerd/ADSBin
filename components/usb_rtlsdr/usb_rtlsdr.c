@@ -612,11 +612,11 @@ static esp_err_t r820t_read(usb_rtlsdr_dev_t *d, uint8_t reg, uint8_t *out)
  *  R820T2 PLL / tune.
  *
  *  The R820T2 LO is a fractional-N PLL off the 28.8 MHz reference. We run the
- *  tuner ZERO-IF: to receive a centre frequency F we program the LO directly to
- *  F (no +IF offset), so the channel lands at DC to match the demod's zero-IF
- *  baseband mode — see configure_frequency_locked() for the full rationale. The
- *  integer/fractional divider and the VCO band are computed from the datasheet
- *  PLL equations.
+ *  tuner LOW-IF: to receive a centre frequency F we program the LO to F + IF
+ *  (R820T_IF_FREQ_HZ), keeping the carrier off the DC spike, and the RTL2832U
+ *  demod NCO down-converts the IF to baseband — see configure_frequency_locked()
+ *  for the full rationale. The integer/fractional divider and the VCO band are
+ *  computed from the datasheet PLL equations.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
@@ -855,6 +855,53 @@ static esp_err_t rtl_set_sample_rate(usb_rtlsdr_dev_t *d, uint32_t rate_sps)
 }
 
 /**
+ * @brief Program the RTL2832U digital IF-NCO to down-convert @p if_hz to baseband.
+ *
+ * @details
+ *   The R820T2 hands the demod a real LOW-IF stream centred at @p if_hz
+ *   (3.57 MHz for our config). This NCO mixes that IF down to DC so the
+ *   resampler and the bulk-IN samples are true baseband — the step that was
+ *   missing while the box was deaf in the air.
+ *
+ *   Clean-room from the RTL2832U demod register description, and numerically
+ *   identical to librtlsdr's rtlsdr_set_if_freq():
+ *
+ *     if_word = -(if_hz * 2^22 / Xtal)        // NEGATED — the NCO subtracts
+ *     if_word &= 0x3FFFFF                       // 22-bit two's-complement field
+ *
+ *   The 22-bit word is written MSB-first across three page-1 byte registers:
+ *     page1 0x19 = bits [21:16]  (only the low 6 bits are the IF field)
+ *     page1 0x1a = bits [15:8]
+ *     page1 0x1b = bits [7:0]
+ *
+ *   The negation is essential: the tuner mixes the channel UP to +IF, so the
+ *   demod must mix DOWN by the same amount. A positive (un-negated) word would
+ *   shift the wrong way and push the carrier further from baseband — "tunes
+ *   fine, decodes nothing".
+ *
+ * @param d      The device whose demod NCO to program.
+ * @param if_hz  The tuner IF to cancel (e.g. R820T_IF_FREQ_HZ = 3.57 MHz).
+ * @return ESP_OK on success, or the first failing register write's status.
+ */
+static esp_err_t rtl_set_if_freq(usb_rtlsdr_dev_t *d, uint32_t if_hz)
+{
+    /* if_word = -(if_hz * 2^22 / Xtal), kept in 22 bits two's-complement. The
+     * 64-bit intermediate avoids overflow before the divide; the unary minus on
+     * the unsigned result is the two's-complement negate the register expects. */
+    uint32_t mag      = (uint32_t)(((uint64_t)if_hz << 22) / RTL_XTAL_HZ);
+    uint32_t if_word  = ((uint32_t)(-(int32_t)mag)) & 0x3FFFFFu;
+
+    esp_err_t err = ESP_OK;
+    /* MSB-first across the three IF-NCO byte registers; only the low 6 bits of
+     * the top register belong to the IF field (datasheet). */
+    err |= rtl_demod_write(d, RTL_DEMOD_IF_FREQ2, (uint16_t)((if_word >> 16) & 0x3Fu), 1);
+    err |= rtl_demod_write(d, RTL_DEMOD_IF_FREQ1, (uint16_t)((if_word >> 8)  & 0xFFu), 1);
+    err |= rtl_demod_write(d, RTL_DEMOD_IF_FREQ0, (uint16_t)( if_word        & 0xFFu), 1);
+
+    return (err == ESP_OK) ? ESP_OK : ESP_FAIL;
+}
+
+/**
  * @brief Bring the RTL2832U up into raw-IQ (DVB-T bypass) mode.
  *
  * @details
@@ -904,13 +951,31 @@ static esp_err_t rtl_init_baseband(usb_rtlsdr_dev_t *d)
      * are paged_addr = (page << 8) | reg:
      *   page0 0x19 = 0x05  enable SDR mode, disable DAGC
      *   page0 0x06 = 0x80  opt_adc_iq = 0, default ADC_I/ADC_Q datapath
-     *   page1 0xb1 = 0x1b  Zero-IF mode (en_bbin) + DC cancel + IQ est/comp
      *   page0 0x0d = 0x83  disable the 4.096 MHz clock output on TP_CK0
      */
     err |= rtl_demod_write(d, 0x0019u, 0x05, 1);   /* page0 reg 0x19 */
     err |= rtl_demod_write(d, 0x0006u, 0x80, 1);   /* page0 reg 0x06 */
-    err |= rtl_demod_write(d, 0x01b1u, 0x1b, 1);   /* page1 reg 0xb1 */
     err |= rtl_demod_write(d, 0x000du, 0x83, 1);   /* page0 reg 0x0d */
+
+    /* ── R820T2 LOW-IF RECEIVE CHAIN (the piece whose absence kept the box deaf
+     *    in the air) ─────────────────────────────────────────────────────────
+     * The R820T2 is a LOW-IF tuner: it delivers the wanted channel at a fixed
+     * 3.57 MHz IF, never at DC (zero-IF would bury the carrier under the tuner's
+     * DC offset + 1/f noise hump). So the demod must be set up to match:
+     *   - en_bbin OFF (page1 0xb1 = 0x1a): leave zero-IF/baseband-input mode; we
+     *     are NOT fed a DC-centred signal, we are fed a 3.57 MHz IF.
+     *   - I-input only (page0 0x08 = 0x4d): take the In-phase ADC for the real
+     *     low-IF stream rather than the zero-IF I/Q pair.
+     *   - spectrum inversion ON (page1 0x15 = 0x01): high-side mixing
+     *     (LO = centre + IF) inverts the spectrum; this flips it back so the
+     *     down-converted baseband is the right way round.
+     * This mirrors librtlsdr's R820T case in rtlsdr_open(). The actual IF-NCO
+     * (page1 0x19/0x1a/0x1b) that shifts 3.57 MHz down to baseband is programmed
+     * by rtl_set_if_freq() in the stream-start path, after the resampler rate is
+     * known. */
+    err |= rtl_demod_write(d, RTL_DEMOD_EN_BBIN, RTL_DEMOD_EN_BBIN_OFF, 1);
+    err |= rtl_demod_write(d, RTL_DEMOD_ADC_IN,  RTL_DEMOD_ADC_IN_I_ONLY, 1);
+    err |= rtl_demod_write(d, RTL_DEMOD_SPEC_INV, RTL_DEMOD_SPEC_INV_ON, 1);
 
     /* GPIO defaults: drive the bias-tee line low (off) until set_bias_tee asks
      * for it. Configure GPIO0 as an output. */
@@ -930,21 +995,21 @@ static esp_err_t rtl_init_baseband(usb_rtlsdr_dev_t *d)
  * @brief Retune the R820T2 to the device's current centre frequency.
  *
  * @details
- *   Folds the ppm trim into the requested centre, then programs the PLL so the
- *   tuner LO sits EXACTLY on the centre frequency — i.e. ZERO-IF (direct down-
- *   conversion). Wrapped in the I2C repeater so the tuner sees the writes.
+ *   Folds the ppm trim into the requested centre, then programs the PLL for
+ *   LO = centre + IF — the classic R820T2 LOW-IF tuning. Wrapped in the I2C
+ *   repeater so the tuner sees the writes.
  *
- *   WHY ZERO-IF (and not the classic +3.57 MHz Realtek IF). The RTL2832U demod
- *   is brought up in zero-IF / baseband mode in rtl_init_baseband() (page1 reg
- *   0xb1 = 0x1b, en_bbin) and we never program the demod's digital IF down-
- *   converter (librtlsdr's set_if_freq, page1 regs 0x19/0x1a/0x1b). So if the
- *   tuner were tuned to centre + 3.57 MHz the wanted signal would emerge at a
- *   +3.57 MHz offset while the demod stayed centred on DC — the energy would sit
- *   OUTSIDE the ~±1.2 MHz captured passband and demod1090 would see only noise
- *   (the zero-planes bug). Placing the LO on the centre frequency lands the
- *   channel at DC, matching the demod's zero-IF mode. demod1090 detects on the
- *   magnitude envelope sqrt(I^2+Q^2), so it needs no carrier/phase alignment —
- *   the signal only has to be inside the passband, which zero-IF guarantees.
+ *   WHY LOW-IF (and NOT zero-IF / LO-on-centre). The R820T2 is a low-IF tuner:
+ *   it is designed to deliver the channel at a fixed 3.57 MHz IF, never at DC.
+ *   Tuning the LO directly to the centre frequency (zero-IF) would land the
+ *   wanted carrier right on top of the tuner's DC offset + 1/f flicker-noise
+ *   hump, which swamps the weak 50 ns ADS-B pulses — the receiver goes nearly
+ *   deaf even with a good antenna at an airport. So we offset-tune the LO to
+ *   centre + 3.57 MHz (this function) and let the RTL2832U's digital IF-NCO
+ *   shift that 3.57 MHz back down to baseband (rtl_set_if_freq(), programmed in
+ *   the stream-start path), with the demod in low-IF mode (en_bbin OFF,
+ *   I-input, spectrum-inversion ON; see rtl_init_baseband). This mirrors exactly
+ *   what librtlsdr / dump1090 / Stratux do for the R820T2.
  */
 static esp_err_t configure_frequency_locked(usb_rtlsdr_dev_t *d)
 {
@@ -952,8 +1017,9 @@ static esp_err_t configure_frequency_locked(usb_rtlsdr_dev_t *d)
      * we ask the LO for a slightly higher frequency to compensate. */
     int64_t f = (int64_t)d->center_freq_hz;
     f += (f * d->freq_correction_ppm) / 1000000;
-    /* Zero-IF: LO == centre. No +IF offset — see the rationale above. */
-    uint32_t lo = (uint32_t)(f);
+    /* Low-IF: LO = centre + 3.57 MHz; the demod NCO down-converts it to baseband
+     * (see rtl_set_if_freq). Offset-tuning keeps the carrier off the DC spike. */
+    uint32_t lo = (uint32_t)(f + R820T_IF_FREQ_HZ);
 
     esp_err_t err = rtl_i2c_repeater(d, true);
     if (err == ESP_OK) {
@@ -1578,6 +1644,13 @@ static esp_err_t start_streaming_locked(usb_rtlsdr_dev_t *d)
     if (err == ESP_OK) err = configure_bias_tee_locked(d);
     if (err != ESP_OK) { ESP_LOGE(TAG, "stream[%d] FAIL @tune/gain: %s", d->index, esp_err_to_name(err)); return err; }
 
+    /* 3b) Program the demod IF-NCO to cancel the R820T2's 3.57 MHz low-IF, so the
+     *     offset-tuned channel arrives at true baseband. The tuner LO is at
+     *     centre + IF (configure_frequency_locked); without this matching down-
+     *     convert the carrier sits at +3.57 MHz and nothing decodes. */
+    err = rtl_set_if_freq(d, R820T_IF_FREQ_HZ);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "stream[%d] FAIL @set_if_freq: %s", d->index, esp_err_to_name(err)); return err; }
+
     /* 4) Reset the demod sample pipe so we start on a clean boundary. */
     err = rtl_demod_write(d, RTL_DEMOD_SOFT_RST, RTL_DEMOD_SOFT_RST_ON, 1);
     if (err == ESP_OK) err = rtl_demod_write(d, RTL_DEMOD_SOFT_RST, RTL_DEMOD_SOFT_RST_OFF, 1);
@@ -2004,6 +2077,10 @@ static void apply_device_config(usb_rtlsdr_dev_t *d)
     if (d_rate) {
         lock();
         esp_err_t err = rtl_set_sample_rate(d, d->sample_rate_sps);
+        /* Re-assert the IF-NCO after a rate change so the low-IF down-convert is
+         * never silently lost on a runtime retune (mirrors the start path's
+         * rate -> if_freq order). */
+        if (err == ESP_OK) err = rtl_set_if_freq(d, R820T_IF_FREQ_HZ);
         unlock();
         if (err != ESP_OK) set_last_error(d, err);
     }

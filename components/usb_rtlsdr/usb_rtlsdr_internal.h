@@ -136,6 +136,42 @@ extern "C" {
 #define RTL_DEMOD_SOFT_RST_ON     0x14u
 #define RTL_DEMOD_SOFT_RST_OFF    0x10u
 
+/* ── Digital down-converter / IF-NCO (page1 regs 0x19/0x1a/0x1b) ─────────────
+ * The RTL2832U carries a numerically-controlled oscillator that shifts the
+ * tuner's low-IF down to baseband BEFORE the resampler. The R820T2 is a LOW-IF
+ * tuner — it deliberately delivers the channel at a 3.57 MHz IF (never at DC,
+ * to dodge the tuner's DC offset + 1/f noise hump). So the demod MUST be told to
+ * down-convert by that same 3.57 MHz, or the carrier never reaches baseband and
+ * nothing decodes. The 22-bit (negated) IF word is written MSB-first across
+ * these three byte registers. This mirrors librtlsdr's rtlsdr_set_if_freq(). */
+#define RTL_DEMOD_IF_FREQ2        0x0119u  /**< page1/0x19: IF word bits [21:16]. */
+#define RTL_DEMOD_IF_FREQ1        0x011Au  /**< page1/0x1a: IF word bits [15:8].  */
+#define RTL_DEMOD_IF_FREQ0        0x011Bu  /**< page1/0x1b: IF word bits [7:0].   */
+
+/* Spectrum inversion (page1 reg 0x15). High-side mixing in the R820T2 (LO =
+ * centre + IF) inverts the spectrum; setting this bit flips it back so the
+ * demod's down-converted baseband is the right way round. librtlsdr enables it
+ * unconditionally for the R820T. Without it the IQ is mirror-imaged and the
+ * Mode-S preamble/PPM never line up — "tunes fine, decodes nothing". */
+#define RTL_DEMOD_SPEC_INV        0x0115u  /**< page1/0x15: spectrum-inversion.   */
+#define RTL_DEMOD_SPEC_INV_ON     0x01u    /**< Enable spectrum inversion.        */
+
+/* ADC datapath select (page0 reg 0x08). With a real low-IF the demod must take
+ * the In-phase ADC input only (not the zero-IF I/Q pair). librtlsdr writes 0x4d
+ * for the R820T. */
+#define RTL_DEMOD_ADC_IN          0x0008u  /**< page0/0x08: ADC input select.     */
+#define RTL_DEMOD_ADC_IN_I_ONLY   0x4Du    /**< In-phase ADC input only (low-IF). */
+
+/* en_bbin (page1 reg 0xb1) selects zero-IF baseband-input mode. For the R820T2
+ * low-IF path this is DISABLED (0x1a); the previous 0x1b enabled zero-IF, which
+ * only made sense when the tuner was wrongly tuned to DC. */
+#define RTL_DEMOD_EN_BBIN         0x01B1u  /**< page1/0xb1: baseband-input mode.  */
+#define RTL_DEMOD_EN_BBIN_OFF     0x1Au    /**< Zero-IF OFF — low-IF down-convert.*/
+
+/* The R820T2's fixed low-IF, mirrored from R820T_IF_FREQ_HZ below, used to
+ * program the demod NCO. Kept here so the demod-side define lives with the other
+ * demod registers; the value must equal R820T_IF_FREQ_HZ. */
+
 /* The RTL2832U master crystal. Both the demod resampler and (via the I2C-fed
  * tuner reference) the R820T2 PLL are derived from this 28.8 MHz reference. */
 #define RTL_XTAL_HZ               28800000u
