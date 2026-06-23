@@ -40,7 +40,19 @@ extern "C" {
 /* ───────────────────────────────────────────────────────────────────────────
  *  RF / sampling constants (S0, S4.1, S5.1)
  * ─────────────────────────────────────────────────────────────────────────── */
-#define ADSB_SAMPLE_RATE_HZ   2400000u      /**< 2.4 Msps, 8-bit I/Q.           */
+/* 2.0 Msps for 1090ES — NOT 2.4. At exactly 2.0 Msps one Mode-S bit (1 µs) is
+ * EXACTLY 2 samples, so the half-bit PPM decision (first sample vs second sample)
+ * in demod1090's slice_bits() is correct by construction. At 2.4 Msps a bit is a
+ * fractional 2.4 samples and the symbol/sample phase slides continuously: the
+ * preamble correlator still locks (you see preambles), but the simple two-sample
+ * slicer recovers WRONG bits on the sliding phase, so the CRC always fails and
+ * nothing decodes — the "PRE>0 but COK=0 at the airport" symptom. Robust 2.4 Msps
+ * decode requires a multi-phase matched-filter correlator (several sub-sample
+ * phase hypotheses tried per candidate, best-scoring kept); until/unless that is
+ * implemented, 2.0 Msps is the correct rate because the half-bit slicer is exact
+ * at 2 samples/bit. Both the RTL2832U resampler and demod1090 read this one
+ * macro, so they stay locked. */
+#define ADSB_SAMPLE_RATE_HZ   2000000u      /**< 2.0 Msps, 8-bit I/Q (2 samples/bit). */
 #define ADSB_CENTER_FREQ_HZ   1090000000u   /**< 1090ES centre frequency.       */
 
 /* ───────────────────────────────────────────────────────────────────────────
