@@ -81,6 +81,19 @@ extern "C" {
 #define DEMOD_DEFAULT_PREAMBLE   28      /**< Default min correlation score.     */
 
 /* ───────────────────────────────────────────────────────────────────────────
+ *  Multi-phase slicing bank.
+ *
+ *  At 2.4 Msps a bit is 2.4 samples, so the bit grid's phase relative to our
+ *  integer sample stream is unknown to within ±½ a sample. We slice the data at
+ *  DEMOD_PHASE_STEPS sub-sample phase hypotheses spread across one whole sample
+ *  period and keep the phase whose per-bit PPM margins are largest (the matched-
+ *  filter-optimal phase). 5 steps = a 0.2-sample phase resolution, well inside
+ *  the tolerance needed to keep all 112 bits on the correct half-bit windows.
+ *  Derived from matched-filter sampling-phase theory — see CITATIONS.md §B.
+ * ─────────────────────────────────────────────────────────────────────────── */
+#define DEMOD_PHASE_STEPS        5       /**< Sub-sample phase hypotheses tried. */
+
+/* ───────────────────────────────────────────────────────────────────────────
  *  Magnitude look-up table.
  *
  *  The RTL2832U delivers offset-binary unsigned 8-bit I and Q (mid-scale

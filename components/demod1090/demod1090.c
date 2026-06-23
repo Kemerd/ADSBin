@@ -299,42 +299,53 @@ static bool detect_preamble(const uint16_t *m, uint32_t n, uint32_t start,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  PPM bit slicing.
+ *  PPM bit slicing at a chosen sub-sample phase (matched-filter, single phase).
  *
- *  After a valid preamble the data begins exactly 8 µs after `start`. Each bit
- *  is a 1 µs PPM symbol: more energy in the first half-bit than the second ⇒ 1,
- *  otherwise ⇒ 0. We advance the read position with a fixed-point phase
- *  accumulator so the half-bit sample points stay aligned across all 112 bits
- *  even though one bit is a non-integer 2.4 samples wide.
+ *  After a valid preamble the data begins ~8 µs after `start`, but at 2.4 Msps the
+ *  exact sub-sample phase of the bit grid relative to our integer sample stream is
+ *  unknown — the preamble detector only locks to an integer `start`. This routine
+ *  slices the data assuming a GIVEN sub-sample phase offset @p phase_fp (a
+ *  fixed-point fraction of a sample, 0..DEMOD_FP_ONE) added to the nominal data
+ *  start. The caller (process_magnitude) sweeps several phase hypotheses and keeps
+ *  the best — that sweep is the multi-phase matched filter (see CITATIONS.md §B).
  *
- *  We always slice the full 112 bits if the buffer allows; the caller decides
- *  short vs long. Returns the number of bits actually sliced (≤ want_bits).
+ *  Each bit is a 1 µs PPM symbol: energy in the first half-bit ⇒ 1, in the second
+ *  ⇒ 0. We sample each half-bit at its CENTRE (¼ and ¾ bit) and decide by which is
+ *  louder. We also accumulate a CONFIDENCE score = Σ|m_first − m_second| over all
+ *  bits: at the correct phase the two half-bit samples sit cleanly on a pulse vs a
+ *  gap so the per-bit margin is large; at a wrong phase both samples straddle the
+ *  symbol edge and the margins collapse toward zero. Maximising this confidence is
+ *  exactly choosing the matched-filter-optimal sampling phase, with no CRC needed
+ *  (so demod1090 stays decoupled from modes_decode).
+ *
+ *  @param phase_fp   sub-sample phase offset to add to the data start, fixed-point.
+ *  @param out_conf   if non-NULL, receives the summed PPM confidence for this phase.
+ *  @return number of bits actually sliced (≤ want_bits).
  * ═══════════════════════════════════════════════════════════════════════════ */
 static int slice_bits(const uint16_t *m, uint32_t n, uint32_t start,
-                      int want_bits, uint8_t *out_data)
+                      int want_bits, uint8_t *out_data,
+                      uint64_t phase_fp, uint64_t *out_conf)
 {
     const uint64_t sp_us   = s_ctx.fp_samples_per_us;          /* samples/µs fp */
     const uint64_t bit_fp  = (uint64_t)(DEMOD_BIT_US     * (double)sp_us); /* 1 bit  */
     const uint64_t half_fp = (uint64_t)(DEMOD_HALFBIT_US * (double)sp_us); /* ½ bit  */
 
-    /* Data starts 8 µs after the preamble start. Carry it as a fixed-point     */
-    /* absolute sample position relative to the buffer origin.                  */
+    /* Data starts 8 µs after the preamble start, shifted by the trial sub-sample */
+    /* phase. Carry it as a fixed-point absolute sample position.                 */
     uint64_t pos = ((uint64_t)start << DEMOD_FP_SHIFT) +
-                   (uint64_t)(DEMOD_PREAMBLE_US * (double)sp_us);
+                   (uint64_t)(DEMOD_PREAMBLE_US * (double)sp_us) +
+                   phase_fp;
 
     /* Clear the destination so unused long-frame bytes are deterministic when  */
     /* the caller only keeps the short-frame prefix.                            */
     memset(out_data, 0, MODES_LONG_BYTES);
 
+    uint64_t conf = 0;          /* Σ|first−second| confidence for this phase.    */
     int bits_done = 0;
     for (int b = 0; b < want_bits; ++b) {
 
-        /* Integer sample index of this bit's first and second half centres.    */
-        /* Sampling a quarter-bit into each half lands squarely on the plateau.  */
-        /* Round-to-nearest (add ½ a sample before the shift) is essential here: */
-        /* at 2.4 samples/bit the centres land on fractional sample positions,   */
-        /* and a plain truncation would bias us a full sample earlier — onto the */
-        /* previous symbol's tail — and corrupt every bit.                       */
+        /* Sample each half-bit at its centre (¼ bit and ¾ bit in). Round to    */
+        /* nearest by adding ½ a sample before the truncating shift.            */
         const uint64_t first_fp  = pos + (half_fp >> 1) + (DEMOD_FP_ONE >> 1);  /* ¼ bit */
         const uint64_t second_fp = pos + half_fp + (half_fp >> 1) + (DEMOD_FP_ONE >> 1); /* ¾ bit */
         const uint32_t i_first   = (uint32_t)(first_fp  >> DEMOD_FP_SHIFT);
@@ -346,15 +357,24 @@ static int slice_bits(const uint16_t *m, uint32_t n, uint32_t start,
             break;
         }
 
-        /* PPM decision: first-half-louder ⇒ 1. Ties resolve to 0, matching the */
-        /* dump1090 convention (rare, and a tie is almost certainly noise).     */
-        if (m[i_first] > m[i_second]) {
+        const uint16_t a = m[i_first];
+        const uint16_t c = m[i_second];
+
+        /* PPM decision: first-half-louder ⇒ 1. Ties resolve to 0.             */
+        if (a > c) {
             out_data[b >> 3] |= (uint8_t)(1u << (7 - (b & 7)));
         }
+
+        /* Accumulate |first − second| as this bit's decision confidence.       */
+        conf += (a > c) ? (uint64_t)(a - c) : (uint64_t)(c - a);
 
         /* Advance one whole bit period and count it.                          */
         pos += bit_fp;
         ++bits_done;
+    }
+
+    if (out_conf) {
+        *out_conf = conf;
     }
     return bits_done;
 }
@@ -498,9 +518,36 @@ static void process_magnitude(const uint16_t *m, uint32_t n,
         /* Timestamp this frame: block start plus the preamble's sample offset. */
         const int64_t rx_us = block_t_us + (int64_t)((double)j * us_per_sample + 0.5);
 
-        /* Slice the maximum 112 bits; the DF tells us if it is really short.   */
+        /* ── MULTI-PHASE SLICE ───────────────────────────────────────────────
+         * At 2.4 Msps the bit grid's sub-sample phase is unknown, so we slice the
+         * candidate at DEMOD_PHASE_STEPS phase hypotheses spread across one whole
+         * sample period and keep the one with the highest summed PPM confidence
+         * (Σ|first−second|). The confidence peaks at the matched-filter-optimal
+         * phase where each half-bit sample sits cleanly on a pulse vs a gap; wrong
+         * phases straddle symbol edges and score low. This recovers correct bits
+         * at fractional samples-per-bit. See CITATIONS.md §B for the derivation. */
         uint8_t data[MODES_LONG_BYTES];
-        int got = slice_bits(m, n, j, MODES_LONG_BITS, data);
+        uint8_t best_data[MODES_LONG_BYTES];
+        uint64_t best_conf = 0;
+        int got = 0;
+        for (int p = 0; p < DEMOD_PHASE_STEPS; ++p) {
+            /* Phase hypotheses evenly spaced over [0, 1) sample: p/STEPS sample. */
+            const uint64_t phase_fp =
+                ((uint64_t)p * DEMOD_FP_ONE) / (uint64_t)DEMOD_PHASE_STEPS;
+
+            uint64_t conf = 0;
+            int got_p = slice_bits(m, n, j, MODES_LONG_BITS, data, phase_fp, &conf);
+
+            /* Keep the highest-confidence phase. The first phase always seeds    */
+            /* best_* so we never emit an uninitialised buffer.                   */
+            if (p == 0 || conf > best_conf) {
+                best_conf = conf;
+                got       = got_p;
+                memcpy(best_data, data, sizeof(best_data));
+            }
+        }
+        /* Decode/emit from the winning phase's bits. */
+        memcpy(data, best_data, sizeof(data));
 
         /* Default skip: at minimum step past the preamble so we never re-detect */
         /* the same sync burst, even if this candidate slices to nothing usable. */
