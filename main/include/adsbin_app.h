@@ -42,7 +42,16 @@ extern "C" {
 #define ADSBIN_PRIO_DECODE   5                           /**< modes_decode (Core1).  */
 #define ADSBIN_PRIO_TRAFFIC  4                           /**< traffic table (Core1). */
 #define ADSBIN_PRIO_SINKS    3                           /**< output sinks  (Core1). */
-#define ADSBIN_PRIO_STATUS   2                           /**< LEDs / temp   (Core1). */
+/* The interactive console/inject reader sits ABOVE the GPS supervisor so operator
+ * I/O (+INJECT / +STATUS / the QC bench) can never be starved by a CPU-bound GPS
+ * task — both live on Core 1. The reader spends almost all its time BLOCKED on a
+ * USB-CDC read, so a higher priority costs no CPU; it only ever preempts to service
+ * a line that just arrived. (Bug history: the inject reader and the GPS supervisor
+ * both ran at ADSBIN_PRIO_STATUS=2; once GPS was wired, a UART RX flood made the
+ * GPS task CPU-bound and round-robin starved the reader, so +INJECT/+STATUS went
+ * silent while decode/traffic kept running.) */
+#define ADSBIN_PRIO_INJECT   2                           /**< console/inject reader (Core1). */
+#define ADSBIN_PRIO_STATUS   1                           /**< LEDs / temp / GPS (Core1).     */
 /* UAT glue tasks share the decode/traffic priority band on Core 1. */
 #define ADSBIN_PRIO_UAT_DECODE  5                        /**< uat_decode glue (Core1).*/
 #define ADSBIN_PRIO_UAT_UPLINK  3                        /**< uplink glue   (Core1).  */

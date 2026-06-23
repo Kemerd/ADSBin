@@ -1,5 +1,29 @@
 menu "ADSBin"
 
+    config ADSBIN_GPS_ISOLATION_TEST
+        bool "GPS isolation test mode (bring up ONLY the GPS)"
+        default n
+        help
+            DIAGNOSTIC BUILD FLAG. When enabled, app_main brings up ONLY the GPS
+            clock service and SKIPS everything else: the USB/RTL-SDR radio, the
+            1090 + 978 demodulators, the decode/traffic tasks, the GDL90/UDP sinks,
+            and the WiFi SoftAP. This gives the GPS a completely quiet console (no
+            interleaved GDL90 binary, no 1 Hz traffic dump) so its bring-up + NMEA
+            fix can be verified in total isolation. Leave OFF for normal builds.
+
+    config ADSBIN_DISABLE_CDC_GDL90
+        bool "Disable the USB-CDC GDL90 sink (keep WiFi/UDP GDL90)"
+        default n
+        help
+            DIAGNOSTIC BUILD FLAG. The USB-CDC GDL90 sink writes binary 0x7E-framed
+            GDL90 frames to the SAME serial port as the console logs + the +STATUS
+            reply + the +INJECT reader. That binary flood interleaves with and
+            corrupts the text console (the "~junk~" bytes), which can make a
+            perfectly-working box look hung over serial. Enabling this flag drops
+            ONLY the USB-CDC GDL90 sink so the console stays clean text; the WiFi/UDP
+            GDL90 feed to ForeFlight is unaffected (a tablet still gets traffic). Use
+            to confirm the radio/decode/GPS all work when the console isn't flooded.
+
     config ADSBIN_STATUS_LED_GPIO
         int "Status LED GPIO (-1 to disable)"
         default -1

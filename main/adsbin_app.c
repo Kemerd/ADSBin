@@ -1028,6 +1028,20 @@ esp_err_t adsbin_app_init(void)
         if (gerr != ESP_OK) {
             ESP_LOGW(TAG, "gps_clock_init failed (%s) - GPS feature disabled",
                      esp_err_to_name(gerr));
+        } else {
+            /* Start GPS HERE, early in init — before the radio/decode/sink/WiFi
+             * pipeline exists and while the console + Core-1 are quiet. This is the
+             * exact quiet context in which GPS bring-up completes cleanly (verified
+             * by the isolation test: UART+UBX+PPS all come up and the ladder reaches
+             * FREE_RUNNING in ~150 ms). Doing it late, after the busy pipeline was
+             * standing up, was the problem: the one-shot bring-up never got to run.
+             * gps_clock_start() spawns its own supervisor task and returns quickly,
+             * so starting it here does not delay the rest of bring-up. Non-fatal. */
+            esp_err_t serr = gps_clock_start();
+            if (serr != ESP_OK) {
+                ESP_LOGW(TAG, "gps_clock_start failed (%s) - GPS disabled, "
+                              "decode/ownship/sinks unaffected", esp_err_to_name(serr));
+            }
         }
     }
 
@@ -1083,6 +1097,23 @@ static status_config_t status_cfg_from_kconfig(void)
 esp_err_t adsbin_app_start(void)
 {
     esp_err_t err;
+
+#if CONFIG_ADSBIN_GPS_ISOLATION_TEST
+    /* ── GPS ISOLATION TEST ──────────────────────────────────────────────────
+     * Diagnostic build: bring up ONLY the GPS and skip the entire radio/decode/
+     * GDL90/WiFi pipeline, so the GPS gets a totally quiet console. We start GPS
+     * INLINE here (not on a detached task) precisely so that if gps_clock_start()
+     * blocks, app_main visibly stops AT the GPS bring-up — making the hang point
+     * unambiguous in the boot log, with no other subsystem to muddy it. The
+     * STARTUP-TRACE logs inside gps_clock_start() then pinpoint the exact step. */
+    ESP_LOGW(TAG, "GPS ISOLATION TEST: radio/decode/sinks/WiFi SKIPPED — GPS only");
+    {
+        esp_err_t gerr = gps_clock_start();
+        ESP_LOGW(TAG, "GPS ISOLATION TEST: gps_clock_start returned %s",
+                 esp_err_to_name(gerr));
+    }
+    return ESP_OK;
+#endif
 
     // Snapshot config once for the start sequence (gain + sink map drive setup).
     adsbin_config_t cfg;
@@ -1283,7 +1314,15 @@ esp_err_t adsbin_app_start(void)
         }
     }
 
+#if CONFIG_ADSBIN_DISABLE_CDC_GDL90
+    /* Diagnostic: the USB-CDC GDL90 sink is suppressed so its binary 0x7E frames
+     * don't flood the text console (logs / +STATUS / +INJECT share this port). The
+     * WiFi/UDP GDL90 sink below is untouched, so ForeFlight still gets traffic. */
+    ESP_LOGW(TAG, "USB-CDC GDL90 sink DISABLED (diag) - console stays clean text");
+    if (0 /* CDC GDL90 disabled by ADSBIN_DISABLE_CDC_GDL90 */) {
+#else
     if (sink_map & ADSBIN_SINK_GDL90) {
+#endif
         const sink_gdl90_cfg_t gcfg = {
             .transport             = s_cdc_transport,
             .emit_ownship_report   = true,   // emit 0x0A when an ownship fix exists
@@ -1391,20 +1430,13 @@ esp_err_t adsbin_app_start(void)
         }
     }
 
-    /* ── 6b. GPS (OPTIONAL, best-effort) ────────────────────────────────────
-     * Start the MAX-M10S GPS clock service. Mirrors the WiFi block's contract:
-     * EVERY failure here is non-fatal — GPS is a bonus, never a precondition for
-     * decoding. When the GPS RX pin is -1 (the default) gps_clock_start() is a
-     * no-op and the box runs exactly as a GPS-less board. A wired module promotes
-     * the ownship through the central ownship service, which the GDL90 sinks pick
-     * up via the publisher snapshot (see the no-seed note in the sink blocks). */
-    {
-        esp_err_t gerr = gps_clock_start();
-        if (gerr != ESP_OK) {
-            ESP_LOGW(TAG, "gps_clock_start failed (%s) - GPS disabled, "
-                          "decode/ownship/sinks unaffected", esp_err_to_name(gerr));
-        }
-    }
+    /* GPS start is intentionally DEFERRED to after the Core-1 glue tasks below —
+     * see section 7b. gps_clock_start() brings up a UART + (optional) PPS capture
+     * peripherals and can take a noticeable time (or, with a misbehaving module,
+     * block); doing it BEFORE the decode/traffic/inject tasks are created meant a
+     * slow GPS bring-up wedged app_main and those tasks never spawned, so +INJECT /
+     * +STATUS / the QC console went dead. The essential pipeline tasks come up
+     * FIRST; GPS — a best-effort bonus — comes up last and can never gate them. */
 
     /* ── 7. Core-1 glue tasks main owns ─────────────────────────────────────
      * decode + traffic + the +INJECT console reader. All pinned to Core 1 so the
@@ -1432,7 +1464,7 @@ esp_err_t adsbin_app_start(void)
     // the reader can pull bytes immediately without owning a peripheral itself.
     ok = xTaskCreatePinnedToCore(inject_console_task, "adsbin_inject",
                                  ADSBIN_INJECT_TASK_STACK, NULL,
-                                 ADSBIN_PRIO_STATUS, NULL, ADSBIN_CORE_DECODE);
+                                 ADSBIN_PRIO_INJECT, NULL, ADSBIN_CORE_DECODE);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "failed to create inject console task");
         return ESP_ERR_NO_MEM;
@@ -1449,6 +1481,12 @@ esp_err_t adsbin_app_start(void)
 
     ESP_LOGI(TAG, "pipeline up: usb->demod(core0) -> decode/traffic/sinks(core1)%s",
              s_978_built ? " + 978 UAT/weather" : "");
+
+    /* NOTE: GPS is NOT started here. It is brought up early in adsbin_app_init(),
+     * right after gps_clock_init(), while the console + Core-1 are still quiet —
+     * that is the context in which its UART/UBX/PPS bring-up completes cleanly
+     * (verified by the isolation test). Starting it late, after this busy pipeline
+     * was already standing up, was why GPS never came alive in the full build. */
 
     return ESP_OK;
 }

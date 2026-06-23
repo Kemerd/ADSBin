@@ -45,9 +45,12 @@
 #include "gps_ubx.h"        // gps_ubx_configure() — optional boot config over TX
 
 /* The task priority lives in main's wiring header; mirror the value here without
- * taking a build dependency on `main` (a Core-1 housekeeping task, below sinks). */
+ * taking a build dependency on `main`. The GPS supervisor is the LOWEST Core-1
+ * housekeeping task — it MUST sit below the interactive console/inject reader
+ * (ADSBIN_PRIO_INJECT) so a UART-RX-bound GPS task can never starve operator I/O.
+ * Keep this in sync with ADSBIN_PRIO_STATUS in main/include/adsbin_app.h (=1). */
 #ifndef ADSBIN_PRIO_STATUS
-#define ADSBIN_PRIO_STATUS   2
+#define ADSBIN_PRIO_STATUS   1
 #endif
 
 static const char *TAG = "gps_clock";
@@ -89,6 +92,14 @@ void      gps_pps_tick(gps_pps_signals_t *sig, const gps_nmea_signals_t *nmea);
 #define GPS_DISCIPLINED_UNC_NS     100u   /**< Reported 1σ when freshly disciplined.       */
 
 #define GPS_UART_RX_BUF            512    /**< UART RX ring (NMEA bursts ≤ ~80 B/sentence). */
+#define GPS_UART_TX_BUF            256    /**< UART TX ring. MUST be non-zero: with a 0-size
+                                          *   TX buffer uart_write_bytes() writes straight to
+                                          *   the FIFO and BLOCKS until it drains — and during
+                                          *   the boot UBX-CFG burst that block was observed to
+                                          *   never return (hanging gps_clock_start()). A real
+                                          *   TX ring makes the write copy-and-return, so the
+                                          *   config burst can never wedge bring-up. 256 B holds
+                                          *   the whole VALSET frame with room to spare. */
 #define GPS_DRAIN_CHUNK            128    /**< Bytes pulled per tick from the UART driver.  */
 
 /* ───────────────────────────────────────────────────────────────────────────
@@ -590,7 +601,8 @@ esp_err_t gps_clock_start(void)
         ESP_LOGE(TAG, "uart_set_pin failed: %s", esp_err_to_name(err));
         return err;
     }
-    err = uart_driver_install((uart_port_t)s_cfg.uart_num, GPS_UART_RX_BUF, 0, 0, NULL, 0);
+    err = uart_driver_install((uart_port_t)s_cfg.uart_num, GPS_UART_RX_BUF,
+                              GPS_UART_TX_BUF, 0, NULL, 0);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "uart_driver_install failed: %s", esp_err_to_name(err));
         return err;
