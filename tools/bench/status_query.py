@@ -29,18 +29,34 @@ _STATUS_PREFIX = "=== ADSBIN STATUS"
 
 # One regex over the frozen token set. We anchor on the prefix and capture each
 # always-present KEY=VALUE; floats accept the printf NAN/INF spellings so an
-# unsampled temperature parses cleanly to a Python float('nan').
-_FLOAT = r"([-+]?(?:nan|inf|\d+(?:\.\d+)?))"
+# unsampled temperature (or an absent GPS fix) parses cleanly to float('nan').
+#
+# The grammar matches the firmware's status_handle_line() emission EXACTLY and is
+# named-group based so adding/removing a token is a one-line change on each side.
+# (No shipped units exist yet, so the parser and firmware move together — there is
+# no legacy line shape to stay compatible with.)
+_FLOAT = r"[-+]?(?:nan|inf|\d+(?:\.\d+)?)"
 _STATUS_RE = re.compile(
     r"===\s*ADSBIN STATUS\s+"
-    r"DONGLES=(\d+)\s+"
-    r"PRESENT=([01])\s+"
-    r"STREAMING=([01])\s+"
-    r"TEMP=" + _FLOAT + r"\s+"
-    r"PEAK=" + _FLOAT + r"\s+"
-    r"HEALTH=(\w+)\s+"
-    r"GPS=(\w+)\s+"
-    r"GPSFIX=([01])",
+    r"DONGLES=(?P<dongles>\d+)\s+"
+    r"PRESENT=(?P<present>[01])\s+"
+    r"STREAMING=(?P<streaming>[01])\s+"
+    r"B1090=(?P<b1090p>[01])/(?P<b1090s>[01])\s+"
+    r"B978=(?P<b978p>[01])/(?P<b978s>[01])\s+"
+    r"TEMP=(?P<temp>" + _FLOAT + r")\s+"
+    r"PEAK=(?P<peak>" + _FLOAT + r")\s+"
+    r"HEALTH=(?P<health>\w+)\s+"
+    r"GPS=(?P<gps>\w+)\s+"
+    r"GPSFIX=(?P<gpsfix>[01])\s+"
+    r"POSVALID=(?P<posvalid>[01])\s+"
+    r"LAT=(?P<lat>" + _FLOAT + r")\s+"
+    r"LON=(?P<lon>" + _FLOAT + r")\s+"
+    r"PRE=(?P<pre>\d+)\s+"
+    r"FRM=(?P<frm>\d+)\s+"
+    r"COK=(?P<cok>\d+)\s+"
+    r"CFAIL=(?P<cfail>\d+)\s+"
+    r"DFDROP=(?P<dfdrop>\d+)\s+"
+    r"POS=(?P<pos>\d+)",
     re.IGNORECASE,
 )
 
@@ -49,13 +65,34 @@ _STATUS_RE = re.compile(
 class UnitStatus:
     """One parsed ``=== ADSBIN STATUS ... ===`` line (WIRE_CONTRACT.md §4)."""
     dongles: int            # Count of adopted RTL-SDR dongles.
-    present: bool           # A dongle is enumerated.
-    streaming: bool         # The dongle is delivering IQ samples.
+    present: bool           # Any dongle is enumerated.
+    streaming: bool         # Any dongle is delivering IQ samples.
+
+    # ── Per-band SDR recognition (which antenna/dongle is alive). ────────────
+    b1090_present: bool     # The 1090ES traffic dongle enumerated.
+    b1090_streaming: bool   # The 1090ES dongle is delivering IQ.
+    b978_present: bool      # The 978 UAT weather dongle enumerated.
+    b978_streaming: bool    # The 978 dongle is delivering IQ.
+
     temp_c: float           # Live die temperature, °C (NaN if no sample yet).
     peak_c: float           # Peak die temperature since boot, °C (NaN if never).
     health: str             # OK / NO_DONGLE / OVERTEMP.
+
+    # ── GPS (ladder + live position). ────────────────────────────────────────
     gps: str                # NONE / FREE_RUNNING / NMEA_FIX / HOLDOVER / DISCIPLINED.
     gps_fix: bool           # A valid GPS ownship fix is live.
+    pos_valid: bool         # The ownship lat/lon below are usable.
+    lat_deg: float          # Ownship latitude,  WGS-84 (NaN if no fix).
+    lon_deg: float          # Ownship longitude, WGS-84 (NaN if no fix).
+
+    # ── 1090 decode ladder (RF → preamble → frame → CRC → position). ─────────
+    preambles: int          # Cumulative Mode-S preambles detected.
+    frames: int             # Cumulative candidate frames sliced.
+    crc_ok: int             # Frames that passed the Mode-S CRC.
+    crc_fail: int           # Frames that failed CRC.
+    df_dropped: int         # Frames dropped at the DF gate.
+    positions: int          # Resolved aircraft positions.
+
     raw: str                # The exact reply line, for diagnostics.
 
     @property
@@ -67,6 +104,13 @@ class UnitStatus:
     def peak_valid(self) -> bool:
         """True when the peak temperature is a real (finite) sample."""
         return math.isfinite(self.peak_c)
+
+    @property
+    def pos_str(self) -> str:
+        """Human position string: 'lat, lon' to 5 dp, or 'no fix'."""
+        if self.pos_valid and math.isfinite(self.lat_deg) and math.isfinite(self.lon_deg):
+            return f"{self.lat_deg:.5f}, {self.lon_deg:.5f}"
+        return "no fix"
 
 
 def parse_status_line(line: str) -> Optional[UnitStatus]:
@@ -80,15 +124,29 @@ def parse_status_line(line: str) -> Optional[UnitStatus]:
     if not m:
         return None
 
+    g = m.group
     return UnitStatus(
-        dongles=int(m.group(1)),
-        present=m.group(2) == "1",
-        streaming=m.group(3) == "1",
-        temp_c=float(m.group(4)),
-        peak_c=float(m.group(5)),
-        health=m.group(6).upper(),
-        gps=m.group(7).upper(),
-        gps_fix=m.group(8) == "1",
+        dongles=int(g("dongles")),
+        present=g("present") == "1",
+        streaming=g("streaming") == "1",
+        b1090_present=g("b1090p") == "1",
+        b1090_streaming=g("b1090s") == "1",
+        b978_present=g("b978p") == "1",
+        b978_streaming=g("b978s") == "1",
+        temp_c=float(g("temp")),
+        peak_c=float(g("peak")),
+        health=g("health").upper(),
+        gps=g("gps").upper(),
+        gps_fix=g("gpsfix") == "1",
+        pos_valid=g("posvalid") == "1",
+        lat_deg=float(g("lat")),
+        lon_deg=float(g("lon")),
+        preambles=int(g("pre")),
+        frames=int(g("frm")),
+        crc_ok=int(g("cok")),
+        crc_fail=int(g("cfail")),
+        df_dropped=int(g("dfdrop")),
+        positions=int(g("pos")),
         raw=line.strip(),
     )
 

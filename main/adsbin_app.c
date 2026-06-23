@@ -731,10 +731,45 @@ static bool status_handle_line(const char *line)
     const float STATUS_QC_CRIT_C = 95.0f;
     bool overtemp = (!isnan(temp_c) && temp_c >= STATUS_QC_CRIT_C);
 
+    /* ── Per-band SDR recognition (1090 + 978) ───────────────────────────────
+     * The aggregate DONGLES/PRESENT/STREAMING tokens above don't tell the QC
+     * operator WHICH antenna/dongle is alive. Walk the driver's slots and map each
+     * to its assigned band role, so the QC tool can assert that BOTH the 1090
+     * traffic dongle and the 978 weather dongle enumerated and are streaming on
+     * their own USB ports. b1090_* / b978_* are 0/1 present and streaming. */
+    int b1090_present = 0, b1090_stream = 0;
+    int b978_present  = 0, b978_stream  = 0;
+    for (int si = 0; si < 2; ++si) {
+        usb_rtlsdr_status_t ss = (usb_rtlsdr_status_t){0};
+        if (usb_rtlsdr_get_status_index(si, &ss) != ESP_OK) {
+            continue;
+        }
+        adsbin_rf_role_t role = usb_rtlsdr_role_of(si);
+        if (role == ADSBIN_ROLE_1090) {
+            b1090_present = ss.device_present ? 1 : 0;
+            b1090_stream  = ss.streaming      ? 1 : 0;
+        } else if (role == ADSBIN_ROLE_978_UAT) {
+            b978_present  = ss.device_present ? 1 : 0;
+            b978_stream   = ss.streaming      ? 1 : 0;
+        }
+    }
+
     /* ── GPS ladder snapshot ─────────────────────────────────────────────────
      * Wait-free seqlock read; quality NONE on a board with no GPS wired. */
     gps_clock_t gps = (gps_clock_t){0};
     (void)gps_clock_get(&gps);
+
+    /* ── GPS position (lat/lon) ──────────────────────────────────────────────
+     * The actual fix coordinates live in the ownship reference (the GPS NMEA
+     * layer pushes them there); gps_clock only carries the time ladder + a
+     * has_ownship_fix flag. Read ownship for printable lat/lon. When no valid fix
+     * is installed we emit a sentinel so the host shows "no fix" rather than 0,0
+     * (the Gulf-of-Guinea null-island trap). */
+    ownship_ref_t own = (ownship_ref_t){0};
+    (void)ownship_get(&own);
+    int    pos_valid = own.valid ? 1 : 0;
+    double lat = own.valid ? own.lat_deg : NAN;
+    double lon = own.valid ? own.lon_deg : NAN;
 
     /* ── Decode-chain counters (the localization ladder) ─────────────────────
      * These let an operator (or us, debugging in the field) see exactly WHERE the
@@ -759,21 +794,27 @@ static bool status_handle_line(const char *line)
      * present so the host can rely on a fixed field set. The decode-ladder tokens
      * (PRE/FRM/COK/CFAIL/DFDROP/POS) are appended after the legacy fields so older
      * parsers that key on the leading tokens keep working. */
-    char buf[320];
+    char buf[420];
     int n = snprintf(buf, sizeof(buf),
                      "=== ADSBIN STATUS "
                      "DONGLES=%d PRESENT=%d STREAMING=%d "
+                     "B1090=%d/%d B978=%d/%d "
                      "TEMP=%.1f PEAK=%.1f HEALTH=%s "
-                     "GPS=%s GPSFIX=%d "
+                     "GPS=%s GPSFIX=%d POSVALID=%d LAT=%.6f LON=%.6f "
                      "PRE=%llu FRM=%llu COK=%u CFAIL=%u DFDROP=%u POS=%u ===\n",
                      dongles,
                      (int)ust.device_present,
                      (int)ust.streaming,
+                     b1090_present, b1090_stream,
+                     b978_present,  b978_stream,
                      (double)temp_c,
                      (double)peak_c,
                      health_token(ust.device_present, overtemp),
                      gps_quality_token(gps.quality),
                      (int)gps.has_ownship_fix,
+                     pos_valid,
+                     (double)lat,
+                     (double)lon,
                      (unsigned long long)dstat.preambles_detected,
                      (unsigned long long)dstat.frames_emitted,
                      (unsigned)mstat.crc_ok,

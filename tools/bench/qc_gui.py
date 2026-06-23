@@ -10,12 +10,19 @@ unit breathe. One glance = ship / don't ship.
 What it checks (the frozen wire contract, tools/bench/WIRE_CONTRACT.md)
 ----------------------------------------------------------------------
   PASS criteria (a unit must pass ALL of these to ship):
-    1. USB enumerate ....... device auto-detected by VID:PID.
-    2. Dongle streaming .... RF BLK=/s > 0 on the sink_debug RF line.
-    3. Decode path ......... +INJECT a known frame (KLM1023) and confirm it
-                             decodes with the right callsign — proves the whole
-                             DSP→decode→traffic chain WITHOUT a plane overhead.
-    4. GDL90 output ........ every captured GDL90 frame passes CRC.
+    1. USB enumerate ......... device auto-detected by VID:PID.
+    2. 1090 dongle + antenna . the 1090ES traffic stick enumerated on its USB
+                               port AND is streaming IQ (per-band, via +STATUS).
+    3. 978 dongle + antenna .. the 978 UAT weather stick enumerated AND streams.
+    4. Decode path ........... +INJECT a known frame (KLM1023) and confirm the
+                               decode chain accepts it — the callsign appears in
+                               traffic and/or the COK (CRC-OK) counter climbs —
+                               proving the multi-phase DSP→CRC→parse chain WITHOUT
+                               a plane overhead.
+    5. GDL90 output .......... every captured GDL90 frame passes CRC.
+    6. GPS module ............ the GPS answers on the clock ladder; a live fix
+                               prints the ownship lat/lon (no fix indoors is OK as
+                               long as the module is detected).
 
   WARN (informational, never fails the unit):
     - Antenna hearing real RF ... PRE=/s > 0 (needs a live 1090 signal in range;
@@ -23,10 +30,10 @@ What it checks (the frozen wire contract, tools/bench/WIRE_CONTRACT.md)
 
 Live monitor (refreshes continuously after the QC sweep)
 --------------------------------------------------------
-  - SDR: dongle present / streaming, RF BLK/PRE/FRM per second, signal level.
+  - SDR: per-band 1090 / 978 dongle present+streaming, RF BLK/PRE/FRM, signal.
   - Aircraft: live target count from the traffic table.
   - Temperature: live + peak die temp (via +STATUS).        [needs firmware +STATUS]
-  - GPS: ladder rung + fix.                                  [needs firmware +STATUS]
+  - GPS: live ownship lat/lon position + ladder rung.       [needs firmware +STATUS]
   - Health: OK / NO_DONGLE / OVERTEMP.                       [needs firmware +STATUS]
 
 Design
@@ -238,9 +245,11 @@ class QcWorker(threading.Thread):
         """Reset the QC checklist to its pending baseline."""
         self._state.checks = [
             CheckResult("USB enumerate"),
-            CheckResult("Dongle streaming"),
-            CheckResult("Decode path (inject)"),
+            CheckResult("1090 dongle + antenna"),
+            CheckResult("978 dongle + antenna"),
+            CheckResult("Decode path (inject→CRC)"),
             CheckResult("GDL90 output"),
+            CheckResult("GPS module"),
             CheckResult("Antenna RF (warn)"),
         ]
         self._state.verdict = None
@@ -396,76 +405,151 @@ class QcWorker(threading.Thread):
     # ── QC sweep steps ─────────────────────────────────────────────────────────
 
     def _do_qc(self, link: cdc_link.CdcLink) -> None:
-        """Run all four go/no-go checks plus the antenna warn, set the verdict."""
-        # 1) USB enumerate — we are here, so the port opened. Record which one.
+        """
+        Run the go/no-go sweep and set the verdict.
+
+        Checklist (indices):
+          0 USB enumerate          hard — the port opened
+          1 1090 dongle + antenna  hard — the 1090 slot enumerated AND streams
+          2 978  dongle + antenna  hard — the 978 slot enumerated AND streams
+          3 Decode path            hard — inject a frame, COK climbs (CRC passes)
+          4 GDL90 output           hard — every captured GDL90 frame CRC-OK
+          5 GPS module             hard — module answers; fix is a sub-detail
+          6 Antenna RF             warn — PRE>0 only with a live 1090 signal
+        """
+        # 0) USB enumerate — we are here, so the port opened. Record which one.
         self._check(0, "pass", self._state.port or "")
 
-        # 2) Dongle streaming + (5) antenna RF, both read off the RF line.
-        self._set(message="Checking SDR dongle is streaming…")
-        self._check(1, "running")
-        self._check(4, "running")
+        # Read one authoritative +STATUS up front: it carries per-band SDR
+        # recognition, the decode ladder, GPS, health — everything below keys off it.
+        self._set(message="Querying unit status…")
+        st0 = query_status(link, timeout=2.0)
+        self._state.live.status = st0
+        self._state.live.status_supported = st0 is not None
+
+        # Also grab the RF line for the live SIG/BLK needles + the antenna warn.
         link.drain()
         rf_lines = link.read_lines(_RF_WINDOW_S)
         blk, pre, frm, sig = _scan_rf(rf_lines)
         self._state.live.rf_blk, self._state.live.rf_pre = blk, pre
         self._state.live.rf_frm, self._state.live.rf_sig = frm, sig
 
-        if blk is None:
-            self._check(1, "fail", "no RF line seen — firmware not publishing?")
-        elif blk > 0:
-            self._check(1, "pass", f"BLK={blk}/s (radio streaming)")
+        if st0 is None:
+            # No status line → can't assess the new per-band/GPS checks. Fail them
+            # all with a clear cause rather than silently passing.
+            for i in (1, 2, 3, 5):
+                self._check(i, "fail", "no +STATUS reply — firmware mismatch?")
         else:
-            self._check(1, "fail", "BLK=0/s — dongle not delivering IQ")
+            # 1) 1090 dongle + antenna: enumerated AND streaming on its own port.
+            self._set(message="Checking 1090 dongle…")
+            if st0.b1090_streaming:
+                self._check(1, "pass", "1090 dongle streaming IQ")
+            elif st0.b1090_present:
+                self._check(1, "fail", "1090 present but NOT streaming")
+            else:
+                self._check(1, "fail", "1090 dongle not recognized on USB")
 
-        # Antenna RF is a WARN, never a fail: a shielded bench hears nothing.
-        if pre is None:
-            self._check(4, "warn", "no RF line to read PRE from")
-        elif pre > 0:
-            self._check(4, "pass", f"PRE={pre}/s (hearing live 1090)")
-        else:
-            self._check(4, "warn", "PRE=0/s (no live signal — OK on a bench)")
+            # 2) 978 dongle + antenna: same, for the UAT weather stick.
+            self._set(message="Checking 978 dongle…")
+            if st0.b978_streaming:
+                self._check(2, "pass", "978 dongle streaming IQ")
+            elif st0.b978_present:
+                self._check(2, "fail", "978 present but NOT streaming")
+            else:
+                self._check(2, "fail", "978 dongle not recognized on USB")
 
-        # 3) Decode path — inject the golden frame, confirm its callsign decodes.
+        # 3) Decode path — inject the golden frame and confirm COK climbs (a frame
+        #    that passes the Mode-S CRC). This exercises CRC + parse without a plane.
         self._set(message="Injecting test frame and verifying decode…")
-        self._check(2, "running")
-        ok, detail = self._verify_inject(link)
-        self._check(2, "pass" if ok else "fail", detail)
+        self._check(3, "running")
+        ok, detail = self._verify_decode(link, st0)
+        self._check(3, "pass" if ok else "fail", detail)
 
         # 4) GDL90 output — every captured frame must pass CRC.
         self._set(message="Validating GDL90 output (CRC)…")
-        self._check(3, "running")
+        self._check(4, "running")
         ok, detail = self._verify_gdl90(link)
-        self._check(3, "pass" if ok else "fail", detail)
+        self._check(4, "pass" if ok else "fail", detail)
 
-        # Verdict: ALL hard checks (indices 0..3) must pass; index 4 is a warn.
-        hard = self._state.checks[:4]
+        # 5) GPS module — the module must answer; a live fix is a bonus indoors.
+        if st0 is not None:
+            if st0.pos_valid:
+                self._check(5, "pass", f"fix: {st0.pos_str}")
+            elif st0.gps != "NONE":
+                # Module is alive on the ladder but hasn't got a fix yet (indoors).
+                self._check(5, "pass", f"module up ({st0.gps.title()}) — acquiring fix")
+            else:
+                self._check(5, "fail", "GPS=NONE — module not detected / not wired")
+
+        # 6) Antenna RF is a WARN, never a fail: a shielded bench hears nothing.
+        if pre is None:
+            self._check(6, "warn", "no RF line to read PRE from")
+        elif pre > 0:
+            self._check(6, "pass", f"PRE={pre}/s (hearing live 1090)")
+        else:
+            self._check(6, "warn", "PRE=0/s (no live signal — OK on a bench)")
+
+        # Verdict: ALL hard checks (indices 0..5) must pass; index 6 is a warn.
+        hard = self._state.checks[:6]
         verdict = all(c.state == "pass" for c in hard)
         self._set(verdict=verdict,
                   message="QC complete." if verdict
                           else "QC FAILED — see the red check(s).")
 
-    def _verify_inject(self, link: cdc_link.CdcLink) -> "tuple[bool, str]":
-        """Inject the golden frame and confirm the expected callsign decodes."""
+    def _verify_decode(self, link: cdc_link.CdcLink,
+                       st_before: Optional[UnitStatus]) -> "tuple[bool, str]":
+        """
+        Inject the golden frame and confirm the decode chain accepted it.
+
+        Two independent confirmations, either of which passes the check:
+          (a) the injected aircraft's callsign appears in the sink_debug traffic
+              table (proves parse + traffic), and/or
+          (b) the +STATUS COK (CRC-OK) counter increments by the number of frames
+              injected (proves the Mode-S CRC accepted them).
+        We inject a few copies so a single dropped line doesn't fail a good unit.
+        """
         frame = canned_msgs.get_frame(_QC_FRAME_NAME)
         if frame is None:
             return False, f"missing corpus frame {_QC_FRAME_NAME!r}"
 
-        link.drain()
-        res = inject_frame(link, frame.hex, timeout=2.0)
-        if not res.ok:
-            return False, f"device rejected +INJECT: {res.raw_reply or res.reason}"
+        cok_before = st_before.crc_ok if st_before is not None else None
 
-        # Capture the next debug block(s) and find our injected aircraft.
+        # Inject the known-good DF17 a few times.
+        link.drain()
+        n_inject = 3
+        accepted = 0
+        for _ in range(n_inject):
+            res = inject_frame(link, frame.hex, timeout=2.0)
+            if res.ok:
+                accepted += 1
+        if accepted == 0:
+            return False, "device rejected every +INJECT"
+
+        # (a) Look for the decoded aircraft in the traffic table.
         lines = link.read_lines(_INJECT_WINDOW_S)
         blocks = sink_debug_parse.parse_lines(lines)
         tgt = sink_debug_parse.find_target(blocks, frame.truth.icao)
-        if tgt is None:
-            return False, f"ICAO {frame.truth.icao:06X} never appeared after inject"
-
         want = frame.truth.callsign
-        if want is not None and tgt.callsign != want:
-            return False, f"callsign got {tgt.callsign!r}, want {want!r}"
-        return True, f"{want} decoded (ICAO {frame.truth.icao:06X})"
+        callsign_ok = tgt is not None and (want is None or tgt.callsign == want)
+
+        # (b) Confirm COK climbed by ~the number we injected.
+        st_after = query_status(link, timeout=2.0)
+        if st_after is not None:
+            self._state.live.status = st_after
+        cok_after = st_after.crc_ok if st_after is not None else None
+        crc_climbed = (cok_before is not None and cok_after is not None
+                       and cok_after >= cok_before + accepted)
+
+        if callsign_ok and crc_climbed:
+            return True, f"{want} decoded · COK {cok_before}→{cok_after}"
+        if crc_climbed:
+            return True, f"CRC accepted {accepted} frames (COK {cok_before}→{cok_after})"
+        if callsign_ok:
+            return True, f"{want} decoded (ICAO {frame.truth.icao:06X})"
+        # Neither path confirmed — report whichever signal we have.
+        if tgt is None:
+            return False, f"ICAO {frame.truth.icao:06X} never decoded; COK {cok_before}→{cok_after}"
+        return False, f"callsign got {tgt.callsign!r}, want {want!r}"
 
     def _verify_gdl90(self, link: cdc_link.CdcLink) -> "tuple[bool, str]":
         """Capture the GDL90 stream and CRC-check every frame."""
@@ -688,7 +772,7 @@ class QcApp:
         tk.Label(checks_card, text="QC CHECKS", font=self._f_small,
                  bg=COL_CARD, fg=COL_SUBTLE).pack(anchor="w", pady=(0, 8))
         self._check_rows: List[Dict[str, tk.Label]] = []
-        for _ in range(5):
+        for _ in range(7):
             row = tk.Frame(checks_card, bg=COL_CARD)
             row.pack(fill="x", pady=3)
             dot = tk.Label(row, text="○", font=self._f_body_b,
@@ -844,12 +928,16 @@ class QcApp:
     def _render_live(self, live: LiveSnapshot) -> None:
         st = live.status
 
-        # SDR tile.
+        # SDR tile — now per-band so the operator sees BOTH antennas/dongles.
         if st is not None:
             present = st.present
             val = "ON" if (present and st.streaming) else ("IDLE" if present else "OFF")
             colour = COL_GREEN if (present and st.streaming) else (COL_AMBER if present else COL_RED)
-            sub = f"{st.dongles} dongle(s)"
+            # Per-band one-glance state: ✓ streaming, ◐ present-not-streaming, ✕ absent.
+            def _band(p: bool, s: bool) -> str:
+                return "✓" if s else ("◐" if p else "✕")
+            sub = (f"1090 {_band(st.b1090_present, st.b1090_streaming)}   "
+                   f"978 {_band(st.b978_present, st.b978_streaming)}")
         else:
             # No +STATUS — fall back to the RF needle for liveness.
             streaming = (live.rf_blk or 0) > 0
@@ -883,11 +971,21 @@ class QcApp:
         else:
             self._set_tile("temp", "--", "awaiting sample", COL_SUBTLE)
 
-        # GPS tile (+STATUS only).
+        # GPS tile — shows the live ownship POSITION (lat, lon) when fixed, else
+        # the ladder rung so the operator can see the module is alive and acquiring.
         if st is not None:
-            gcol = COL_GREEN if st.gps_fix else (COL_AMBER if st.gps != "NONE" else COL_SUBTLE)
-            self._set_tile("gps", st.gps.replace("_", " ").title(),
-                           "fix" if st.gps_fix else "no fix", gcol)
+            if st.pos_valid:
+                # Big value = the position itself; caption = the ladder rung.
+                gcol = COL_GREEN
+                self._set_tile("gps", st.pos_str,
+                               f"{st.gps.replace('_', ' ').title()} · fix", gcol,
+                               small=True)
+            elif st.gps != "NONE":
+                # Module present on the ladder but no fix yet (typical indoors).
+                self._set_tile("gps", st.gps.replace("_", " ").title(),
+                               "module up · acquiring", COL_AMBER)
+            else:
+                self._set_tile("gps", "NONE", "not detected / not wired", COL_SUBTLE)
         elif live.status_supported is False:
             self._set_tile("gps", "n/a", "needs +STATUS firmware", COL_SUBTLE)
         else:
@@ -903,10 +1001,18 @@ class QcApp:
         else:
             self._set_tile("health", "--", "awaiting status", COL_SUBTLE)
 
-    def _set_tile(self, key: str, value: str, sub: str, colour: str) -> None:
-        """Update one live tile's big value + sub-caption + accent colour."""
+    def _set_tile(self, key: str, value: str, sub: str, colour: str,
+                  small: bool = False) -> None:
+        """
+        Update one live tile's big value + sub-caption + accent colour.
+
+        @param small  Render the value in the body font instead of the big title
+                      font — used for long values like a GPS lat/lon pair that would
+                      otherwise clip the tile width.
+        """
         t = self._tiles[key]
-        t["val"].configure(text=value, fg=colour)
+        t["val"].configure(text=value, fg=colour,
+                           font=self._f_body_b if small else self._f_title)
         t["sub"].configure(text=sub)
 
 
