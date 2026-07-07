@@ -141,3 +141,9 @@ CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM=y
 CONFIG_ADSBIN_GPS_UART_RX_GPIO=20
 CONFIG_ADSBIN_GPS_UART_TX_GPIO=21
 CONFIG_ADSBIN_GPS_PPS_GPIO=22
+
+# REAL-TIME BUILD — the flight audit proved the 2.4 Msps demod cannot meet its
+# Core-0 budget at -Og (bench: 14 of the required ~146 IQ blocks/s consumed).
+# The DSP hot paths are integer-only now, but the radio path still needs -O2:
+# debug builds are for the bench with the SDR idle, never for the air.
+CONFIG_COMPILER_OPTIMIZATION_PERF=y

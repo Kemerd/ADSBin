@@ -616,12 +616,13 @@ void gdl90_traffic_from_target(gdl90_traffic_t *out, const traffic_target_t *tgt
                            : 0;
 
     // Callsign: copy when known, else leave the all-zero buffer (encoder pads it
-    // to 8 spaces on the wire).
+    // to 8 spaces on the wire). Both buffers are ADSB_CALLSIGN_LEN (8 chars +
+    // NUL); a bounded strlen + memcpy copies exactly the live characters and
+    // keeps the rest zeroed, with the terminator guaranteed by construction.
     if (tgt->has_callsign) {
-        // strncpy bounded to the shared buffer length; guarantees no overrun and
-        // leaves trailing zeros that the encoder turns into spaces.
-        strncpy(out->callsign, tgt->callsign, ADSB_CALLSIGN_LEN - 1);
-        out->callsign[ADSB_CALLSIGN_LEN - 1] = '\0';
+        size_t n = strnlen(tgt->callsign, ADSB_CALLSIGN_LEN - 1);
+        memcpy(out->callsign, tgt->callsign, n);
+        out->callsign[n] = '\0';
     }
 
     // No emergency signalling from a receive-only box.
