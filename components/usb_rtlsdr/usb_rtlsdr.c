@@ -864,7 +864,8 @@ static esp_err_t r820t_apply_gain(usb_rtlsdr_dev_t *d, usb_rtlsdr_gain_mode_t mo
                             (uint8_t)(mix_step & R820T_GAIN_STEP_MASK),
                             (uint8_t)(R820T_STAGE_MODE_BIT | R820T_GAIN_STEP_MASK));
 
-    /* VGA reg 0x0C: fixed mid-high IF gain step (0x0B ~ 16.3 dB), bit4 clear.
+    /* VGA reg 0x0C: fixed mid-high IF gain step (0x0B ≈ 26 dB at ~3.5 dB/step;
+     * librtlsdr's default fixed step is 0x08 ≈ 16.3 dB), bit4 clear.
      * Bits 6:5 carry non-gain control and are preserved (mask 0x9F). */
     err |= r820t_write_mask(d, R820T_REG_VGA_GAIN, 0x0B, R820T_VGA_WRITE_MASK);
 
@@ -902,13 +903,13 @@ static esp_err_t r820t_init(usb_rtlsdr_dev_t *d)
         /* 0x0D LNA AGC top.                                                  */ 0x63,
         /* 0x0E mixer AGC top.                                                */ 0x75,
         /* 0x0F reserved/clk.                                                 */ 0x68,
-        /* 0x10 PLL VCO + divider (overwritten by set_pll).                  */ 0x6C,
-        /* 0x11 PLL frac lo.                                                  */ 0x83,
-        /* 0x12 PLL frac hi.                                                  */ 0x80,
-        /* 0x13 PLL Nint.                                                     */ 0x00,
-        /* 0x14 PLL VCO ctrl.                                                 */ 0x0F,
-        /* 0x15 reserved.                                                     */ 0x00,
-        /* 0x16 reserved.                                                     */ 0xC0,
+        /* 0x10 PLL refdiv + VCO post-divider (overwritten by set_pll).      */ 0x6C,
+        /* 0x11 PLL analog / charge-pump current.                             */ 0x83,
+        /* 0x12 VCO core current [7:5] + SDM power bit3 (set_pll manages).   */ 0x80,
+        /* 0x13 VCO band / autotune state (chip-managed).                     */ 0x00,
+        /* 0x14 PLL integer divider word (overwritten by set_pll).           */ 0x0F,
+        /* 0x15 PLL SDM fraction LSB (overwritten by set_pll).               */ 0x00,
+        /* 0x16 PLL SDM fraction MSB (overwritten by set_pll).               */ 0xC0,
         /* 0x17 reserved.                                                     */ 0x30,
         /* 0x18 reserved.                                                     */ 0x48,
         /* 0x19 reserved.                                                     */ 0xCC,
@@ -2883,6 +2884,7 @@ esp_err_t usb_rtlsdr_get_status_index(int idx, usb_rtlsdr_status_t *out)
     out->state          = d->state;
     out->device_present = (d->dev != NULL);
     out->streaming      = (d->state == USB_RTLSDR_STATE_STREAMING);
+    out->pll_locked     = d->pll_locked;
     out->last_error     = d->last_error;
     out->last_block_us  = d->last_block_us;
     unlock();

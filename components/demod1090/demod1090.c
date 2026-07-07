@@ -584,7 +584,14 @@ static void process_magnitude(const uint16_t *m, uint32_t n,
         mag_sum += m[k];
     }
     const uint32_t mag_mean = (uint32_t)(mag_sum / (n ? n : 1u));
-    const uint32_t gate_hi  = mag_mean + (mag_mean >> 1);     /* 1.5 × mean     */
+    uint32_t gate_hi        = mag_mean + (mag_mean >> 1);     /* 1.5 × mean     */
+    /* Clamp below the uint16 magnitude ceiling: past a mean of ~43690 the raw
+     * 1.5× threshold exceeds 65535 and NOTHING could pass the strict '>' — a
+     * rail-amplitude interferer would blind the demod completely instead of
+     * just degrading it. Clamped, a saturated pulse (65535) always gates in.  */
+    if (gate_hi > 65534u) {
+        gate_hi = 65534u;
+    }
     const uint32_t g_lo     = s_ctx.gate_idx_lo;
     const uint32_t g_hi     = s_ctx.gate_idx_hi;
 

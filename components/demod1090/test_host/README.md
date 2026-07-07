@@ -36,7 +36,10 @@ rm -f esp_timer.h esp_err.h test_preamble   # don't leave shadows around
   point-sampling detector fails a large slice of phases outright — this is the
   in-flight "strong traffic overhead, nothing decodes" failure mode.
 - **Short frames:** DF11 (56-bit) across the same sweep.
-- **Weak signal:** graceful degradation (≥60% at ~14 dB SNR), no cliff.
+- **Weak signal (regression canary):** at ~10 dB SNR, ≥40% of bursts must still
+  reach the CRC stage (captured within 3 bits of truth; measured ~48% at the
+  fixed seed). Exact-match yield at this SNR is physics-limited (~(1-p)^112) —
+  raising it belongs to decode-side 1-bit CRC repair, not the demod.
 - **Pure noise:** with a hot front end (49.6 dB gain noise floor) the pre-gate +
   correlator must keep the false-candidate rate bounded — this bounds the
   garbage load on Core 0/Core 1 (CRC kills the survivors downstream).

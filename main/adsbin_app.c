@@ -736,9 +736,12 @@ static bool status_handle_line(const char *line)
      * operator WHICH antenna/dongle is alive. Walk the driver's slots and map each
      * to its assigned band role, so the QC tool can assert that BOTH the 1090
      * traffic dongle and the 978 weather dongle enumerated and are streaming on
-     * their own USB ports. b1090_* / b978_* are 0/1 present and streaming. */
-    int b1090_present = 0, b1090_stream = 0;
-    int b978_present  = 0, b978_stream  = 0;
+     * their own USB ports. b1090_* / b978_* are 0/1 present and streaming; the
+     * third flag per band is the tuner PLL LOCK — a streaming band with lock=0
+     * is DETUNED and structurally deaf (bytes flow, nothing can ever decode),
+     * which byte/BLK counters alone can never reveal. */
+    int b1090_present = 0, b1090_stream = 0, b1090_lock = 0;
+    int b978_present  = 0, b978_stream  = 0, b978_lock  = 0;
     for (int si = 0; si < 2; ++si) {
         usb_rtlsdr_status_t ss = (usb_rtlsdr_status_t){0};
         if (usb_rtlsdr_get_status_index(si, &ss) != ESP_OK) {
@@ -748,9 +751,11 @@ static bool status_handle_line(const char *line)
         if (role == ADSBIN_ROLE_1090) {
             b1090_present = ss.device_present ? 1 : 0;
             b1090_stream  = ss.streaming      ? 1 : 0;
+            b1090_lock    = ss.pll_locked     ? 1 : 0;
         } else if (role == ADSBIN_ROLE_978_UAT) {
             b978_present  = ss.device_present ? 1 : 0;
             b978_stream   = ss.streaming      ? 1 : 0;
+            b978_lock     = ss.pll_locked     ? 1 : 0;
         }
     }
 
@@ -801,7 +806,11 @@ static bool status_handle_line(const char *line)
                      "B1090=%d/%d B978=%d/%d "
                      "TEMP=%.1f PEAK=%.1f HEALTH=%s "
                      "GPS=%s GPSFIX=%d POSVALID=%d LAT=%.6f LON=%.6f "
-                     "PRE=%llu FRM=%llu COK=%u CFAIL=%u DFDROP=%u POS=%u ===\n",
+                     "PRE=%llu FRM=%llu COK=%u CFAIL=%u DFDROP=%u POS=%u "
+                     /* PLL lock per band, appended (additive, keeps old parsers
+                      * working): streaming with PLL=0 means DETUNED — noise in,
+                      * zero decodes forever. The flight-failure telltale.      */
+                     "PLL1090=%d PLL978=%d ===\n",
                      dongles,
                      (int)ust.device_present,
                      (int)ust.streaming,
@@ -820,7 +829,8 @@ static bool status_handle_line(const char *line)
                      (unsigned)mstat.crc_ok,
                      (unsigned)mstat.crc_fail,
                      (unsigned)mstat.df_dropped,
-                     (unsigned)positions);
+                     (unsigned)positions,
+                     b1090_lock, b978_lock);
     if (n > 0) {
         inject_reply(buf);
     }

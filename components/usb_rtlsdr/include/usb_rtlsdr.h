@@ -130,6 +130,13 @@ typedef struct {
     usb_rtlsdr_state_t state;
     bool               device_present;
     bool               streaming;
+    bool               pll_locked;     /**< Tuner PLL lock at the last retune.
+                                        *   false while streaming = the radio is
+                                        *   DETUNED: bytes flow but they are
+                                        *   noise and nothing will ever decode.
+                                        *   The one condition byte counters
+                                        *   cannot reveal — check it first when
+                                        *   a band is silent.                   */
     esp_err_t          last_error;     /**< Last non-fatal error, ESP_OK if none. */
     int64_t            last_block_us;  /**< adsbin_now_us() of latest block (0=n/a).*/
 } usb_rtlsdr_status_t;
