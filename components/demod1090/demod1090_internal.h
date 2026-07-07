@@ -22,11 +22,17 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+/* Host unit tests compile this component with -DDEMOD1090_HOST_TEST=1 (see
+ * test_host/): the FreeRTOS task shell is excluded and only the pure DSP core
+ * (LUT, preamble correlator, PPM slicer, scan loop) is built, exactly like
+ * demod978's UAT_HOST_TEST arrangement. */
+#ifndef DEMOD1090_HOST_TEST
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/ringbuf.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
+#endif
 #include "adsbin_types.h"
 #include "demod1090.h"
 
@@ -81,17 +87,49 @@ extern "C" {
 #define DEMOD_DEFAULT_PREAMBLE   28      /**< Default min correlation score.     */
 
 /* ───────────────────────────────────────────────────────────────────────────
- *  Multi-phase slicing bank.
+ *  Multi-phase PREAMBLE DETECTION bank.
  *
- *  At 2.4 Msps a bit is 2.4 samples, so the bit grid's phase relative to our
- *  integer sample stream is unknown to within ±½ a sample. We slice the data at
- *  DEMOD_PHASE_STEPS sub-sample phase hypotheses spread across one whole sample
- *  period and keep the phase whose per-bit PPM margins are largest (the matched-
- *  filter-optimal phase). 5 steps = a 0.2-sample phase resolution, well inside
- *  the tolerance needed to keep all 112 bits on the correct half-bit windows.
- *  Derived from matched-filter sampling-phase theory — see CITATIONS.md §B.
+ *  At 2.4 Msps the preamble's true start lands anywhere inside one sample
+ *  period, and a single fixed sample-index template only "sees" arrivals whose
+ *  phase happens to put its point samples on the pulse plateaus — a large slice
+ *  of real arrivals is simply undetectable that way. So detection itself runs
+ *  DEMOD_PRE_PHASES index templates, each precomputed (at init, in integers)
+ *  for a different assumed sub-sample arrival phase; a candidate passes if ANY
+ *  template accepts, and the winning template's phase seeds the data slicer.
+ *  3 templates = ±1/6-sample worst-case phase error at detection, well inside
+ *  the ±0.6-sample half-bit decision margin.
+ * ─────────────────────────────────────────────────────────────────────────── */
+#define DEMOD_PRE_PHASES         3       /**< Preamble phase templates tried.    */
+#define DEMOD_PRE_PULSES         4       /**< Mode-S preamble pulse count.       */
+#define DEMOD_PRE_VALLEYS        5       /**< Quiet points checked per template. */
+
+/**
+ * @brief One precomputed preamble index template for a given sub-sample phase.
+ *
+ * @details
+ *   Offsets are integer samples RELATIVE to the candidate start index, chosen
+ *   at init so each lands nearest the centre of its pulse / quiet slot for the
+ *   template's assumed arrival phase. The hot loop is then pure integer loads
+ *   and compares — no floating point of any kind (the P4 has no double FPU;
+ *   soft-double per scanned sample was what put the demod 3–9× over budget).
+ */
+typedef struct {
+    uint16_t pulse[DEMOD_PRE_PULSES];    /**< Pulse-centre sample offsets.       */
+    uint16_t valley[DEMOD_PRE_VALLEYS];  /**< Quiet-slot sample offsets.         */
+} demod_pre_tpl_t;
+
+/* ───────────────────────────────────────────────────────────────────────────
+ *  Multi-phase DATA slicing bank.
+ *
+ *  Detection pins the arrival phase to ±1/6 sample (one template class, above),
+ *  or ±1/2 sample if the scorer picked a neighbouring class on a noisy burst.
+ *  The data slicer therefore sweeps DEMOD_PHASE_STEPS hypotheses spaced
+ *  DEMOD_PHASE_STEP_FP apart, CENTRED on the detected phase (covering ±1/3 of a
+ *  sample), and keeps the phase whose per-bit PPM margins are largest (the
+ *  matched-filter-optimal phase). See CITATIONS.md §B.
  * ─────────────────────────────────────────────────────────────────────────── */
 #define DEMOD_PHASE_STEPS        5       /**< Sub-sample phase hypotheses tried. */
+#define DEMOD_PHASE_STEP_FP      (DEMOD_FP_ONE / 6)  /**< Spacing: 1/6 sample.   */
 
 /* ───────────────────────────────────────────────────────────────────────────
  *  Magnitude look-up table.
@@ -117,8 +155,24 @@ typedef struct {
     uint32_t task_stack_size;       /**< Task stack in bytes.                    */
     uint8_t  preamble_threshold;    /**< Min preamble correlation score.         */
 
-    /* ---- precomputed DSP geometry (set in init) ---- */
+    /* ---- precomputed DSP geometry (set once in init; ALL hot-path index and
+     *      span math reads these — the scan loop itself never touches floating
+     *      point, because every double op is a soft-float library call on the
+     *      P4's single-precision-only FPU) ---- */
     uint64_t fp_samples_per_us;     /**< samples/µs in 32.32 fixed-point.        */
+    uint64_t fp_bit;                /**< One 1 µs PPM bit, fp samples.           */
+    uint64_t fp_half;               /**< Half a bit (PPM decision window), fp.   */
+    uint64_t fp_data_start;         /**< Preamble→data gap (8 µs), fp samples.   */
+    uint32_t span_preamble;         /**< Whole preamble, integer samples (ceil). */
+    uint32_t span_short;            /**< Preamble + 56 bits, samples (+margin).  */
+    uint32_t span_full;             /**< Preamble + 112 bits, samples (+margin). */
+
+    /* ---- preamble phase-template bank (see DEMOD_PRE_PHASES) ---- */
+    demod_pre_tpl_t pre_tpl[DEMOD_PRE_PHASES]; /**< Integer index templates.     */
+    uint64_t pre_phase_fp[DEMOD_PRE_PHASES];   /**< Each template's phase, fp.   */
+    uint32_t pre_window;            /**< Max template offset + slack (bounds).   */
+    uint32_t gate_idx_lo;           /**< First pulse-0 offset across templates.  */
+    uint32_t gate_idx_hi;           /**< Last  pulse-0 offset across templates.  */
 
     /* ---- magnitude LUT (heap, 64 KiB) ---- */
     uint16_t *mag_lut;              /**< [256*256] (I<<8 | Q) → magnitude.        */
@@ -127,7 +181,8 @@ typedef struct {
     uint16_t *mag;                  /**< Magnitude buffer for the current block.  */
     uint32_t  mag_cap;             /**< Capacity of @c mag in samples.           */
 
-    /* ---- runtime handles ---- */
+#ifndef DEMOD1090_HOST_TEST
+    /* ---- runtime handles (firmware only; the host test has no RTOS) ---- */
     RingbufHandle_t iq_ring;        /**< Borrowed source ring (from usb_rtlsdr).  */
     QueueHandle_t   out_queue;      /**< Borrowed destination frame queue.        */
     TaskHandle_t    task;           /**< The Core-0 demod task.                   */
@@ -138,12 +193,30 @@ typedef struct {
     uint32_t last_seq;              /**< Last iq_block_t.seq we consumed.         */
     bool     have_seq;             /**< false until the first block arrives.     */
 
-    /* ---- stats (guarded by stats_mux) ---- */
+    /* ---- stats lock (host build keeps bare counters, no readers race) ---- */
     SemaphoreHandle_t stats_mux;
+#endif
     demod1090_stats_t stats;
 
     bool inited;                    /**< demod1090_init() succeeded.              */
 } demod1090_ctx_t;
+
+#ifdef DEMOD1090_HOST_TEST
+/* ───────────────────────────────────────────────────────────────────────────
+ *  Host-test surface. The test provides the capture hook; the shims below are
+ *  implemented in demod1090.c under the same guard and drive the SAME pure
+ *  pipeline the firmware task uses (LUT → scan → slice → emit).
+ * ─────────────────────────────────────────────────────────────────────────── */
+/** @brief Build the LUT + geometry for a host run (no task, no RTOS). */
+esp_err_t demod1090_host_setup(uint32_t sample_rate_hz, uint8_t preamble_threshold);
+/** @brief Run one interleaved-IQ buffer through magnitude + preamble scan.
+ *  @return number of magnitude samples processed. */
+uint32_t demod1090_host_process_iq(const uint8_t *iq, uint32_t n_bytes, int64_t t_us);
+/** @brief Free host-run allocations. */
+void demod1090_host_teardown(void);
+/** @brief PROVIDED BY THE TEST: receives every emitted candidate frame. */
+void demod1090_host_capture(const modes_frame_t *frame);
+#endif
 
 #ifdef __cplusplus
 }

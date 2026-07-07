@@ -55,6 +55,11 @@
 #include <string.h>
 #include <math.h>
 
+/* The host unit test builds this file with -DDEMOD1090_HOST_TEST=1: no RTOS, no
+ * ESP heap/log — plain libc stand-ins below keep the PURE DSP core identical
+ * between target and host so the test exercises the exact shipping code path
+ * (LUT → preamble scan → PPM slice → emit). Same arrangement as demod978. */
+#ifndef DEMOD1090_HOST_TEST
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/ringbuf.h"
@@ -62,11 +67,23 @@
 #include "freertos/semphr.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#else
+#include <stdio.h>
+#define ESP_LOGE(tag, fmt, ...) fprintf(stderr, "[%s] " fmt "\n", tag, ##__VA_ARGS__)
+#define ESP_LOGI(tag, fmt, ...) printf("[%s] " fmt "\n", tag, ##__VA_ARGS__)
+#define heap_caps_malloc(sz, caps)     malloc(sz)
+#define heap_caps_realloc(p, sz, caps) realloc((p), (sz))
+#define heap_caps_free(p)              free(p)
+#define MALLOC_CAP_INTERNAL 0
+#define MALLOC_CAP_8BIT     0
+#endif
 
 #include "demod1090.h"
 #include "demod1090_internal.h"
 #include "adsbin_types.h"
+#ifndef DEMOD1090_HOST_TEST
 #include "adsbin_err.h"
+#endif
 
 /* Logging tag for this component. */
 static const char *TAG = "demod1090";
@@ -105,6 +122,7 @@ static demod1090_ctx_t s_ctx;
  *  contention is negligible (the readers are the slow status task).
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+#ifndef DEMOD1090_HOST_TEST
 /** @brief Take the stats lock (never from ISR; only task context here). */
 static inline void stats_lock(void)
 {
@@ -120,6 +138,11 @@ static inline void stats_unlock(void)
         xSemaphoreGive(s_ctx.stats_mux);
     }
 }
+#else
+/* Host build is single-threaded: the counters need no lock. */
+static inline void stats_lock(void)   {}
+static inline void stats_unlock(void) {}
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════════════
  *  Magnitude LUT.
@@ -207,94 +230,175 @@ static uint32_t block_to_magnitude(const uint8_t *iq, uint32_t n_bytes)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- *  Preamble correlation.
+ *  DSP geometry — computed ONCE at init.
+ *
+ *  Everything the scan loop needs (pulse/valley sample offsets per phase
+ *  template, bit strides, frame spans) is derived here with double math and
+ *  frozen into integers / 32.32 fixed-point. The P4's FPU is single-precision
+ *  only, so a double op in the per-sample path is a soft-float LIBRARY CALL —
+ *  the old per-sample index math cost ~20 such calls per scanned position and
+ *  put the demod 3–9× over the Core-0 real-time budget (the bench showed 14 of
+ *  the required 146 blocks/s being consumed). Init-time is the only place
+ *  doubles are allowed in this file.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void build_geometry(void)
+{
+    const double sp = (double)s_ctx.sample_rate_hz / 1e6;   /* samples per µs   */
+
+    /* Fixed-point strides for the PPM slicer. One bit = 1 µs; the half-bit is  */
+    /* the PPM decision window.                                                 */
+    s_ctx.fp_samples_per_us = (uint64_t)(sp * (double)DEMOD_FP_ONE);
+    s_ctx.fp_bit            = s_ctx.fp_samples_per_us;      /* DEMOD_BIT_US = 1 */
+    s_ctx.fp_half           = s_ctx.fp_bit >> 1;
+    s_ctx.fp_data_start     = (uint64_t)(DEMOD_PREAMBLE_US * sp * (double)DEMOD_FP_ONE);
+
+    /* Integer sample spans (ceil), with the same +4 tail margin the scan logic */
+    /* has always used for the emit/skip distances.                             */
+    const uint32_t rate = s_ctx.sample_rate_hz;
+    s_ctx.span_preamble = (uint32_t)(((uint64_t)8u  * rate + 999999u) / 1000000u);
+    s_ctx.span_short    = (uint32_t)(((uint64_t)(8u + MODES_SHORT_BITS) * rate + 999999u) / 1000000u) + 4u;
+    s_ctx.span_full     = (uint32_t)(((uint64_t)(8u + MODES_LONG_BITS)  * rate + 999999u) / 1000000u) + 4u;
+
+    /* Preamble slot centres, physical constants of the 1090 downlink: pulses   */
+    /* peak a quarter-bit past their leading edges (0/1/3.5/4.5 µs); the gaps at */
+    /* 2.0/3.0/5.5/6.5/7.5 µs MUST be quiet in a genuine preamble.              */
+    static const double pulse_us[DEMOD_PRE_PULSES] = {
+        DEMOD_PULSE0_US + 0.25, DEMOD_PULSE1_US + 0.25,
+        DEMOD_PULSE2_US + 0.25, DEMOD_PULSE3_US + 0.25,
+    };
+    static const double valley_us[DEMOD_PRE_VALLEYS] = { 2.0, 3.0, 5.5, 6.5, 7.5 };
+
+    /* Build one integer index template per assumed sub-sample arrival phase.   */
+    /* For phase h (fraction of a sample) a slot at t µs truly sits at h + t*sp */
+    /* samples past the candidate index; we snap that to the nearest integer.   */
+    uint32_t max_off = 0;
+    uint32_t g_lo = UINT32_MAX, g_hi = 0;
+    for (int p = 0; p < DEMOD_PRE_PHASES; ++p) {
+        const double h = (double)p / (double)DEMOD_PRE_PHASES;
+        s_ctx.pre_phase_fp[p] =
+            ((uint64_t)p * DEMOD_FP_ONE) / (uint64_t)DEMOD_PRE_PHASES;
+
+        for (int k = 0; k < DEMOD_PRE_PULSES; ++k) {
+            const uint16_t off = (uint16_t)(pulse_us[k] * sp + h + 0.5);
+            s_ctx.pre_tpl[p].pulse[k] = off;
+            if (off > max_off) max_off = off;
+        }
+        for (int k = 0; k < DEMOD_PRE_VALLEYS; ++k) {
+            const uint16_t off = (uint16_t)(valley_us[k] * sp + h + 0.5);
+            s_ctx.pre_tpl[p].valley[k] = off;
+            if (off > max_off) max_off = off;
+        }
+
+        /* Track where pulse 0 lands across the templates: the coarse pre-gate  */
+        /* probes exactly these offsets, so it can never out-reject the full    */
+        /* correlator.                                                          */
+        const uint32_t p0_off = s_ctx.pre_tpl[p].pulse[0];
+        if (p0_off < g_lo) g_lo = p0_off;
+        if (p0_off > g_hi) g_hi = p0_off;
+    }
+    s_ctx.pre_window  = max_off + 2u;      /* bounds slack past the last slot   */
+    s_ctx.gate_idx_lo = g_lo;
+    s_ctx.gate_idx_hi = g_hi;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Preamble correlation — integer-only, phase-template bank.
  *
  *  The Mode-S preamble is four 0.5 µs pulses with leading edges at 0, 1, 3.5
  *  and 4.5 µs inside an 8 µs window. We score a candidate start index by
- *  comparing the energy in the four "pulse" slots against the energy in the
- *  guaranteed-quiet "valley" slots that separate them. A genuine preamble has
- *  high pulses and deep valleys; noise and continuous signals do not.
+ *  comparing the four "pulse" slots against the guaranteed-quiet "valley"
+ *  slots that separate them. A genuine preamble has high pulses and deep
+ *  valleys; noise and continuous carriers do not.
  *
- *  This is the dump1090 idea, but the slot centres are computed from the
- *  fractional samples-per-µs so it is correct at 2.4 Msps.
+ *  At 2.4 Msps a 0.5 µs pulse is only 1.2 samples wide, so a SINGLE index
+ *  template only catches arrivals whose sub-sample phase puts its point
+ *  samples on the plateaus — much real traffic would never be detectable. We
+ *  therefore try DEMOD_PRE_PHASES precomputed templates (one per assumed
+ *  arrival phase) and accept on the best-scoring one; the winner's phase then
+ *  seeds the data slicer so its hypothesis sweep starts on target.
  *
- *  @param m      magnitude buffer
- *  @param n      number of valid magnitude samples
- *  @param start  candidate preamble start (sample index)
+ *  @param m          magnitude buffer
+ *  @param n          number of valid magnitude samples
+ *  @param start      candidate preamble start (sample index)
  *  @param out_score  0..255 correlation quality on success
  *  @param out_level  representative burst magnitude (proxy RSSI)
+ *  @param out_phase  index into pre_phase_fp[] of the winning template
  *  @return true if @p start looks like a valid preamble.
  * ═══════════════════════════════════════════════════════════════════════════ */
 static bool detect_preamble(const uint16_t *m, uint32_t n, uint32_t start,
-                            uint8_t *out_score, uint16_t *out_level)
+                            uint8_t *out_score, uint16_t *out_level,
+                            uint32_t *out_phase)
 {
-    const uint64_t sp_us = s_ctx.fp_samples_per_us;   /* samples/µs, fixed pt   */
-
-    /* The preamble window must fit entirely inside the buffer.                 */
-    const uint32_t window = (uint32_t)((DEMOD_PREAMBLE_US * (double)sp_us) /
-                                       (double)DEMOD_FP_ONE) + 2;
-    if (start + window >= n) {
+    /* The widest template window must fit entirely inside the buffer.          */
+    if (start + s_ctx.pre_window >= n) {
         return false;
     }
 
-    /* Helper: magnitude at a µs offset from `start`, rounded to nearest sample.*/
-    /* We inline the fixed-point conversion to dodge any float in the loop body */
-    /* after this point.                                                        */
-    #define MAG_AT_US(us) \
-        (m[start + (uint32_t)(((uint64_t)((us) * (double)sp_us) + (DEMOD_FP_ONE/2)) >> DEMOD_FP_SHIFT)])
+    uint32_t best_score = 0;
+    uint32_t best_level = 0;
+    uint32_t best_phase = 0;
+    bool     hit        = false;
 
-    /* The four pulse peaks: sample each pulse near its centre (leading edge +  */
-    /* a quarter-bit) so we sit on the plateau, not the rising edge.           */
-    const uint32_t p0 = MAG_AT_US(DEMOD_PULSE0_US + 0.25);
-    const uint32_t p1 = MAG_AT_US(DEMOD_PULSE1_US + 0.25);
-    const uint32_t p2 = MAG_AT_US(DEMOD_PULSE2_US + 0.25);
-    const uint32_t p3 = MAG_AT_US(DEMOD_PULSE3_US + 0.25);
+    for (uint32_t p = 0; p < DEMOD_PRE_PHASES; ++p) {
+        const demod_pre_tpl_t *t = &s_ctx.pre_tpl[p];
 
-    /* The valleys: points that MUST be quiet in a real preamble. These sit in  */
-    /* the gaps at 2.0, 3.0, 5.5, 6.5 and 7.5 µs.                               */
-    const uint32_t v0 = MAG_AT_US(2.0);
-    const uint32_t v1 = MAG_AT_US(3.0);
-    const uint32_t v2 = MAG_AT_US(5.5);
-    const uint32_t v3 = MAG_AT_US(6.5);
-    const uint32_t v4 = MAG_AT_US(7.5);
+        /* The four pulse slots for this phase hypothesis.                      */
+        const uint32_t p0 = m[start + t->pulse[0]];
+        const uint32_t p1 = m[start + t->pulse[1]];
+        const uint32_t p2 = m[start + t->pulse[2]];
+        const uint32_t p3 = m[start + t->pulse[3]];
 
-    /* Sum of the four pulse magnitudes and the five valley magnitudes.         */
-    const uint32_t pulse_sum  = p0 + p1 + p2 + p3;
-    const uint32_t valley_sum = v0 + v1 + v2 + v3 + v4;
+        /* Weakest pulse — every valley must stay strictly below it (the        */
+        /* dump1090-style dominance check). Early-out on the first hot valley:  */
+        /* on noise that usually kills the template within one or two loads.    */
+        uint32_t min_pulse = p0;
+        if (p1 < min_pulse) min_pulse = p1;
+        if (p2 < min_pulse) min_pulse = p2;
+        if (p3 < min_pulse) min_pulse = p3;
 
-    /* Mean pulse vs mean valley. A real preamble's pulses tower over the gaps. */
-    const uint32_t pulse_mean  = pulse_sum / 4u;
-    const uint32_t valley_mean = valley_sum / 5u;
+        uint32_t valley_sum = 0;
+        bool     dominated  = true;
+        for (int k = 0; k < DEMOD_PRE_VALLEYS; ++k) {
+            const uint32_t v = m[start + t->valley[k]];
+            if (v >= min_pulse) {
+                dominated = false;
+                break;
+            }
+            valley_sum += v;
+        }
+        if (!dominated) {
+            continue;
+        }
 
-    /* Reject if any single pulse is weaker than the strongest valley — that is */
-    /* the cheap dump1090-style edge check that kills most false starts.        */
-    const uint32_t max_valley = (v0 > v1 ? v0 : v1);
-    const uint32_t mv2 = (v2 > v3 ? v2 : v3);
-    const uint32_t max_v = (max_valley > mv2 ? max_valley : mv2);
-    const uint32_t max_v2 = (max_v > v4 ? max_v : v4);
+        /* Mean pulse vs mean valley: need genuine separation, not a flat blob. */
+        const uint32_t pulse_mean  = (p0 + p1 + p2 + p3) / 4u;
+        const uint32_t valley_mean = valley_sum / DEMOD_PRE_VALLEYS;
+        if (pulse_mean <= valley_mean) {
+            continue;
+        }
 
-    if (p0 <= max_v2 || p1 <= max_v2 || p2 <= max_v2 || p3 <= max_v2) {
+        /* Score = how cleanly the pulses dominate, mapped to 0..255 via the    */
+        /* ratio (pulse-valley)/pulse: a perfect preamble (silent gaps) → 255.  */
+        const uint32_t margin  = pulse_mean - valley_mean;
+        uint32_t score32 = (margin * 255u) / pulse_mean;
+        if (score32 > 255u) score32 = 255u;
+
+        /* Keep the best-matching phase template.                               */
+        if (!hit || score32 > best_score) {
+            hit        = true;
+            best_score = score32;
+            best_level = pulse_mean;
+            best_phase = p;
+        }
+    }
+
+    if (!hit) {
         return false;
     }
 
-    /* Need real separation between pulse and valley energy. If the valleys are */
-    /* nearly as hot as the pulses this is not a clean PPM preamble.            */
-    if (pulse_mean <= valley_mean) {
-        return false;
-    }
-
-    /* Score = how cleanly the pulses dominate, mapped to 0..255. We use the    */
-    /* ratio (pulse-valley)/pulse so a perfect preamble (zero valleys) → 255.   */
-    uint32_t margin = pulse_mean - valley_mean;
-    uint32_t score32 = (margin * 255u) / (pulse_mean ? pulse_mean : 1u);
-    if (score32 > 255u) score32 = 255u;
-
-    *out_score = (uint8_t)score32;
-
-    /* Proxy RSSI: the mean pulse height, capped to 16 bits.                    */
-    *out_level = (uint16_t)(pulse_mean > 65535u ? 65535u : pulse_mean);
-
-    #undef MAG_AT_US
+    *out_score = (uint8_t)best_score;
+    *out_level = (uint16_t)(best_level > 65535u ? 65535u : best_level);
+    *out_phase = best_phase;
     return true;
 }
 
@@ -318,23 +422,26 @@ static bool detect_preamble(const uint16_t *m, uint32_t n, uint32_t start,
  *  exactly choosing the matched-filter-optimal sampling phase, with no CRC needed
  *  (so demod1090 stays decoupled from modes_decode).
  *
- *  @param phase_fp   sub-sample phase offset to add to the data start, fixed-point.
+ *  @param phase_off  SIGNED sub-sample offset (fixed-point) added to the data
+ *                    start; the caller centres its sweep on the phase the
+ *                    preamble detector locked, so this can be negative.
  *  @param out_conf   if non-NULL, receives the summed PPM confidence for this phase.
  *  @return number of bits actually sliced (≤ want_bits).
  * ═══════════════════════════════════════════════════════════════════════════ */
 static int slice_bits(const uint16_t *m, uint32_t n, uint32_t start,
                       int want_bits, uint8_t *out_data,
-                      uint64_t phase_fp, uint64_t *out_conf)
+                      int64_t phase_off, uint64_t *out_conf)
 {
-    const uint64_t sp_us   = s_ctx.fp_samples_per_us;          /* samples/µs fp */
-    const uint64_t bit_fp  = (uint64_t)(DEMOD_BIT_US     * (double)sp_us); /* 1 bit  */
-    const uint64_t half_fp = (uint64_t)(DEMOD_HALFBIT_US * (double)sp_us); /* ½ bit  */
+    /* All strides precomputed at init — no floating point on this path.        */
+    const uint64_t bit_fp  = s_ctx.fp_bit;                    /* 1 µs PPM bit   */
+    const uint64_t half_fp = s_ctx.fp_half;                   /* ½-bit window   */
 
-    /* Data starts 8 µs after the preamble start, shifted by the trial sub-sample */
-    /* phase. Carry it as a fixed-point absolute sample position.                 */
-    uint64_t pos = ((uint64_t)start << DEMOD_FP_SHIFT) +
-                   (uint64_t)(DEMOD_PREAMBLE_US * (double)sp_us) +
-                   phase_fp;
+    /* Data starts 8 µs after the preamble start, shifted by the trial sub-sample
+     * phase. Carry it as a fixed-point absolute sample position. The signed
+     * offset is at most ±⅓ sample against a ≥19-sample base, so the unsigned
+     * result cannot underflow. */
+    uint64_t pos = (uint64_t)((int64_t)(((uint64_t)start << DEMOD_FP_SHIFT) +
+                                        s_ctx.fp_data_start) + phase_off);
 
     /* Clear the destination so unused long-frame bytes are deterministic when  */
     /* the caller only keeps the short-frame prefix.                            */
@@ -395,6 +502,7 @@ static void emit_frame(const uint8_t *data, int len_bytes, uint8_t score,
     f.signal_level   = level;
     f.rx_time_us     = rx_time_us;
 
+#ifndef DEMOD1090_HOST_TEST
     /* Non-blocking send: on Core 0 we MUST NOT wait. A full queue means
        modes_decode is behind, so we drop and count rather than stall ingest.   */
     if (xQueueSend(s_ctx.out_queue, &f, 0) == pdTRUE) {
@@ -409,6 +517,14 @@ static void emit_frame(const uint8_t *data, int len_bytes, uint8_t score,
         s_ctx.stats.queue_overflows++;
         stats_unlock();
     }
+#else
+    /* Host build: hand the candidate straight to the test's capture hook.      */
+    s_ctx.stats.frames_emitted++;
+    if (len_bytes == MODES_SHORT_BYTES) s_ctx.stats.frames_56bit++;
+    else                                s_ctx.stats.frames_112bit++;
+    s_ctx.stats.last_signal_level = level;
+    demod1090_host_capture(&f);
+#endif
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -423,15 +539,10 @@ static void process_magnitude(const uint16_t *m, uint32_t n,
                               int64_t block_t_us, uint32_t rate_hz)
 {
     /* Magnitude samples spanned by a full preamble+long frame, by just the     */
-    /* preamble, and by a short (56-bit) frame. Precomputed once and reused for  */
-    /* both the per-hit skip distance and the scan-window limit below.           */
-    const uint32_t full_span =
-        (uint32_t)(DEMOD_FULL_FRAME_US * (double)rate_hz / 1e6) + 4;
-    const uint32_t preamble_span =
-        (uint32_t)(DEMOD_PREAMBLE_US * (double)rate_hz / 1e6);
-    const uint32_t short_span =
-        (uint32_t)((DEMOD_PREAMBLE_US + (double)MODES_SHORT_BITS * DEMOD_BIT_US)
-                   * (double)rate_hz / 1e6) + 4;
+    /* preamble, and by a short (56-bit) frame — precomputed at init (integer). */
+    const uint32_t full_span     = s_ctx.span_full;
+    const uint32_t preamble_span = s_ctx.span_preamble;
+    const uint32_t short_span    = s_ctx.span_short;
 
     /* We only need room for the SHORTEST emittable frame to begin scanning at a */
     /* position. A long candidate that runs off the block tail is handled        */
@@ -447,62 +558,57 @@ static void process_magnitude(const uint16_t *m, uint32_t n,
     /* Local counters batched so we touch the mutex once per block, not per hit.*/
     uint64_t local_preambles = 0;
 
-    /* Per-bit sample stride in microseconds, used to timestamp each frame at   */
-    /* its true preamble position rather than the block start.                  */
-    const double us_per_sample = 1e6 / (double)rate_hz;
-
     /* Scan window: leave room for at least a short frame after every candidate. */
     /* (Longer candidates that overrun the tail are truncated by slice_bits.)    */
     const uint32_t scan_end = n - short_span;
 
     /* ── COARSE PRE-GATE (performance) ───────────────────────────────────────
-     * detect_preamble() is invoked at EVERY sample index, and each call does ~9
-     * fixed-point index computes + 9 magnitude loads + several compares. On quiet
-     * air the overwhelming majority of positions are noise and can be rejected by
-     * a SINGLE cheap comparison before paying for the full correlation.
+     * detect_preamble() is integer-only now, but it still costs ~10–30 loads and
+     * compares per position; a one-load gate in front of it decides whether the
+     * position is even worth that.
      *
-     * The gate must be STRICTLY WEAKER than detect_preamble's own checks so it can
-     * never reject a position the real detector would accept (zero recall loss).
-     *
-     * detect_preamble requires every pulse (including the first, p0) to exceed the
-     * strongest valley, and the valleys are >= 0 — so a real preamble's first
-     * pulse magnitude is well above the block's noise floor. p0 is sampled a
-     * quarter-bit into PULSE0 (t=0), which at our ~2.4 samples/µs lands within one
-     * sample of `start`. To stay provably permissive regardless of the exact
-     * rounding, the gate inspects the SMALL NEIGHBOURHOOD around the start sample
-     * (start..start+2) and keeps the position if ANY of those equals/exceeds the
-     * floor. That window strictly contains wherever p0 actually samples, so the
-     * gate can never discard a position detect_preamble would have accepted.
-     *
-     * The floor is a low fraction of the block's mean magnitude (mean/4): a genuine
-     * pulse towers over the mean, so the gate only ever drops obviously-quiet air.
+     * The gate probes the PULSE-0 sample offsets used by the phase templates
+     * (gate_idx_lo..gate_idx_hi — a 1-sample window at 2.4 Msps, since pulse 0
+     * rounds to the same offset for every phase) and demands the strongest of
+     * them exceed 1.5× the block's mean magnitude. Justification: on Rayleigh
+     * noise (real antenna air) P(sample > 1.5×mean) ≈ 17%, so ~5/6 of positions
+     * skip the correlator; while any preamble the correlator itself would pass
+     * needs each pulse to top the MAX of five noise valleys — whose median on
+     * noise is ≈1.5×mean — so a burst gated out here had essentially no chance
+     * of surviving the full dominance test anyway. (The old mean/4 "provably
+     * permissive" floor passed >99.9% of noise positions and was the single
+     * biggest contributor to the demod running 3–9× over real time.)
      */
     uint64_t mag_sum = 0;
     for (uint32_t k = 0; k < n; ++k) {
         mag_sum += m[k];
     }
-    const uint16_t mag_mean  = (uint16_t)(mag_sum / (n ? n : 1u));
-    const uint16_t gate_floor = (uint16_t)(mag_mean >> 2);   /* mean/4 */
+    const uint32_t mag_mean = (uint32_t)(mag_sum / (n ? n : 1u));
+    const uint32_t gate_hi  = mag_mean + (mag_mean >> 1);     /* 1.5 × mean     */
+    const uint32_t g_lo     = s_ctx.gate_idx_lo;
+    const uint32_t g_hi     = s_ctx.gate_idx_hi;
 
     uint32_t j = 0;
     while (j < scan_end) {
 
         uint8_t  score = 0;
         uint16_t level = 0;
+        uint32_t phase = 0;
 
-        /* Coarse pre-gate: a real preamble's first pulse sits within start..start+2.
-         * If that whole neighbourhood is down in the noise, no preamble can begin
-         * here — skip the expensive correlation. This single (≤3-load) compare
-         * eliminates the vast majority of full detect_preamble() calls on quiet air.
-         * The window strictly covers p0's sample point, so it is provably permissive.
-         */
-        if (m[j] <= gate_floor && m[j + 1] <= gate_floor && m[j + 2] <= gate_floor) {
+        /* Coarse pre-gate: pulse 0 must already stand clear of the noise floor
+         * at (at least) one of the template offsets, or no template can accept
+         * this position. One load + one compare in the common case.            */
+        uint32_t gate_peak = 0;
+        for (uint32_t g = g_lo; g <= g_hi; ++g) {
+            if (m[j + g] > gate_peak) gate_peak = m[j + g];
+        }
+        if (gate_peak <= gate_hi) {
             ++j;
             continue;
         }
 
         /* Full preamble correlation. On a miss, step one sample and keep hunting.*/
-        if (!detect_preamble(m, n, j, &score, &level)) {
+        if (!detect_preamble(m, n, j, &score, &level, &phase)) {
             ++j;
             continue;
         }
@@ -515,28 +621,33 @@ static void process_magnitude(const uint16_t *m, uint32_t n,
 
         ++local_preambles;
 
-        /* Timestamp this frame: block start plus the preamble's sample offset. */
-        const int64_t rx_us = block_t_us + (int64_t)((double)j * us_per_sample + 0.5);
+        /* Timestamp this frame: block start plus the preamble's sample offset  */
+        /* (integer µs; one 64-bit divide per ACCEPTED candidate, not per sample).*/
+        const int64_t rx_us =
+            block_t_us + (int64_t)(((uint64_t)j * 1000000ull) / rate_hz);
 
         /* ── MULTI-PHASE SLICE ───────────────────────────────────────────────
-         * At 2.4 Msps the bit grid's sub-sample phase is unknown, so we slice the
-         * candidate at DEMOD_PHASE_STEPS phase hypotheses spread across one whole
-         * sample period and keep the one with the highest summed PPM confidence
-         * (Σ|first−second|). The confidence peaks at the matched-filter-optimal
-         * phase where each half-bit sample sits cleanly on a pulse vs a gap; wrong
-         * phases straddle symbol edges and score low. This recovers correct bits
-         * at fractional samples-per-bit. See CITATIONS.md §B for the derivation. */
+         * The winning preamble template pins the burst's sub-sample phase to
+         * ±1/6 sample (±1/2 if the scorer picked a neighbouring class on a noisy
+         * burst). Slice the data at DEMOD_PHASE_STEPS hypotheses spaced 1/6 of a
+         * sample apart and CENTRED on that detected phase, keeping the one with
+         * the highest summed PPM confidence (Σ|first−second|). The confidence
+         * peaks at the matched-filter-optimal phase where each half-bit sample
+         * sits cleanly on a pulse vs a gap; wrong phases straddle symbol edges
+         * and score low. See CITATIONS.md §B for the derivation. */
+        const int64_t phase_centre = (int64_t)s_ctx.pre_phase_fp[phase];
+
         uint8_t data[MODES_LONG_BYTES];
         uint8_t best_data[MODES_LONG_BYTES];
         uint64_t best_conf = 0;
         int got = 0;
         for (int p = 0; p < DEMOD_PHASE_STEPS; ++p) {
-            /* Phase hypotheses evenly spaced over [0, 1) sample: p/STEPS sample. */
-            const uint64_t phase_fp =
-                ((uint64_t)p * DEMOD_FP_ONE) / (uint64_t)DEMOD_PHASE_STEPS;
+            /* Hypotheses at centre + {-2,-1,0,+1,+2} × (1/6 sample).            */
+            const int64_t phase_off = phase_centre +
+                ((int64_t)p - DEMOD_PHASE_STEPS / 2) * (int64_t)DEMOD_PHASE_STEP_FP;
 
             uint64_t conf = 0;
-            int got_p = slice_bits(m, n, j, MODES_LONG_BITS, data, phase_fp, &conf);
+            int got_p = slice_bits(m, n, j, MODES_LONG_BITS, data, phase_off, &conf);
 
             /* Keep the highest-confidence phase. The first phase always seeds    */
             /* best_* so we never emit an uninitialised buffer.                   */
@@ -592,6 +703,7 @@ static void process_magnitude(const uint16_t *m, uint32_t n,
     }
 }
 
+#ifndef DEMOD1090_HOST_TEST
 /* ═══════════════════════════════════════════════════════════════════════════
  *  The Core-0 demod task.
  *
@@ -723,10 +835,10 @@ esp_err_t demod1090_init(const demod1090_config_t *cfg)
         return ESP_ERR_INVALID_ARG;
     }
 
-    /* Precompute the DSP geometry: samples-per-µs in 32.32 fixed point and a   */
-    /* rounded integer copy for coarse span math.                              */
-    const double sp_us = (double)s_ctx.sample_rate_hz / 1e6;
-    s_ctx.fp_samples_per_us = (uint64_t)(sp_us * (double)DEMOD_FP_ONE);
+    /* Precompute the DSP geometry (fixed-point strides, integer spans, and the */
+    /* per-phase preamble index templates). The only double math this component */
+    /* ever runs happens inside this one init-time call.                        */
+    build_geometry();
 
     /* Stats mutex first so any later failure path can still be torn down.      */
     s_ctx.stats_mux = xSemaphoreCreateMutex();
@@ -747,8 +859,8 @@ esp_err_t demod1090_init(const demod1090_config_t *cfg)
     memset(&s_ctx.stats, 0, sizeof(s_ctx.stats));
 
     s_ctx.inited = true;
-    ESP_LOGI(TAG, "init ok: %u sps, %.3f samples/us, threshold %u",
-             (unsigned)s_ctx.sample_rate_hz, sp_us,
+    ESP_LOGI(TAG, "init ok: %u sps, %u phase templates, threshold %u",
+             (unsigned)s_ctx.sample_rate_hz, (unsigned)DEMOD_PRE_PHASES,
              (unsigned)s_ctx.preamble_threshold);
     return ESP_OK;
 }
@@ -851,6 +963,53 @@ void demod1090_deinit(void)
     s_ctx.inited = false;
     ESP_LOGI(TAG, "deinit complete");
 }
+
+#else /* DEMOD1090_HOST_TEST */
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  Host-test shims — no RTOS, no ring, no task. These drive the exact same
+ *  pure pipeline the firmware task runs: build_geometry + LUT, then
+ *  block_to_magnitude → process_magnitude → emit (captured by the test's
+ *  demod1090_host_capture hook). See test_host/.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+esp_err_t demod1090_host_setup(uint32_t sample_rate_hz, uint8_t preamble_threshold)
+{
+    memset(&s_ctx, 0, sizeof(s_ctx));
+    s_ctx.sample_rate_hz     = sample_rate_hz ? sample_rate_hz : ADSB_SAMPLE_RATE_HZ;
+    s_ctx.preamble_threshold = preamble_threshold ? preamble_threshold
+                                                  : DEMOD_DEFAULT_PREAMBLE;
+    build_geometry();
+
+    esp_err_t err = build_mag_lut();
+    if (err != ESP_OK) {
+        return err;
+    }
+    s_ctx.inited = true;
+    return ESP_OK;
+}
+
+uint32_t demod1090_host_process_iq(const uint8_t *iq, uint32_t n_bytes, int64_t t_us)
+{
+    if (!s_ctx.inited || !iq) {
+        return 0;
+    }
+    /* Same two hot-path stages the firmware task runs per ring block.          */
+    const uint32_t n_samples = block_to_magnitude(iq, n_bytes);
+    if (n_samples) {
+        process_magnitude(s_ctx.mag, n_samples, t_us, s_ctx.sample_rate_hz);
+    }
+    return n_samples;
+}
+
+void demod1090_host_teardown(void)
+{
+    free(s_ctx.mag);
+    free(s_ctx.mag_lut);
+    memset(&s_ctx, 0, sizeof(s_ctx));
+}
+
+#endif /* !DEMOD1090_HOST_TEST */
 
 void demod1090_get_stats(demod1090_stats_t *out)
 {

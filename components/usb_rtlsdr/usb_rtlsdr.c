@@ -579,32 +579,65 @@ static esp_err_t r820t_write(usb_rtlsdr_dev_t *d, uint8_t reg, uint8_t val)
 }
 
 /**
- * @brief Read one R820T2 register.
+ * @brief Read-modify-write an R820T2 register through the shadow.
  *
  * @details
- *   The R820T2 returns its register file bit-reversed within each byte
- *   (datasheet quirk of the read path). We undo that so the caller sees the
- *   logical value. Only used to probe the chip id at 0x00.
+ *   The chip has no readable register file for RMW, so the shadow is the source
+ *   of truth for the bits we are NOT changing. Only the bits selected by
+ *   @p mask take @p val; everything else keeps its shadowed state. Every gain /
+ *   PLL field update goes through here so unrelated control bits (loop-through,
+ *   power enables, autotune state) are never clobbered by a bare store.
  */
-static esp_err_t r820t_read(usb_rtlsdr_dev_t *d, uint8_t reg, uint8_t *out)
+static esp_err_t r820t_write_mask(usb_rtlsdr_dev_t *d, uint8_t reg,
+                                  uint8_t val, uint8_t mask)
 {
-    uint8_t buf[2] = {0, 0};
-    /* Reads come from the tuner slave on the I2C window. The RTL2832U returns
-     * the requested register; one byte is enough for the id probe. */
-    esp_err_t err = ctrl_xfer(d, RTL_CTRL_IN, RTL_VENDOR_REQUEST,
-                              (uint16_t)R820T_I2C_ADDR, RTL_BLK_I2C, buf, 1);
+    const uint8_t cur = (reg < R820T_NUM_REGS) ? d->r82_shadow[reg] : 0x00;
+    return r820t_write(d, reg, (uint8_t)((cur & (uint8_t)~mask) | (val & mask)));
+}
+
+/** @brief Reverse the bit order within one byte (R820T2 read-path quirk). */
+static inline uint8_t r820t_bitrev(uint8_t b)
+{
+    b = (uint8_t)(((b & 0xF0) >> 4) | ((b & 0x0F) << 4));
+    b = (uint8_t)(((b & 0xCC) >> 2) | ((b & 0x33) << 2));
+    b = (uint8_t)(((b & 0xAA) >> 1) | ((b & 0x55) << 1));
+    return b;
+}
+
+/**
+ * @brief Read the first @p n R820T2 registers (0x00 upward).
+ *
+ * @details
+ *   The R820T2 read path always starts at register 0x00 and returns each byte
+ *   bit-reversed (datasheet quirk); we set the read pointer to 0 first, fetch
+ *   @p n bytes in one window read, and un-reverse them so the caller sees the
+ *   logical values. Used for the chip-id probe (reg 0x00) and the PLL lock
+ *   check (reg 0x02 bit 6).
+ */
+static esp_err_t r820t_read_regs(usb_rtlsdr_dev_t *d, uint8_t *out, uint8_t n)
+{
+    /* Point the tuner's read cursor at register 0. This is a bare one-byte I2C
+     * write of the address with no data byte — same window, same write strobe. */
+    uint8_t ptr = 0x00;
+    esp_err_t err = ctrl_xfer_retry(d, RTL_CTRL_OUT, RTL_VENDOR_REQUEST,
+                                    (uint16_t)R820T_I2C_ADDR,
+                                    (uint16_t)(RTL_BLK_I2C | RTL_REG_WRITE_FLAG),
+                                    &ptr, 1);
     if (err != ESP_OK) {
         return err;
     }
 
-    /* The R820T2 read path returns each byte bit-reversed; undo it so the caller
-     * sees the logical value. (We only use this to confirm the bus answers.) */
-    uint8_t b = buf[0];
-    b = (uint8_t)(((b & 0xF0) >> 4) | ((b & 0x0F) << 4));
-    b = (uint8_t)(((b & 0xCC) >> 2) | ((b & 0x33) << 2));
-    b = (uint8_t)(((b & 0xAA) >> 1) | ((b & 0x55) << 1));
-    *out = b;
-    (void)reg; /* The window read starts at reg 0; the chip id lives there.     */
+    /* Burst-read n bytes from the window; the chip streams regs 0x00..n-1. */
+    err = ctrl_xfer(d, RTL_CTRL_IN, RTL_VENDOR_REQUEST,
+                    (uint16_t)R820T_I2C_ADDR, RTL_BLK_I2C, out, n);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /* Undo the per-byte bit reversal so callers see logical register values.  */
+    for (uint8_t i = 0; i < n; ++i) {
+        out[i] = r820t_bitrev(out[i]);
+    }
     return ESP_OK;
 }
 
@@ -620,29 +653,58 @@ static esp_err_t r820t_read(usb_rtlsdr_dev_t *d, uint8_t reg, uint8_t *out)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Program the R820T2 PLL to put the LO at @p lo_hz.
+ * @brief Program the R820T2 PLL to put the LO at @p lo_hz, and verify lock.
  *
  * @details
  *   Clean-room from the R820T2 register description's PLL section:
- *     - The reference into the PLL is the 28.8 MHz crystal (optionally divided).
- *     - A power-of-two VCO post-divider (mix_div) keeps the VCO in its 1.77–
- *       3.9 GHz band; we pick the smallest divider that lands the VCO in band.
- *     - Nint = floor(VCO / (2 * pll_ref)); the 16-bit sigma-delta fraction is
- *       the remainder scaled by 2^16.
- *   The fields land in regs 0x10..0x14 (VCO/divider, fractional lo/hi, Nint).
+ *     - The reference into the PLL is the 28.8 MHz crystal (optionally divided);
+ *       the phase detector runs at 2 * ref = 57.6 MHz.
+ *     - A power-of-two VCO post-divider (mix_div) keeps the VCO in its
+ *       characterised 1.77–3.54 GHz band; we pick the smallest divider that
+ *       lands the VCO in band. (For 1090/978 low-IF this is always mix_div=2.)
+ *     - Nint = floor(VCO / (2 * ref)); the 16-bit sigma-delta fraction is the
+ *       remainder scaled by 2^16.
+ *
+ *   REGISTER MAP (the bug that flew): the integer divider word goes to reg
+ *   0x14 and the SDM fraction to 0x15 (LSB) / 0x16 (MSB). Registers 0x11–0x13
+ *   are PLL ANALOG config — 0x12 in particular holds the VCO core current in
+ *   bits [7:5] and the SDM power-down in bit 3. An earlier revision wrote the
+ *   divider into 0x11/0x12/0x13, which (a) never moved the divider off its
+ *   power-up value and (b) usually powered the SDM off via the stray bit 3, so
+ *   the LO sat ~hundreds of MHz from the target while the byte stream looked
+ *   perfectly healthy. Nothing downstream can detect that, hence the lock
+ *   readback below.
+ *
+ *   LOCK VERIFY: reg 0x02 bit 6 reports lock. We check it after programming;
+ *   on a miss we raise the VCO core current once and re-check. A persistent
+ *   no-lock is logged at ERROR level and latched into d->pll_locked so status
+ *   surfaces can flag a "streaming but detuned" radio — the exact failure mode
+ *   that is otherwise invisible until a flight test comes back empty.
  */
 static esp_err_t r820t_set_pll(usb_rtlsdr_dev_t *d, uint32_t lo_hz)
 {
     /* PLL reference: the crystal feeds the tuner ref directly in our config. */
     const uint32_t pll_ref = RTL_XTAL_HZ;
 
-    /* Choose the smallest power-of-two VCO divider that keeps the VCO inside its
-     * valid band (~1.77–3.9 GHz). mix_div doubles until the VCO is in range. */
+    esp_err_t err = ESP_OK;
+
+    /* Fast autotune (128 kHz) while the PLL acquires; dropped to 8 kHz after
+     * lock so the loop stops hunting. Masked so tracking-filter bits survive. */
+    err |= r820t_write_mask(d, R820T_REG_TF_FILTER,
+                            R820T_AUTOTUNE_FAST, R820T_AUTOTUNE_MASK);
+
+    /* Nominal VCO core current for acquisition (raised later only if the first
+     * lock check misses). Keeps bit3 (SDM power) and bits [4:0] untouched. */
+    err |= r820t_write_mask(d, R820T_REG_PLL_VCO_CUR,
+                            R820T_VCO_CUR_DEFAULT, R820T_VCO_CUR_MASK);
+
+    /* Choose the smallest power-of-two VCO post-divider that keeps the VCO in
+     * its characterised band. mix_div doubles until the VCO is in range. */
     uint32_t mix_div = 2;
     uint8_t  div_num = 0;      /* log2(mix_div) - 1, programmed into reg 0x10.   */
     while (mix_div <= 64) {
         uint64_t vco = (uint64_t)lo_hz * mix_div;
-        if (vco >= 1770000000ull && vco <= 3900000000ull) {
+        if (vco >= 1770000000ull && vco <= 3540000000ull) {
             break;
         }
         mix_div <<= 1;
@@ -658,37 +720,77 @@ static esp_err_t r820t_set_pll(usb_rtlsdr_dev_t *d, uint32_t lo_hz)
     uint32_t nint     = (uint32_t)(vco_freq / pll_step);
     uint64_t vco_frac = vco_freq - (uint64_t)nint * pll_step;
 
-    /* The R820T2 splits Nint into a low integer and a "Ni2c" pair (datasheet).
-     * Nint = 2*ni + nint_lo where nint_lo is the low bit; this packs the integer
-     * divider into reg 0x13. */
+    /* The R820T2 encodes Nint as ni + si: Nint = 4*ni + si + 13, with ni in
+     * bits [5:0] and si in bits [7:6] of the integer-divider register (0x14). */
     if (nint < 13 || nint > 76) {
         /* Out-of-range divider => LO unreachable for this band. */
         ESP_LOGW(TAG, "PLL Nint %u out of range for LO %u", nint, lo_hz);
     }
     uint8_t  ni  = (uint8_t)((nint - 13) / 4);
     uint8_t  si  = (uint8_t)((nint - 13) - (ni * 4));
-    uint8_t  reg13 = (uint8_t)((ni & 0x3F) + (si << 6));
+    uint8_t  nint_word = (uint8_t)((ni & 0x3F) + (si << 6));
 
-    /* 16-bit sigma-delta fraction = round(vco_frac / pll_step * 2^16). */
+    /* 16-bit sigma-delta fraction = vco_frac / pll_step scaled by 2^16. */
     uint16_t sdm = (uint16_t)(((uint64_t)vco_frac << 16) / pll_step);
-    uint8_t  sdm_lo = (uint8_t)(sdm & 0xFF);
-    uint8_t  sdm_hi = (uint8_t)((sdm >> 8) & 0xFF);
-
-    esp_err_t err = ESP_OK;
 
     /* reg 0x10: VCO power + the VCO post-divider selection (div_num). Keep the
      * datasheet power bits and OR in our divider. */
     uint8_t reg10 = (uint8_t)((d->r82_shadow[R820T_REG_PLL_VCO] & 0x1F) | (div_num << 5));
     err |= r820t_write(d, R820T_REG_PLL_VCO, reg10);
 
-    /* reg 0x11/0x12: 16-bit sigma-delta fractional divider. */
-    err |= r820t_write(d, R820T_REG_PLL_FRAC_LO, sdm_lo);
-    err |= r820t_write(d, R820T_REG_PLL_FRAC_HI, sdm_hi);
+    /* reg 0x14: the integer divider word. THIS is the register that actually
+     * moves the LO — see the map note in the function header. */
+    err |= r820t_write(d, R820T_REG_PLL_NINT, nint_word);
 
-    /* reg 0x13: integer divider (Nint encoding). */
-    err |= r820t_write(d, R820T_REG_PLL_NINT, reg13);
+    /* Sigma-delta modulator: power it per need (bit3 of 0x12: 1 = SDM OFF for a
+     * pure integer-N ratio, 0 = ON for fractional), then load the fraction MSB
+     * first into 0x16/0x15. */
+    err |= r820t_write_mask(d, R820T_REG_PLL_VCO_CUR,
+                            (sdm == 0) ? R820T_SDM_PWR_OFF_BIT : 0x00,
+                            R820T_SDM_PWR_OFF_BIT);
+    err |= r820t_write(d, R820T_REG_PLL_SDM_MSB, (uint8_t)((sdm >> 8) & 0xFF));
+    err |= r820t_write(d, R820T_REG_PLL_SDM_LSB, (uint8_t)(sdm & 0xFF));
 
-    return (err == ESP_OK) ? ESP_OK : ESP_FAIL;
+    if (err != ESP_OK) {
+        d->pll_locked = false;
+        return ESP_FAIL;
+    }
+
+    /* ── LOCK CHECK ─────────────────────────────────────────────────────────
+     * Give the loop a moment to settle, then read reg 0x02 bit 6. One retry
+     * with boosted VCO core current covers band-edge cases where the nominal
+     * current can't pull the VCO far enough. */
+    bool locked = false;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        vTaskDelay(pdMS_TO_TICKS(2));                 /* PLL settle time.        */
+
+        uint8_t regs[3] = {0};
+        if (r820t_read_regs(d, regs, sizeof(regs)) == ESP_OK &&
+            (regs[R820T_REG_PLL_STATUS] & R820T_PLL_LOCK_BIT)) {
+            locked = true;
+            break;
+        }
+        if (attempt == 0) {
+            /* No lock at nominal current — boost and try once more. */
+            (void)r820t_write_mask(d, R820T_REG_PLL_VCO_CUR,
+                                   R820T_VCO_CUR_BOOST, R820T_VCO_CUR_MASK);
+        }
+    }
+    d->pll_locked = locked;
+
+    if (locked) {
+        /* Slow the autotune now that we are on frequency (8 kHz loop).         */
+        (void)r820t_write_mask(d, R820T_REG_TF_FILTER,
+                               R820T_AUTOTUNE_SLOW_BIT, R820T_AUTOTUNE_SLOW_BIT);
+        ESP_LOGI(TAG, "PLL locked: LO %u Hz (nint=%u sdm=0x%04x mix_div=%u)",
+                 (unsigned)lo_hz, (unsigned)nint, (unsigned)sdm, (unsigned)mix_div);
+    } else {
+        /* Streaming continues (the system stays alive) but this slot is DEAF:
+         * make the failure impossible to miss in any captured log. */
+        ESP_LOGE(TAG, "PLL NOT LOCKED at LO %u Hz — receiver is detuned and "
+                      "will decode NOTHING on this band", (unsigned)lo_hz);
+    }
+    return ESP_OK;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -705,30 +807,40 @@ static esp_err_t r820t_set_pll(usb_rtlsdr_dev_t *d, uint32_t lo_hz)
  * @brief Apply a gain mode + level to the R820T2 stages.
  *
  * @details
- *   For MANUAL_FIXED we set the LNA, mixer and VGA to fixed steps with their AGC
- *   bits clear (manual). The requested @p gain_tenth_db is clamped to the chip's
+ *   For MANUAL_FIXED we pin the LNA, mixer and VGA at fixed steps with their
+ *   AGC paths disabled. The requested @p gain_tenth_db is clamped to the chip's
  *   achievable range; the canonical ADS-B value (496 tenths = 49.6 dB) maps to
- *   near-maximum on all three stages. For HW_AGC we hand the LNA + mixer to the
- *   chip's loop (top bits set) and let the RTL2832U/IF VGA float.
+ *   near-maximum on the LNA + mixer. For HW_AGC the LNA + mixer go to the
+ *   chip's loop and the VGA stays at a fixed IF gain.
+ *
+ *   BIT-SENSE WARNING (this shipped inverted once): bit4's meaning differs per
+ *   stage — LNA reg 0x05 bit4 = 1 is MANUAL, mixer reg 0x07 bit4 = 1 is AUTO.
+ *   The old code cleared bit4 on the LNA for "manual", which actually left the
+ *   LNA free-running under the chip AGC with the requested step ignored. All
+ *   writes here are masked so the registers' non-gain bits (loop-through,
+ *   power, VGA bits 6:5) keep their init values.
  */
 static esp_err_t r820t_apply_gain(usb_rtlsdr_dev_t *d, usb_rtlsdr_gain_mode_t mode, int gain_tenth_db)
 {
     esp_err_t err = ESP_OK;
 
     if (mode == USB_RTLSDR_GAIN_HW_AGC) {
-        /* Hand all three stages to the chip's AGC loop: set the AUTO bit on the
-         * LNA, mixer and VGA registers. The low-nibble gain step is ignored by
-         * the chip while AUTO is set, but we leave a sane mid value. */
-        err |= r820t_write(d, R820T_REG_LNA_GAIN,   (uint8_t)(R820T_AGC_AUTO_BIT | 0x08));
-        err |= r820t_write(d, R820T_REG_MIXER_GAIN, (uint8_t)(R820T_AGC_AUTO_BIT | 0x08));
-        err |= r820t_write(d, R820T_REG_VGA_GAIN,   (uint8_t)(R820T_AGC_AUTO_BIT | 0x0B));
+        /* Hand the LNA + mixer to the chip's AGC loop: LNA auto = bit4 CLEAR,
+         * mixer auto = bit4 SET (opposite senses, see header note). The VGA has
+         * no loop of its own — leave it at a fixed sane IF gain step. */
+        err |= r820t_write_mask(d, R820T_REG_LNA_GAIN, 0x00,
+                                R820T_STAGE_MODE_BIT);
+        err |= r820t_write_mask(d, R820T_REG_MIXER_GAIN, R820T_STAGE_MODE_BIT,
+                                R820T_STAGE_MODE_BIT);
+        err |= r820t_write_mask(d, R820T_REG_VGA_GAIN, 0x0B,
+                                R820T_VGA_WRITE_MASK);
         return (err == ESP_OK) ? ESP_OK : ESP_FAIL;
     }
 
     /* MANUAL_FIXED: distribute the requested gain across the three stages. The
      * R820T2 gives ~0..30 dB on the LNA in 16 steps and ~0..16 dB on the mixer
      * in 16 steps; for ADS-B we bias toward the top. Map tenths-of-dB into
-     * 0..15 LNA + 0..15 mixer steps, clamped. AGC bit cleared => manual. */
+     * 0..15 LNA + 0..15 mixer steps, clamped. */
     int g = gain_tenth_db;
     if (g < 0)   g = 0;
     if (g > 496) g = 496;       /* 49.6 dB is the documented max useful gain.    */
@@ -740,16 +852,21 @@ static esp_err_t r820t_apply_gain(usb_rtlsdr_dev_t *d, usb_rtlsdr_gain_mode_t mo
     if (lna_step > 15) lna_step = 15;
     if (mix_step > 15) mix_step = 15;
 
-    /* reg 0x05: manual (AGC bit clear) + LNA gain step in the low nibble. */
-    uint8_t reg05 = (uint8_t)(lna_step & R820T_GAIN_STEP_MASK);
-    /* reg 0x07: manual + mixer gain step in the low nibble. */
-    uint8_t reg07 = (uint8_t)(mix_step & R820T_GAIN_STEP_MASK);
-    /* reg 0x0C: VGA manual, fixed mid-high IF gain step (0x0B ~ 16.3 dB). */
-    uint8_t reg0c = (uint8_t)(0x0B & R820T_GAIN_STEP_MASK);
+    /* LNA reg 0x05: bit4 SET = manual, gain step in the low nibble. Bits 7:5
+     * (loop-through / power) are preserved by the mask. */
+    err |= r820t_write_mask(d, R820T_REG_LNA_GAIN,
+                            (uint8_t)(R820T_STAGE_MODE_BIT |
+                                      (lna_step & R820T_GAIN_STEP_MASK)),
+                            (uint8_t)(R820T_STAGE_MODE_BIT | R820T_GAIN_STEP_MASK));
 
-    err |= r820t_write(d, R820T_REG_LNA_GAIN,   reg05);
-    err |= r820t_write(d, R820T_REG_MIXER_GAIN, reg07);
-    err |= r820t_write(d, R820T_REG_VGA_GAIN,   reg0c);
+    /* Mixer reg 0x07: bit4 CLEAR = manual, gain step in the low nibble.        */
+    err |= r820t_write_mask(d, R820T_REG_MIXER_GAIN,
+                            (uint8_t)(mix_step & R820T_GAIN_STEP_MASK),
+                            (uint8_t)(R820T_STAGE_MODE_BIT | R820T_GAIN_STEP_MASK));
+
+    /* VGA reg 0x0C: fixed mid-high IF gain step (0x0B ~ 16.3 dB), bit4 clear.
+     * Bits 6:5 carry non-gain control and are preserved (mask 0x9F). */
+    err |= r820t_write_mask(d, R820T_REG_VGA_GAIN, 0x0B, R820T_VGA_WRITE_MASK);
 
     return (err == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
@@ -1013,10 +1130,12 @@ static esp_err_t rtl_init_baseband(usb_rtlsdr_dev_t *d)
  */
 static esp_err_t configure_frequency_locked(usb_rtlsdr_dev_t *d)
 {
-    /* Apply the ppm correction: a positive ppm means the crystal runs fast, so
-     * we ask the LO for a slightly higher frequency to compensate. */
+    /* Apply the ppm correction: a positive ppm means the crystal runs FAST, so
+     * every programmed frequency comes out (1 + ppm/1e6) too high — we must ask
+     * for a slightly LOWER value to land on target. (Adding, as an earlier
+     * revision did, doubles the error instead of cancelling it.) */
     int64_t f = (int64_t)d->center_freq_hz;
-    f += (f * d->freq_correction_ppm) / 1000000;
+    f -= (f * d->freq_correction_ppm) / 1000000;
     /* Low-IF: LO = centre + 3.57 MHz; the demod NCO down-converts it to baseband
      * (see rtl_set_if_freq). Offset-tuning keeps the carrier off the DC spike. */
     uint32_t lo = (uint32_t)(f + R820T_IF_FREQ_HZ);
@@ -1576,7 +1695,7 @@ static esp_err_t open_device(usb_rtlsdr_dev_t *d, uint8_t addr)
         err = rtl_i2c_repeater(d, true);
         uint8_t id = 0;
         if (err == ESP_OK) {
-            r820t_read(d, R820T_REG_CHIPID, &id);   /* best-effort id read.       */
+            r820t_read_regs(d, &id, 1);             /* best-effort id read (reg 0).*/
         }
         rtl_i2c_repeater(d, false);
         /* The R820T2 returns a stable id pattern; treat any successful bus read

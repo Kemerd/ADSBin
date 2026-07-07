@@ -127,9 +127,14 @@ extern "C" {
 #define RTL_DEMOD_IIC_REPEAT_OFF  0x10u    /**< Repeater disabled.               */
 
 /* Resampler ratio registers (page1) that set the effective output sample rate
- * from the 28.8 MHz crystal. The 28-bit ratio is split across four byte regs. */
-#define RTL_DEMOD_RSAMP_RATIO0    0x019Fu  /**< Resample ratio [27:24..16].      */
-#define RTL_DEMOD_RSAMP_RATIO1    0x01A0u  /**< Resample ratio [15:8..0].        */
+ * from the 28.8 MHz crystal. The 28-bit ratio is split across four byte regs:
+ * the HIGH 16 bits land at 0x9F/0xA0 and the LOW 16 bits at 0xA1/0xA2 (each
+ * two-byte write fills two consecutive registers). The low half previously
+ * went to 0xA0 — overlapping the high word's LSB and never touching 0xA1/0xA2.
+ * That happened to be harmless at exactly 2.4 Msps (ratio 0x3000000 has zero
+ * low bits) but corrupts the rate for any other setting. */
+#define RTL_DEMOD_RSAMP_RATIO0    0x019Fu  /**< Resample ratio [27:16] -> 0x9F/0xA0. */
+#define RTL_DEMOD_RSAMP_RATIO1    0x01A1u  /**< Resample ratio [15:0]  -> 0xA1/0xA2. */
 
 /* Soft reset of the demod sample pipe (page1/off1, bit values per datasheet). */
 #define RTL_DEMOD_SOFT_RST        0x0101u
@@ -196,6 +201,13 @@ extern "C" {
  * chip-id pattern in reg 0x00's low bits. We use it only to confirm presence. */
 #define R820T_REG_CHIPID          0x00u
 
+/* Read-only PLL status (reg 0x02): bit 6 reports the PLL locked to the
+ * programmed divider. Reads of the R820T2 always start at reg 0x00 and return
+ * each byte bit-reversed, so fetching this means reading three bytes from the
+ * top of the file and un-reversing them (see r820t_read_regs). */
+#define R820T_REG_PLL_STATUS      0x02u
+#define R820T_PLL_LOCK_BIT        0x40u  /**< reg 0x02 bit6: 1 = PLL locked.     */
+
 /* Writable function registers (subset we touch), with the datasheet meaning of
  * the fields we set. Each name maps to a real R820T2 register address. */
 #define R820T_REG_LNA_GAIN        0x05u  /**< LNA gain + loop-through + AGC mode.*/
@@ -208,21 +220,44 @@ extern "C" {
 #define R820T_REG_VGA_GAIN        0x0Cu  /**< VGA (IF) gain + VGA AGC mode.      */
 #define R820T_REG_LNA_TOP         0x0Du  /**< LNA AGC loop top voltage.          */
 #define R820T_REG_MIX_TOP         0x0Eu  /**< Mixer AGC loop top voltage.        */
-#define R820T_REG_PLL_VCO         0x10u  /**< Reference divider + VCO settings.  */
-#define R820T_REG_PLL_FRAC_LO     0x11u  /**< Sigma-delta fractional [7:0].      */
-#define R820T_REG_PLL_FRAC_HI     0x12u  /**< Sigma-delta fractional [15:8].     */
-#define R820T_REG_PLL_NINT        0x13u  /**< Integer divider Nint + frac msb.   */
-#define R820T_REG_PLL_VCO_CTRL    0x14u  /**< VCO band / divider control.        */
-#define R820T_REG_TF_FILTER       0x1Au  /**< Tracking-filter / PLL auto.        */
+/* PLL register block. NOTE THE MAP CAREFULLY — an earlier revision had the
+ * divider registers shifted down by one address (Nint in 0x13, fraction in
+ * 0x11/0x12). Those are NOT divider registers: 0x11 is PLL analog/charge-pump
+ * config, 0x12 carries the VCO core current in bits [7:5] plus the sigma-delta
+ * modulator power-down in bit 3, and 0x13 is VCO band/autotune state. The real
+ * divider lives at 0x14 (integer word) and 0x15/0x16 (16-bit SDM fraction), so
+ * the old code left the power-up divider in force and the LO never moved off
+ * its reset frequency — the receiver streamed noise while looking healthy. */
+#define R820T_REG_PLL_VCO         0x10u  /**< Refdiv + VCO post-divider select.  */
+#define R820T_REG_PLL_CP          0x11u  /**< PLL analog / charge-pump current.  */
+#define R820T_REG_PLL_VCO_CUR     0x12u  /**< VCO current [7:5]; bit3 = SDM off. */
+#define R820T_REG_PLL_VCO_BAND    0x13u  /**< VCO band / autotune (chip-managed).*/
+#define R820T_REG_PLL_NINT        0x14u  /**< Integer divider word ni + (si<<6). */
+#define R820T_REG_PLL_SDM_LSB     0x15u  /**< Sigma-delta fraction [7:0].        */
+#define R820T_REG_PLL_SDM_MSB     0x16u  /**< Sigma-delta fraction [15:8].       */
+#define R820T_REG_TF_FILTER       0x1Au  /**< Tracking-filter / PLL autotune.    */
 #define R820T_REG_FILTER_GATE     0x1Bu  /**< Filter gate + tracking band.       */
 
-/* AGC-mode bits (datasheet: each gain register's bit4 selects auto vs manual
- * for that stage). Convention used here, matching the R820T2 register
- * description: bit4 = 1 puts the stage under the chip's AGC loop (AUTO); bit4 = 0
- * leaves the low-nibble gain step in force (MANUAL). For ADS-B we want MANUAL
- * fixed gain on all three stages. */
-#define R820T_AGC_AUTO_BIT        0x10u  /**< bit4: 1=AGC auto, 0=manual.        */
+/* Field masks for the PLL block. */
+#define R820T_SDM_PWR_OFF_BIT     0x08u  /**< reg 0x12 bit3: 1 = SDM disabled.   */
+#define R820T_VCO_CUR_MASK        0xE0u  /**< reg 0x12 [7:5]: VCO core current.  */
+#define R820T_VCO_CUR_DEFAULT     0x80u  /**< Nominal VCO current for tuning.    */
+#define R820T_VCO_CUR_BOOST       0x60u  /**< Raised current if lock fails.      */
+#define R820T_AUTOTUNE_MASK       0x0Cu  /**< reg 0x1A [3:2]: PLL autotune rate. */
+#define R820T_AUTOTUNE_FAST       0x00u  /**< 128 kHz autotune while acquiring.  */
+#define R820T_AUTOTUNE_SLOW_BIT   0x08u  /**< bit3: drop to 8 kHz once locked.   */
+
+/* Gain-stage mode bits. Each gain register's bit4 selects auto vs manual, BUT
+ * THE SENSE DIFFERS PER STAGE (this bit us hard once already):
+ *   - LNA   (reg 0x05): bit4 = 1 => MANUAL (gain_manual), 0 => chip AGC.
+ *   - Mixer (reg 0x07): bit4 = 1 => chip AGC,  0 => MANUAL.
+ *   - VGA   (reg 0x0C): bit4 = 0 => MANUAL nibble in force.
+ * For ADS-B we want MANUAL fixed gain on all three stages, and every write must
+ * preserve the register's non-gain bits (loop-through, power, clock) — so gain
+ * updates go through the shadow-based masked write, never a bare store. */
+#define R820T_STAGE_MODE_BIT      0x10u  /**< bit4: per-stage auto/manual select.*/
 #define R820T_GAIN_STEP_MASK      0x0Fu  /**< Low nibble: per-stage gain step.   */
+#define R820T_VGA_WRITE_MASK      0x9Fu  /**< VGA writes keep bits 6:5 intact.   */
 
 /* The R820T2 intermediate frequency the RTL2832U expects. The tuner mixes the
  * RF down to this IF; the demod resampler then brings it to baseband. Standard
@@ -335,6 +370,13 @@ typedef struct {
 
     /* ---- R820T2 writable-register shadow (no RMW on the chip) ---- */
     uint8_t          r82_shadow[R820T_NUM_REGS];
+
+    /* ---- last PLL-lock verdict (reg 0x02 bit6 readback after tuning) ----
+     * false means the chip reported no lock on the most recent retune: the LO
+     * is NOT on frequency and the stream is thermal noise even though every
+     * byte counter looks healthy. Logged loudly at tune time; kept here so
+     * status paths can surface a "streaming but detuned" condition. */
+    bool             pll_locked;
 
     /* ---- per-device lifecycle ---- */
     volatile usb_rtlsdr_state_t state;   /**< Liveness state machine.            */

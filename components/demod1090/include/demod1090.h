@@ -24,9 +24,14 @@
 
 #include <stdint.h>
 #include "esp_err.h"
+/* The host unit test (test_host/, -DDEMOD1090_HOST_TEST) builds the pure DSP
+ * core with no RTOS: it needs the config/stats types from this header but not
+ * the FreeRTOS-typed lifecycle below. */
+#ifndef DEMOD1090_HOST_TEST
 #include "freertos/FreeRTOS.h"
 #include "freertos/ringbuf.h"
 #include "freertos/queue.h"
+#endif
 #include "adsbin_types.h"   /* iq_block_t, modes_frame_t */
 
 #ifdef __cplusplus
@@ -56,8 +61,10 @@ typedef struct {
 } demod1090_stats_t;
 
 /* ───────────────────────────────────────────────────────────────────────────
- *  Lifecycle
+ *  Lifecycle (firmware only — the host test drives the pure core directly via
+ *  the demod1090_host_* shims declared in demod1090_internal.h)
  * ─────────────────────────────────────────────────────────────────────────── */
+#ifndef DEMOD1090_HOST_TEST
 
 /** @brief Build the magnitude LUT + internal state and validate @p cfg.
  *  Does not start the task. @param cfg NULL => defaults. */
@@ -76,6 +83,8 @@ esp_err_t demod1090_stop(void);
 
 /** @brief Free the LUT and internal state (stops the task first if running). */
 void demod1090_deinit(void);
+
+#endif /* !DEMOD1090_HOST_TEST */
 
 /* ───────────────────────────────────────────────────────────────────────────
  *  Diagnostics (safe from any core)
