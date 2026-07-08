@@ -2065,10 +2065,18 @@ static void task_do_recovery(void)
             if (d->dev && d->bulk_ep && d->want_stream &&
                 d->state == USB_RTLSDR_STATE_STREAMING) {
                 lock();
-                /* Drain anything still in flight + clear a host-side halt. */
+                /* Drain anything still in flight + clear a host-side halt. The
+                 * CLEAR is the load-bearing step: it is what flips the halted
+                 * pipe back to ACTIVE. It returns ESP_ERR_INVALID_STATE when the
+                 * pipe cannot be made active again (e.g. the HCD root port lost
+                 * its enabled-device state), in which case any URBs we submit
+                 * below would sit queued on a halted pipe FOREVER while looking
+                 * perfectly healthy — so its result MUST gate the whole restream
+                 * (this exact ignored-return was the stall→restream doom loop). */
                 cancel_urbs(d);
+                esp_err_t rerr = ESP_OK;
                 if (d->dev && d->bulk_ep) {
-                    usb_host_endpoint_clear(d->dev, d->bulk_ep);
+                    rerr = usb_host_endpoint_clear(d->dev, d->bulk_ep);
                 }
 
                 /* CRITICAL: re-arming the HOST pipe alone does not restart a wedged
@@ -2078,7 +2086,7 @@ static void task_do_recovery(void)
                  * EP-A FIFO (the same 0x1002→0x0000 pulse stream start uses) and
                  * pulse the demod soft-reset so the chip starts sourcing IQ afresh.
                  * Failures here are surfaced so we escalate to a full re-enumerate. */
-                esp_err_t rerr = rtl_write_reg(d, RTL_USB_EPA_CTL, RTL_BLK_USB, 0x1002, 2);
+                if (rerr == ESP_OK) rerr = rtl_write_reg(d, RTL_USB_EPA_CTL, RTL_BLK_USB, 0x1002, 2);
                 if (rerr == ESP_OK) rerr = rtl_write_reg(d, RTL_USB_EPA_CTL, RTL_BLK_USB, 0x0000, 2);
                 if (rerr == ESP_OK) rerr = rtl_demod_write(d, RTL_DEMOD_SOFT_RST, RTL_DEMOD_SOFT_RST_ON, 1);
                 if (rerr == ESP_OK) rerr = rtl_demod_write(d, RTL_DEMOD_SOFT_RST, RTL_DEMOD_SOFT_RST_OFF, 1);
@@ -2273,6 +2281,23 @@ static void usb_task(void *arg)
     uint32_t wd_last_seq[RTLSDR_MAX_DEVICES] = {0};
     int64_t  wd_last_progress_us[RTLSDR_MAX_DEVICES] = {0};
 
+    /* ── Restream-strike escalation state ────────────────────────────────────
+     * A light restream is not guaranteed to revive the pipe: field capture shows
+     * the HCD can wedge so that the endpoint CLEAR fails (or the re-armed URBs
+     * simply never complete) while control transfers still succeed — the watchdog
+     * then fires every 2 s forever with BLK stuck at 0. Count consecutive stall
+     * strikes per device (reset on any IQ progress); once a device accumulates
+     * WD_STRIKES_FOR_PORT_CYCLE of them, the light path has provably failed and
+     * we escalate to the big hammer: power-cycling the ROOT PORT. That is a
+     * guaranteed logical re-plug — every device drops (DEV_GONE → full teardown)
+     * and re-enumerates (NEW_DEV → re-adopt, roles re-resolve by port, streams
+     * restart via the want_stream latch). A cooldown stops a genuinely dead bus
+     * from being cycled in a tight loop. */
+    uint8_t  wd_strikes[RTLSDR_MAX_DEVICES] = {0};
+    int64_t  last_port_cycle_us = 0;
+    const uint8_t WD_STRIKES_FOR_PORT_CYCLE = 3;
+    const int64_t PORT_CYCLE_COOLDOWN_US    = 15000000;   /* 15 s between cycles */
+
     while (s_ctx.task_run) {
 
         /* Pump the host library + client event loops (bounded waits). */
@@ -2338,19 +2363,57 @@ static void usb_task(void *arg)
                  * instantly flagged as stalled. */
                 wd_last_seq[i] = d->block_seq;
                 wd_last_progress_us[i] = now;
+                wd_strikes[i] = 0;
                 continue;
             }
             if (d->block_seq != wd_last_seq[i]) {
-                /* Forward progress — note it and move the deadline. */
+                /* Forward progress — note it, move the deadline, forgive strikes. */
                 wd_last_seq[i] = d->block_seq;
                 wd_last_progress_us[i] = now;
+                wd_strikes[i] = 0;
             } else if ((now - wd_last_progress_us[i]) > STREAM_STALL_TIMEOUT_US) {
-                /* No blocks delivered for 2 s while streaming => silent stall.
-                 * Kick a light restream and reset the deadline so we don't spam
-                 * restreams faster than they can take effect. */
-                ESP_LOGW(TAG, "stream[%d] silently stalled (no IQ for 2s) - restreaming", d->index);
-                d->do_restream = true;
+                /* No blocks delivered for 2 s while streaming => silent stall. */
                 wd_last_progress_us[i] = now;
+
+                if (wd_strikes[i] < WD_STRIKES_FOR_PORT_CYCLE) {
+                    wd_strikes[i]++;
+                }
+
+                if (wd_strikes[i] >= WD_STRIKES_FOR_PORT_CYCLE &&
+                    (now - last_port_cycle_us) > PORT_CYCLE_COOLDOWN_US) {
+                    /* Three restreams in a row restored nothing — the light path
+                     * cannot revive this pipe (wedged HCD/port state). Power-cycle
+                     * the root port: a guaranteed logical re-plug of the whole bus.
+                     * Both dongles drop and re-adopt; a few seconds of RF outage
+                     * beats a permanently deaf receiver in flight. */
+                    ESP_LOGE(TAG, "stream[%d] wedged (%u failed restreams) - "
+                             "power-cycling USB root port", d->index,
+                             (unsigned)wd_strikes[i]);
+                    last_port_cycle_us = now;
+                    for (int j = 0; j < (int)RTLSDR_MAX_DEVICES; j++) {
+                        wd_strikes[j] = 0;
+                    }
+                    esp_err_t perr = usb_host_lib_set_root_port_power(false);
+                    if (perr == ESP_OK) {
+                        /* Let VBUS collapse + the hub/dongles actually lose power
+                         * before re-driving the port, or some hubs latch state. */
+                        vTaskDelay(pdMS_TO_TICKS(500));
+                        perr = usb_host_lib_set_root_port_power(true);
+                    }
+                    if (perr != ESP_OK) {
+                        ESP_LOGE(TAG, "root-port power cycle failed: %s",
+                                 esp_err_to_name(perr));
+                    }
+                    /* DEV_GONE handling + auto_recover re-latch take it from here:
+                     * teardown, NEW_DEV re-adopt, roles by port, streams restart. */
+                } else {
+                    /* Kick a light restream first (and between escalations). */
+                    ESP_LOGW(TAG, "stream[%d] silently stalled (no IQ for 2s) - "
+                             "restreaming (strike %u/%u)", d->index,
+                             (unsigned)wd_strikes[i],
+                             (unsigned)WD_STRIKES_FOR_PORT_CYCLE);
+                    d->do_restream = true;
+                }
             }
         }
 
