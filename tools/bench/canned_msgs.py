@@ -129,8 +129,8 @@ CANNED_FRAMES: List[CannedFrame] = [
     ),
 
     # ── Even airborne position (TC 11) — part of the 40621D pair ───────────────
-    # This even frame's AC altitude field is Gillham (Q-bit clear), so a 25-ft
-    # decoder reports no altitude for it; the position is resolved via the pair.
+    # Both frames of this pair carry AC12 = 0xC38: Q-bit SET, N = 1560, so the
+    # 25-ft decode is 1560*25 - 1000 = 38000 ft (the mode-s.org worked example).
     CannedFrame(
         name="pos_even_40621D",
         hex="8D40621D58C382D690C8AC2863A7",
@@ -140,7 +140,7 @@ CANNED_FRAMES: List[CannedFrame] = [
             df=17,
             type_code=11,
             crc_ok=True,
-            altitude_ft=None,          # Gillham-coded in this frame; not 25-ft.
+            altitude_ft=38000,         # 25-ft Q-bit encoding (AC12 0xC38).
             cpr_odd=False,
             cpr_lat=93000,
             cpr_lon=51372,
@@ -157,7 +157,7 @@ CANNED_FRAMES: List[CannedFrame] = [
             df=17,
             type_code=11,
             crc_ok=True,
-            altitude_ft=11850,         # 25-ft Q-bit encoding in the odd frame.
+            altitude_ft=38000,         # Same AC12 (0xC38) as the even frame.
             cpr_odd=True,
             cpr_lat=74158,
             cpr_lon=50194,

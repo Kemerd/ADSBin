@@ -426,7 +426,7 @@ modes_result_t modes_decode_identification(const uint8_t *frame,
  * @details
  *   Mode-C altitude is split into two Gray-coded parts:
  *     - C1 C2 C4 encode the 100-ft sub-position within a 500-ft band, mapping
- *       (via a fixed table) to 1..5; codes 0/6/7 are illegal.
+ *       (via a fixed table) to 1..5; codes 000/101/111 are illegal.
  *     - D2 D4 A1 A2 A4 B1 B2 B4 are a Gray-coded 500-ft band count.
  *   Every odd 500-ft band runs its 100-ft sub-positions in REVERSE so adjacent
  *   bands meet without a discontinuity (the classic Gillham fold). Altitude is
@@ -444,8 +444,10 @@ static int32_t modes_gillham_to_ft(uint32_t d2, uint32_t d4,
                                    uint32_t c1, uint32_t c2, uint32_t c4)
 {
     // ── 100-ft sub-position from the C Gray triple. ──────────────────────────
-    // Lookup indexed by (C1<<2 | C2<<1 | C4): 0/3/5 are illegal codes (-1).
-    static const int8_t C_TO_HUNDREDS[8] = { -1, 1, 5, -1, 2, -1, 4, 3 };
+    // Lookup indexed by (C1<<2 | C2<<1 | C4). The C bits Gray-encode 1..5:
+    //   001→1, 011→2, 010→3, 110→4, 100→5; codes 000/101/111 are illegal (-1).
+    // (Same fold as dump1090 ModeAToModeC: C1⊕7, C2⊕3, C4⊕1 with the 7-repair.)
+    static const int8_t C_TO_HUNDREDS[8] = { -1, 1, 3, 2, 5, -1, 4, -1 };
     const uint32_t c = (c1 << 2) | (c2 << 1) | c4;
     int hundreds = C_TO_HUNDREDS[c & 7u];
     if (hundreds < 0) {
@@ -503,24 +505,24 @@ static bool modes_decode_altitude_ac12(uint32_t ac12, int32_t *out_ft)
     }
 
     // ── Q == 0 : legacy Gillham (Mode-C) 100-ft code. ────────────────────────
-    // The 12 AC bits are laid out, MSB (bit 11) to LSB (bit 0), as:
-    //   C1 A1 C2 A2 C4 A4 [Q] B1 D1 B2 D2 B4
-    // (D4 is not transmitted in the 12-bit field and is taken as 0.) Pull each
-    // labelled bit straight out of its position and hand them to the decoder.
+    // The 12 AC bits are the 13-bit AC field minus the M bit, laid out MSB
+    // (bit 11) to LSB (bit 0) as:
+    //   C1 A1 C2 A2 C4 A4 B1 [Q] B2 D2 B4 D4
+    // (Q occupies the D1 slot of the classic Gillham code — D1 is never sent.)
+    // Pull each labelled bit straight out of its position for the decoder; this
+    // matches dump1090's decodeAC12Field "insert M=0 at bit 6" re-expansion.
     const uint32_t c1 = (ac12 >> 11) & 1u;
     const uint32_t a1 = (ac12 >> 10) & 1u;
     const uint32_t c2 = (ac12 >> 9)  & 1u;
     const uint32_t a2 = (ac12 >> 8)  & 1u;
     const uint32_t c4 = (ac12 >> 7)  & 1u;
     const uint32_t a4 = (ac12 >> 6)  & 1u;
-    /* bit 5 is the Q bit (0 in this branch) */
-    const uint32_t b1 = (ac12 >> 4)  & 1u;
-    const uint32_t d1 = (ac12 >> 3)  & 1u;   /* D1 unused by the altitude code   */
-    const uint32_t b2 = (ac12 >> 2)  & 1u;
-    const uint32_t d2 = (ac12 >> 1)  & 1u;
-    const uint32_t b4 = (ac12 >> 0)  & 1u;
-    const uint32_t d4 = 0u;                   /* D4 absent in the 12-bit field    */
-    (void)d1;                                 /* documented but not used          */
+    const uint32_t b1 = (ac12 >> 5)  & 1u;
+    /* bit 4 is the Q bit (0 in this branch) */
+    const uint32_t b2 = (ac12 >> 3)  & 1u;
+    const uint32_t d2 = (ac12 >> 2)  & 1u;
+    const uint32_t b4 = (ac12 >> 1)  & 1u;
+    const uint32_t d4 = (ac12 >> 0)  & 1u;
 
     const int32_t ft = modes_gillham_to_ft(d2, d4, a1, a2, a4, b1, b2, b4, c1, c2, c4);
     if (ft == INT32_MIN) {
